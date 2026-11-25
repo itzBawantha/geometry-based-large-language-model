@@ -9,6 +9,7 @@
 //     O(Allocated) CUDA rendering, 1.2M outer-shell VBO, and 1-to-1 binding rays.
 // =============================================================================
 
+#include "../include/animal_infer.hpp"
 #include "../include/cuda_driver_min.hpp"
 #include "../include/gaussian_pyramid.hpp"
 #include "../include/gllm_model.hpp"
@@ -357,9 +358,10 @@ static void save_ppm(const std::string& path, int w, int h) {
 }
 
 int main(int argc, char** argv) {
-    std::string model_path, screenshot_path, test_idx_img;
+    std::string model_path, screenshot_path, test_idx_img, test_animal_img;
     std::string bench_mnist_dir = "data/mnist";
     std::string bench_emnist_dir = "data/emnist_byclass";
+    std::string animal_manifest = "data/cat_dog_split.tsv";
     bool start_benchmark = false;
     float bench_rate_ips = 6.0f;
     int test_idx_pos = -1;
@@ -383,6 +385,8 @@ int main(int argc, char** argv) {
         else if (a == "--bench-emnist" && i + 1 < argc) bench_emnist_dir = argv[++i];
         else if (a == "--bench-rate" && i + 1 < argc) bench_rate_ips = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.5f, 120.0f);
         else if (a == "--test-img" && i + 2 < argc) { test_idx_img = argv[++i]; test_idx_pos = std::atoi(argv[++i]); }
+        else if (a == "--test-animal" && i + 1 < argc) test_animal_img = argv[++i];
+        else if (a == "--animal-manifest" && i + 1 < argc) animal_manifest = argv[++i];
         else if (a == "--test-transpose") test_transpose = true;
         else if (a == "--enable-manifold" && i + 1 < argc) cli_enable_manifolds.push_back(argv[++i]);
         else if (a == "--disable-manifold" && i + 1 < argc) cli_disable_manifolds.push_back(argv[++i]);
@@ -546,6 +550,32 @@ int main(int argc, char** argv) {
     dispatcher.init_from_model(model);
     for (const auto& nm : cli_enable_manifolds)  dispatcher.set_root_by_name(nm, true, model);
     for (const auto& nm : cli_disable_manifolds) dispatcher.set_root_by_name(nm, false, model);
+
+    // Initialize interactive Cat/Dog HOG image inference engine if the loaded sphere has trained animals manifolds!
+    gllm::AnimalInferenceEngine animal_engine;
+    bool has_animal_engine = animal_engine.init(model, mod);
+    gllm::AnimalInferResult last_animal_res;
+    bool show_edge_view = false; // Toggle between raw photo & glowing Gradient-Domain Sparse Edge Map!
+    std::vector<std::string> unseen_cat_paths, unseen_dog_paths;
+    size_t unseen_cat_cursor = 0, unseen_dog_cursor = 0;
+    if (has_animal_engine && std::filesystem::exists(animal_manifest)) {
+        std::ifstream mf(animal_manifest);
+        std::string line;
+        while (std::getline(mf, line)) {
+            if (line.rfind("test\t", 0) != 0) continue;
+            size_t t1 = line.find('\t', 5);
+            if (t1 == std::string::npos) continue;
+            size_t t2 = line.find('\t', t1 + 1);
+            if (t2 == std::string::npos) continue;
+            std::string sp = line.substr(5, t1 - 5);
+            std::string p  = line.substr(t1 + 1, t2 - t1 - 1);
+            if (sp == "cat") unseen_cat_paths.push_back(p);
+            else if (sp == "dog") unseen_dog_paths.push_back(p);
+        }
+        std::cout << "[ANIMALS] Interactive CUDA Cat/Dog image inference READY ("
+                  << unseen_cat_paths.size() << " unseen cats, " << unseen_dog_paths.size()
+                  << " unseen dogs; or drag-and-drop ANY PNG/JPG onto the window!)\n";
+    }
 
     // Upload GPU model, matcher & Operational Manifold metadata buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_shadow_rgb = 0, d_counter = 0;
@@ -833,6 +863,102 @@ int main(int argc, char** argv) {
     bool show_links    = true;
     bool show_manifold = true;
     bool dirty_lat     = true;
+
+    // -------------------------------------------------------------------------
+    // Interactive CUDA Animal Image Inference (Zero-BBox Auto OR Drag-Box ROI!)
+    // -------------------------------------------------------------------------
+    auto apply_animal_result = [&](const gllm::AnimalInferResult& ar) {
+        if (!ar.valid) return;
+        last_animal_res = ar;
+        std::vector<gllm::SketchSidebarHUD::OverlayBox> ovs;
+        ovs.push_back({ar.face_box.x0, ar.face_box.y0, ar.face_box.x1, ar.face_box.y1, 255, 235, 50, 2});
+        static const uint8_t kFCol[6][3] = {
+            {60, 220, 255}, {255, 170, 50}, {150, 120, 255},
+            {90, 255, 125}, {255, 95, 145}, {80, 195, 255}
+        };
+        for (int f = 0; f < 6; ++f) {
+            const auto& b = ar.comps[2 + f].box;
+            ovs.push_back({b.x0, b.y0, b.x1, b.y1, kFCol[f][0], kFCol[f][1], kFCol[f][2], 1});
+        }
+        const auto& view_rgb = (show_edge_view && !ar.edge_rgb.empty()) ? ar.edge_rgb : ar.img_rgb;
+        hud.set_photo_preview(view_rgb, ar.img_w, ar.img_h, ovs, ar.face_hog_preview);
+
+        auto prev_bench = match_summary.bench;
+        match_summary = gllm::MatchSummary{};
+        match_summary.has_result      = true;
+        match_summary.animal_mode     = true;
+        match_summary.cuda_ms         = ar.gpu_ms;
+        match_summary.dispatch_status = dispatcher.hud_status_line();
+        match_summary.bench           = prev_bench;
+
+        char b1[64], s1[64], s2[64];
+        std::snprintf(b1, sizeof(b1), "MATCH: %s (%.0f%%)",
+                      ar.pred_is_cat ? "CAT" : "DOG",
+                      ar.pred_is_cat ? ar.cat_prob : ar.dog_prob);
+        std::snprintf(s1, sizeof(s1), "CHILD HITS: %d/6 | %d/6 CAT | %.1fms",
+                      ar.child_hits, ar.cat_votes, ar.gpu_ms);
+        std::snprintf(s2, sizeof(s2), "MODE: %s | %s",
+                      ar.used_manual_box ? "MANUAL BOX" : "CHILD-FIRST GRAD-EDGE",
+                      show_edge_view ? "VIEW:EDGE" : "VIEW:PHOTO");
+        match_summary.animal_banner = b1;
+        match_summary.animal_sub1   = s1;
+        match_summary.animal_sub2   = s2;
+        if (!ar.truth_species.empty()) {
+            std::string tr_up = (ar.truth_species == "cat") ? "CAT" : "DOG";
+            bool hit = ((ar.truth_species == "cat") == ar.pred_is_cat);
+            match_summary.animal_truth = tr_up + (hit ? " (HIT)" : " (MISS)");
+        }
+
+        // Top 10 rows: Overall CAT, Overall DOG, then all 8 anatomical compartments!
+        match_summary.ranked.push_back({ar.cat_outer_idx, ar.cat_outer_idx, "SPECIES: CAT", ar.cat_prob, 100.0f, false});
+        match_summary.ranked.push_back({ar.dog_outer_idx, ar.dog_outer_idx, "SPECIES: DOG", ar.dog_prob, 0.0f, false});
+        static const int kOrder[8] = {1, 2, 3, 4, 5, 6, 7, 0}; // face, 6 features, full
+        for (int oi : kOrder) {
+            const auto& cp = ar.comps[oi];
+            float p_cat = 100.0f / (1.0f + std::exp(-cp.margin * 14.0f));
+            float pct = cp.is_cat ? p_cat : (100.0f - p_cat);
+            std::string nm = (oi == 1) ? "L2 face" : ((oi == 0) ? "L1 full" : ("L3 " + cp.name));
+            match_summary.ranked.push_back({cp.outer_idx, cp.outer_idx, nm, pct, cp.is_cat ? 100.0f : 0.0f, false});
+        }
+        focus_cls = ar.winner_outer_idx;
+        dirty_lat = true;
+        hud.dirty_tex = true;
+
+        std::printf("\n[ANIMAL-INFER] %s -> %s (CAT %.1f%% | DOG %.1f%% | %d/6 child feats -> CAT | %.2f ms GPU | %s)\n",
+                    ar.image_path.c_str(), ar.pred_is_cat ? "CAT" : "DOG",
+                    ar.cat_prob, ar.dog_prob, ar.cat_votes, ar.gpu_ms,
+                    ar.used_manual_box ? "MANUAL-BOX" : "ZERO-BBOX");
+    };
+
+    auto run_animal_file = [&](const std::string& path, const std::string& truth = "") {
+        if (!has_animal_engine) {
+            std::cout << "[ANIMAL-INFER] Loaded .gllm model does not contain trained animals HOG manifolds.\n";
+            return;
+        }
+        if (dispatcher.count_active_regions(model, gllm::InferenceModality::kRgbPyramid) == 0u) {
+            match_summary = gllm::MatchSummary{};
+            match_summary.has_result      = true;
+            match_summary.animal_mode     = true;
+            match_summary.animal_banner   = "ANIMALS OFF";
+            match_summary.animal_sub1     = "PRESS '2' TO ENABLE ANIMALS MANIFOLD";
+            match_summary.animal_sub2     = "DISPATCH: " + dispatcher.hud_status_line();
+            match_summary.dispatch_status = dispatcher.hud_status_line();
+            hud.dirty_tex = true;
+            std::cout << "[DISPATCH] Animals manifold inference is OFF — press '2' to enable!\n";
+            return;
+        }
+        match_summary.bench.active = false;
+        auto ar = animal_engine.infer_file(path, truth);
+        if (!ar.valid) {
+            std::cerr << "[ANIMAL-INFER] Failed to decode image: " << path << "\n";
+            return;
+        }
+        apply_animal_result(ar);
+    };
+
+    if (!test_animal_img.empty()) {
+        run_animal_file(test_animal_img);
+    }
 
     // -------------------------------------------------------------------------
     // Run 2-Stage Multi-Scale Gaussian Pyramid CUDA Match (Bernoulli x Soft-IoU)
@@ -1196,7 +1322,13 @@ int main(int argc, char** argv) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) running = false;
-            else if (ev.type == SDL_MOUSEBUTTONDOWN) {
+            else if (ev.type == SDL_DROPFILE) {
+                if (ev.drop.file) {
+                    std::string dropped_path(ev.drop.file);
+                    SDL_free(ev.drop.file);
+                    run_animal_file(dropped_path);
+                }
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
                 int hx = 0, hy = 0;
                 map_mouse_to_hud(ev.button.x, ev.button.y, hx, hy);
                 if (hx < gllm::SketchSidebarHUD::kPanelW) {
@@ -1207,14 +1339,48 @@ int main(int argc, char** argv) {
                         dirty_lat = true;
                     } else if (ev.button.button == SDL_BUTTON_LEFT) {
                         if (hud.canvas_rect.contains(hx, hy)) {
-                            canvas_drawing = true;
-                            prev_cx = static_cast<float>(hx - hud.canvas_rect.x);
-                            prev_cy = static_cast<float>(hy - hud.canvas_rect.y);
-                            hud.draw_stroke(prev_cx, prev_cy, prev_cx, prev_cy);
+                            if (hud.has_photo && last_animal_res.valid) {
+                                hud.drag_box_active = true;
+                                hud.drag_x0 = hud.drag_x1 = hx - hud.canvas_rect.x;
+                                hud.drag_y0 = hud.drag_y1 = hy - hud.canvas_rect.y;
+                                hud.dirty_tex = true;
+                            } else {
+                                canvas_drawing = true;
+                                prev_cx = static_cast<float>(hx - hud.canvas_rect.x);
+                                prev_cy = static_cast<float>(hy - hud.canvas_rect.y);
+                                hud.draw_stroke(prev_cx, prev_cy, prev_cx, prev_cy);
+                            }
+                        } else if (hud.btn_test_cat.contains(hx, hy)) {
+                            if (!unseen_cat_paths.empty()) {
+                                const auto& p = unseen_cat_paths[unseen_cat_cursor++ % unseen_cat_paths.size()];
+                                run_animal_file(p, "cat");
+                            }
+                        } else if (hud.btn_test_dog.contains(hx, hy)) {
+                            if (!unseen_dog_paths.empty()) {
+                                const auto& p = unseen_dog_paths[unseen_dog_cursor++ % unseen_dog_paths.size()];
+                                run_animal_file(p, "dog");
+                            }
+                        } else if (hud.btn_sketch.contains(hx, hy)) {
+                            if (hud.has_photo && last_animal_res.valid) {
+                                // Toggle between Photo & Gradient-Domain Sparse Edge Map!
+                                show_edge_view = !show_edge_view;
+                                apply_animal_result(last_animal_res);
+                            } else {
+                                match_summary.bench.active = false;
+                                hud.clear();
+                                match_summary = gllm::MatchSummary{};
+                                focus_cls = no_focus;
+                                dirty_lat = true;
+                            }
                         } else if (hud.btn_capture.contains(hx, hy)) {
                             if (match_summary.bench.active) {
                                 match_summary.bench.paused = !match_summary.bench.paused;
                                 hud.dirty_tex = true;
+                            } else if (hud.has_photo && last_animal_res.valid) {
+                                auto ar = animal_engine.infer_rgb(last_animal_res.img_rgb, last_animal_res.img_w,
+                                                                  last_animal_res.img_h, last_animal_res.image_path,
+                                                                  nullptr, last_animal_res.truth_species);
+                                apply_animal_result(ar);
                             } else {
                                 run_cuda_capture();
                             }
@@ -1259,19 +1425,48 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                 orbit_dragging = false;
                 canvas_drawing = false;
+                if (hud.drag_box_active) {
+                    hud.drag_box_active = false;
+                    int bx0 = std::min(hud.drag_x0, hud.drag_x1), bx1 = std::max(hud.drag_x0, hud.drag_x1);
+                    int by0 = std::min(hud.drag_y0, hud.drag_y1), by1 = std::max(hud.drag_y0, hud.drag_y1);
+                    if ((bx1 - bx0) >= 12 && (by1 - by0) >= 12 && last_animal_res.valid && hud.photo_scale > 1e-4f) {
+                        gllm::AnimalBox mb{
+                            (bx0 - hud.photo_ox) / hud.photo_scale,
+                            (by0 - hud.photo_oy) / hud.photo_scale,
+                            (bx1 - hud.photo_ox) / hud.photo_scale,
+                            (by1 - hud.photo_oy) / hud.photo_scale
+                        };
+                        auto ar = animal_engine.infer_rgb(last_animal_res.img_rgb, last_animal_res.img_w,
+                                                          last_animal_res.img_h, last_animal_res.image_path,
+                                                          &mb, last_animal_res.truth_species);
+                        apply_animal_result(ar);
+                    } else {
+                        hud.dirty_tex = true;
+                    }
+                }
             } else if (ev.type == SDL_MOUSEMOTION) {
                 int hx = 0, hy = 0;
                 map_mouse_to_hud(ev.motion.x, ev.motion.y, hx, hy);
                 bool old_hc = hud.hover_capture, old_hcl = hud.hover_clear;
+                bool old_t1 = hud.hover_test_cat, old_t2 = hud.hover_test_dog, old_sk = hud.hover_sketch;
                 int  old_hr = hud.hover_row;
-                hud.hover_capture = hud.btn_capture.contains(hx, hy);
-                hud.hover_clear   = hud.btn_clear.contains(hx, hy);
-                hud.hover_row     = -1;
+                hud.hover_capture  = hud.btn_capture.contains(hx, hy);
+                hud.hover_clear    = hud.btn_clear.contains(hx, hy);
+                hud.hover_test_cat = hud.btn_test_cat.contains(hx, hy);
+                hud.hover_test_dog = hud.btn_test_dog.contains(hx, hy);
+                hud.hover_sketch   = hud.btn_sketch.contains(hx, hy);
+                hud.hover_row      = -1;
                 for (int r = 0; r < 10; ++r) if (hud.row_rects[r].contains(hx, hy)) hud.hover_row = r;
-                if (old_hc != hud.hover_capture || old_hcl != hud.hover_clear || old_hr != hud.hover_row)
+                if (old_hc != hud.hover_capture || old_hcl != hud.hover_clear ||
+                    old_t1 != hud.hover_test_cat || old_t2 != hud.hover_test_dog ||
+                    old_sk != hud.hover_sketch || old_hr != hud.hover_row)
                     hud.dirty_tex = true;
 
-                if (canvas_drawing) {
+                if (hud.drag_box_active) {
+                    hud.drag_x1 = std::clamp(hx - hud.canvas_rect.x, 0, gllm::SketchSidebarHUD::kCanvasS - 1);
+                    hud.drag_y1 = std::clamp(hy - hud.canvas_rect.y, 0, gllm::SketchSidebarHUD::kCanvasS - 1);
+                    hud.dirty_tex = true;
+                } else if (canvas_drawing) {
                     float cx = std::clamp(static_cast<float>(hx - hud.canvas_rect.x), 0.0f, float(gllm::SketchSidebarHUD::kCanvasS - 1));
                     float cy = std::clamp(static_cast<float>(hy - hud.canvas_rect.y), 0.0f, float(gllm::SketchSidebarHUD::kCanvasS - 1));
                     hud.draw_stroke(prev_cx, prev_cy, cx, cy);
@@ -1523,6 +1718,7 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_man_score));
     CU_CHECK(cuMemFree_v2(d_man_reg));
     CU_CHECK(cuMemFree_v2(d_man_act));
+    animal_engine.release();
     CU_CHECK(cuEventDestroy_v2(ev_s));
     CU_CHECK(cuEventDestroy_v2(ev_e));
     CU_CHECK(cuModuleUnload(mod));

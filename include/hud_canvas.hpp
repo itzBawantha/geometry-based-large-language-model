@@ -46,6 +46,11 @@ struct MatchSummary {
     std::string manifold_name;                 // Routed Operational Manifold (e.g. "handwritten/letters")
     std::string manifold_semantic;             // CUDA semantic register (e.g. "handwritten_letters_A_Z_a_z")
     std::string dispatch_status;               // Live per-root inference status (e.g. "1:handwritten[ON] 2:animals[OFF]")
+    bool        animal_mode    = false;        // True when displaying a dropped/loaded Cat/Dog photo!
+    std::string animal_banner;                 // e.g. "MATCH: CAT (84%)"
+    std::string animal_sub1;                   // e.g. "FEATS: 5/6 CAT | 12.4ms GPU"
+    std::string animal_sub2;                   // e.g. "MODE: ZERO-BBOX AUTO (DRAG BOX)"
+    std::string animal_truth;                  // optional ground truth label for test samples
     VisualBenchStats bench;                    // Live visual benchmark telemetry when active
     std::vector<MatchResultRow> ranked;        // Surviving classes sorted by overlap desc
     std::vector<std::string>    pruned_labels; // Labels eliminated at Stage 1
@@ -261,19 +266,32 @@ public:
 
     Rect canvas_rect  = {20, 46, kCanvasS, kCanvasS};
     Rect preview_rect = {256, 46, 62, 62};
+    Rect btn_test_cat = {256, 166, 62, 28};
+    Rect btn_test_dog = {256, 200, 62, 28};
+    Rect btn_sketch   = {256, 234, 62, 28};
     Rect btn_capture  = {20, 282, 144, 34};
     Rect btn_clear    = {174, 282, 144, 34};
     Rect row_rects[10];
 
     std::vector<float>   canvas;       // 224 x 224 float [0..1]
+    std::vector<uint8_t> photo_rgb;    // 224 x 224 x 3 RGB overlay when in animal photo mode
+    bool                 has_photo = false;
+    bool                 drag_box_active = false;
+    int                  drag_x0 = 0, drag_y0 = 0, drag_x1 = 0, drag_y1 = 0;
     std::array<float, 784> norm28{};   // Auto-centered 28x28 [0..1] sent to CUDA
     std::vector<uint8_t> rgba;         // kPanelW x kPanelH x 4 RGBA8 texture
     bool dirty_tex = true;
-    bool hover_capture = false;
-    bool hover_clear   = false;
-    int  hover_row     = -1;
+    bool hover_capture  = false;
+    bool hover_clear    = false;
+    bool hover_test_cat = false;
+    bool hover_test_dog = false;
+    bool hover_sketch   = false;
+    int  hover_row      = -1;
 
-    SketchSidebarHUD() : canvas(kCanvasS * kCanvasS, 0.0f), rgba(kPanelW * kPanelH * 4, 0) {
+    SketchSidebarHUD()
+        : canvas(kCanvasS * kCanvasS, 0.0f),
+          photo_rgb(kCanvasS * kCanvasS * 3, 0),
+          rgba(kPanelW * kPanelH * 4, 0) {
         for (int i = 0; i < 10; ++i) {
             row_rects[i] = {18, 462 + i * 32, 300, 28};
         }
@@ -281,7 +299,68 @@ public:
 
     void clear() {
         std::fill(canvas.begin(), canvas.end(), 0.0f);
+        std::fill(photo_rgb.begin(), photo_rgb.end(), 0);
+        has_photo = false;
+        drag_box_active = false;
         norm28.fill(0.0f);
+        dirty_tex = true;
+    }
+
+    // Blit an arbitrary RGB photo + detected face & 6 feature boxes cleanly into the 224x224 canvas!
+    struct OverlayBox { float x0, y0, x1, y1; uint8_t r, g, b; int thick; };
+    float photo_scale = 1.0f;
+    int   photo_ox = 0, photo_oy = 0, photo_dw = kCanvasS, photo_dh = kCanvasS;
+
+    void set_photo_preview(const std::vector<uint8_t>& src_rgb, uint32_t sw, uint32_t sh,
+                           const std::vector<OverlayBox>& overlays,
+                           const std::array<float, 784>& hog28) {
+        std::fill(photo_rgb.begin(), photo_rgb.end(), 12);
+        has_photo = (sw > 0 && sh > 0 && src_rgb.size() >= static_cast<size_t>(sw) * sh * 3u);
+        if (!has_photo) { dirty_tex = true; return; }
+        photo_scale = std::min(static_cast<float>(kCanvasS) / sw, static_cast<float>(kCanvasS) / sh);
+        photo_dw = std::max(1, static_cast<int>(std::lround(sw * photo_scale)));
+        photo_dh = std::max(1, static_cast<int>(std::lround(sh * photo_scale)));
+        photo_ox = (kCanvasS - photo_dw) / 2;
+        photo_oy = (kCanvasS - photo_dh) / 2;
+        for (int y = 0; y < photo_dh; ++y) {
+            int py = std::clamp(static_cast<int>(y / photo_scale), 0, static_cast<int>(sh) - 1);
+            for (int x = 0; x < photo_dw; ++x) {
+                int px = std::clamp(static_cast<int>(x / photo_scale), 0, static_cast<int>(sw) - 1);
+                size_t si = (static_cast<size_t>(py) * sw + px) * 3u;
+                size_t di = (static_cast<size_t>(photo_oy + y) * kCanvasS + (photo_ox + x)) * 3u;
+                photo_rgb[di + 0] = src_rgb[si + 0];
+                photo_rgb[di + 1] = src_rgb[si + 1];
+                photo_rgb[di + 2] = src_rgb[si + 2];
+            }
+        }
+        auto draw_pbox = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b, int thick) {
+            x0 = std::clamp(x0, 0, kCanvasS - 1); x1 = std::clamp(x1, 0, kCanvasS - 1);
+            y0 = std::clamp(y0, 0, kCanvasS - 1); y1 = std::clamp(y1, 0, kCanvasS - 1);
+            for (int t = 0; t < thick; ++t) {
+                int a0 = std::clamp(x0 + t, 0, kCanvasS - 1), a1 = std::clamp(x1 - t, 0, kCanvasS - 1);
+                int b0 = std::clamp(y0 + t, 0, kCanvasS - 1), b1 = std::clamp(y1 - t, 0, kCanvasS - 1);
+                for (int x = a0; x <= a1; ++x) {
+                    size_t i0 = (static_cast<size_t>(b0) * kCanvasS + x) * 3u;
+                    size_t i1 = (static_cast<size_t>(b1) * kCanvasS + x) * 3u;
+                    photo_rgb[i0] = r; photo_rgb[i0 + 1] = g; photo_rgb[i0 + 2] = b;
+                    photo_rgb[i1] = r; photo_rgb[i1 + 1] = g; photo_rgb[i1 + 2] = b;
+                }
+                for (int y = b0; y <= b1; ++y) {
+                    size_t i0 = (static_cast<size_t>(y) * kCanvasS + a0) * 3u;
+                    size_t i1 = (static_cast<size_t>(y) * kCanvasS + a1) * 3u;
+                    photo_rgb[i0] = r; photo_rgb[i0 + 1] = g; photo_rgb[i0 + 2] = b;
+                    photo_rgb[i1] = r; photo_rgb[i1 + 1] = g; photo_rgb[i1 + 2] = b;
+                }
+            }
+        };
+        for (const auto& ov : overlays) {
+            draw_pbox(photo_ox + static_cast<int>(ov.x0 * photo_scale),
+                      photo_oy + static_cast<int>(ov.y0 * photo_scale),
+                      photo_ox + static_cast<int>(ov.x1 * photo_scale),
+                      photo_oy + static_cast<int>(ov.y1 * photo_scale),
+                      ov.r, ov.g, ov.b, ov.thick);
+        }
+        norm28 = hog28;
         dirty_tex = true;
     }
 
@@ -435,46 +514,91 @@ public:
 
         if (ms.bench.active) {
             draw_text(20, 16, "LIVE VISUAL BENCHMARK", 2, 120, 255, 200);
+        } else if (ms.animal_mode || has_photo) {
+            draw_text(20, 16, "GLLM IMAGE INFERENCE", 2, 255, 215, 115);
         } else {
             draw_text(20, 16, "GLLM SKETCH INFERENCE", 2, 125, 220, 255);
         }
 
-        // 1. Drawing canvas (224x224) + subtle 22x22 canonical scale guide frame (176x176)
+        // 1. Drawing canvas OR Dropped Animal Photo preview (224x224)
         fill_rect(canvas_rect.x, canvas_rect.y, canvas_rect.w, canvas_rect.h, 8, 12, 22, 255);
-        stroke_rect(canvas_rect.x + 24, canvas_rect.y + 24, 176, 176, 22, 38, 62, 255);
-        for (int y = 0; y < kCanvasS; ++y) {
-            for (int x = 0; x < kCanvasS; ++x) {
-                float v = canvas[y * kCanvasS + x];
-                if (v > 0.01f) {
-                    uint8_t cr = static_cast<uint8_t>(std::min(255.0f, 40.0f + 215.0f * v));
-                    uint8_t cg = static_cast<uint8_t>(std::min(255.0f, 160.0f + 95.0f * v));
-                    uint8_t cb = 255;
-                    put_px(canvas_rect.x + x, canvas_rect.y + y, cr, cg, cb, 255);
+        if (has_photo) {
+            for (int y = 0; y < kCanvasS; ++y) {
+                for (int x = 0; x < kCanvasS; ++x) {
+                    size_t si = (static_cast<size_t>(y) * kCanvasS + x) * 3u;
+                    put_px(canvas_rect.x + x, canvas_rect.y + y,
+                           photo_rgb[si + 0], photo_rgb[si + 1], photo_rgb[si + 2], 255);
+                }
+            }
+            if (drag_box_active) {
+                int bx0 = std::min(drag_x0, drag_x1), bx1 = std::max(drag_x0, drag_x1);
+                int by0 = std::min(drag_y0, drag_y1), by1 = std::max(drag_y0, drag_y1);
+                stroke_rect(canvas_rect.x + bx0, canvas_rect.y + by0,
+                            std::max(2, bx1 - bx0), std::max(2, by1 - by0), 80, 255, 220, 255);
+            }
+        } else {
+            stroke_rect(canvas_rect.x + 24, canvas_rect.y + 24, 176, 176, 22, 38, 62, 255);
+            for (int y = 0; y < kCanvasS; ++y) {
+                for (int x = 0; x < kCanvasS; ++x) {
+                    float v = canvas[y * kCanvasS + x];
+                    if (v > 0.01f) {
+                        uint8_t cr = static_cast<uint8_t>(std::min(255.0f, 40.0f + 215.0f * v));
+                        uint8_t cg = static_cast<uint8_t>(std::min(255.0f, 160.0f + 95.0f * v));
+                        uint8_t cb = 255;
+                        put_px(canvas_rect.x + x, canvas_rect.y + y, cr, cg, cb, 255);
+                    }
                 }
             }
         }
-        stroke_rect(canvas_rect.x - 1, canvas_rect.y - 1, canvas_rect.w + 2, canvas_rect.h + 2, 65, 165, 230, 255);
+        stroke_rect(canvas_rect.x - 1, canvas_rect.y - 1, canvas_rect.w + 2, canvas_rect.h + 2,
+                    has_photo ? 240 : 65, has_photo ? 190 : 165, has_photo ? 80 : 230, 255);
 
-        // 2. Live 28x28 normalized preview
-        draw_text(preview_rect.x, preview_rect.y + 70, "28x28", 1, 130, 175, 210);
+        // 2. Live 28x28 normalized / 4-orientation HOG shadow preview + quick Animal Test buttons
+        draw_text(preview_rect.x, preview_rect.y + 70, has_photo ? "4xHOG" : "28x28", 1, 130, 175, 210);
         draw_text(preview_rect.x, preview_rect.y + 82, "CUDA", 1, 130, 175, 210);
-        draw_text(preview_rect.x, preview_rect.y + 94, "INPUT", 1, 130, 175, 210);
+        draw_text(preview_rect.x, preview_rect.y + 94, has_photo ? "SHADOW" : "INPUT", 1, 130, 175, 210);
         fill_rect(preview_rect.x, preview_rect.y, preview_rect.w, preview_rect.h, 6, 10, 18, 255);
         for (int y = 0; y < 28; ++y) {
             for (int x = 0; x < 28; ++x) {
                 uint8_t v = static_cast<uint8_t>(norm28[y * 28 + x] * 255.0f);
-                if (v > 4) fill_rect(preview_rect.x + 3 + x * 2, preview_rect.y + 3 + y * 2, 2, 2, v, static_cast<uint8_t>(std::min(255, v + 30)), 255, 255);
+                if (v > 4) {
+                    if (has_photo) {
+                        fill_rect(preview_rect.x + 3 + x * 2, preview_rect.y + 3 + y * 2, 2, 2,
+                                  255, static_cast<uint8_t>(std::min(255, 60 + v)), static_cast<uint8_t>(v / 2), 255);
+                    } else {
+                        fill_rect(preview_rect.x + 3 + x * 2, preview_rect.y + 3 + y * 2, 2, 2,
+                                  v, static_cast<uint8_t>(std::min(255, v + 30)), 255, 255);
+                    }
+                }
             }
         }
         stroke_rect(preview_rect.x, preview_rect.y, preview_rect.w, preview_rect.h, 60, 120, 175, 255);
 
-        // 3. Buttons: [ CAPTURE / CLEAR ] in sketch mode, or [ PAUSE / SPEED ] in Live Visual Benchmark mode
+        // Quick Cat / Dog / Edge-or-Sketch buttons on the right rail
+        fill_rect(btn_test_cat.x, btn_test_cat.y, btn_test_cat.w, btn_test_cat.h,
+                  hover_test_cat ? 42 : 24, hover_test_cat ? 112 : 76, hover_test_cat ? 168 : 118, 255);
+        stroke_rect(btn_test_cat.x, btn_test_cat.y, btn_test_cat.w, btn_test_cat.h, 110, 210, 255, 255);
+        draw_text(btn_test_cat.x + 12, btn_test_cat.y + 10, "+CAT", 1, 235, 248, 255);
+
+        fill_rect(btn_test_dog.x, btn_test_dog.y, btn_test_dog.w, btn_test_dog.h,
+                  hover_test_dog ? 148 : 108, hover_test_dog ? 96 : 68, hover_test_dog ? 34 : 24, 255);
+        stroke_rect(btn_test_dog.x, btn_test_dog.y, btn_test_dog.w, btn_test_dog.h, 255, 195, 110, 255);
+        draw_text(btn_test_dog.x + 12, btn_test_dog.y + 10, "+DOG", 1, 255, 244, 225);
+
+        fill_rect(btn_sketch.x, btn_sketch.y, btn_sketch.w, btn_sketch.h,
+                  hover_sketch ? 60 : 34, hover_sketch ? 80 : 48, hover_sketch ? 105 : 68, 255);
+        stroke_rect(btn_sketch.x, btn_sketch.y, btn_sketch.w, btn_sketch.h, 110, 145, 185, 255);
+        draw_text(btn_sketch.x + (has_photo ? 10 : 8), btn_sketch.y + 10, has_photo ? "EDGES" : "SKETCH", 1, 210, 230, 248);
+
+        // 3. Buttons: [ CAPTURE / CLEAR ] in sketch mode, [ AUTO SCAN / CLEAR ] in photo mode, or [ PAUSE / SPEED ] in bench
         fill_rect(btn_capture.x, btn_capture.y, btn_capture.w, btn_capture.h,
                   hover_capture ? 32 : 18, hover_capture ? 148 : 118, hover_capture ? 175 : 148, 255);
         stroke_rect(btn_capture.x, btn_capture.y, btn_capture.w, btn_capture.h, 110, 235, 255, 255);
         if (ms.bench.active) {
             draw_text(btn_capture.x + (ms.bench.paused ? 34 : 42), btn_capture.y + 10,
                       ms.bench.paused ? "RESUME" : "PAUSE", 2, 245, 255, 255);
+        } else if (has_photo) {
+            draw_text(btn_capture.x + 20, btn_capture.y + 10, "AUTO SCAN", 2, 245, 255, 255);
         } else {
             draw_text(btn_capture.x + 30, btn_capture.y + 10, "CAPTURE", 2, 245, 255, 255);
         }
@@ -531,8 +655,18 @@ public:
             fill_rect(28, 410, 280, 7, 24, 38, 58, 255);
             int pw = b.total ? std::clamp(static_cast<int>(280.0f * b.processed / b.total), 1, 280) : 0;
             fill_rect(28, 410, pw, 7, 70, 235, 185, 255);
+        } else if (ms.animal_mode && ms.has_result) {
+            bool is_cat_banner = (ms.animal_banner.find("CAT") != std::string::npos);
+            draw_text(28, 340, ms.animal_banner.substr(0, 22), 2,
+                      is_cat_banner ? 115 : 255, is_cat_banner ? 255 : 205, is_cat_banner ? 200 : 110);
+            draw_text(28, 364, ms.animal_sub1.substr(0, 44), 1, 210, 240, 255);
+            draw_text(28, 382, ms.animal_sub2.substr(0, 44), 1, 130, 225, 255);
+            std::string line4 = !ms.animal_truth.empty()
+                ? ("TRUTH: " + ms.animal_truth + " | DROP PNG/JPG OR DRAG BOX")
+                : "DROP ANY PNG/JPG | DRAG FACE BOX TO REFINE";
+            draw_text(28, 400, line4.substr(0, 44), 1, 255, 200, 125);
         } else if (!ms.has_result) {
-            draw_text(30, 344, "DRAW INSIDE GUIDE -> CAPTURE", 1, 175, 205, 235);
+            draw_text(30, 344, "DRAW DIGIT OR DROP CAT/DOG PHOTO!", 1, 175, 205, 235);
             char buf[64];
             if (num_regions > num_classes) {
                 std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES (%u SHADOWS)", num_classes, num_regions);
@@ -575,8 +709,8 @@ public:
             }
         }
 
-        // 5. Top-10 Ranked Overlap Bars
-        draw_text(20, 442, "TOP 10 OVERLAP MATCHES (CLICK ROW):", 1, 145, 195, 235);
+        // 5. Top-10 Ranked Overlap Bars (or Per-Compartment Animal Breakdown)
+        draw_text(20, 442, ms.animal_mode ? "ANIMAL HIERARCHY BREAKDOWN (CLICK):" : "TOP 10 OVERLAP MATCHES (CLICK ROW):", 1, 145, 195, 235);
         for (int i = 0; i < 10; ++i) {
             const Rect& rr = row_rects[i];
             bool has_row = ms.has_result && i < static_cast<int>(ms.ranked.size());
@@ -589,21 +723,32 @@ public:
 
             if (has_row) {
                 const auto& row = ms.ranked[i];
-                char left_txt[32], right_txt[32];
-                std::snprintf(left_txt, sizeof(left_txt), "#%-2d %s", i + 1, row.label.c_str());
-                draw_text(rr.x + 8, rr.y + 9, left_txt, 1, 240, 248, 255);
+                if (ms.animal_mode) {
+                    draw_text(rr.x + 8, rr.y + 9, row.label.substr(0, 15), 1, 240, 248, 255);
+                    int bar_x = rr.x + 108, bar_y = rr.y + 8, bar_w = 110, bar_h = 11;
+                    fill_rect(bar_x, bar_y, bar_w, bar_h, 24, 34, 52, 255);
+                    int fill_w = std::clamp(static_cast<int>(bar_w * (row.overlap_pct / 100.0f)), 0, bar_w);
+                    bool cat_win = (row.rel_prob_pct >= 50.0f);
+                    fill_rect(bar_x, bar_y, fill_w, bar_h, cat_win ? 70 : 245, cat_win ? 230 : 170, cat_win ? 195 : 65, 255);
+                    char rt[24];
+                    std::snprintf(rt, sizeof(rt), "%s %4.0f%%", cat_win ? "CAT" : "DOG", row.overlap_pct);
+                    draw_text(rr.x + 226, rr.y + 9, rt, 1, cat_win ? 130 : 255, cat_win ? 255 : 210, cat_win ? 215 : 135);
+                } else {
+                    char left_txt[32], right_txt[32];
+                    std::snprintf(left_txt, sizeof(left_txt), "#%-2d %s", i + 1, row.label.c_str());
+                    draw_text(rr.x + 8, rr.y + 9, left_txt, 1, 240, 248, 255);
 
-                // Overlap bar
-                int bar_x = rr.x + 68, bar_y = rr.y + 8, bar_w = 112, bar_h = 11;
-                fill_rect(bar_x, bar_y, bar_w, bar_h, 24, 34, 52, 255);
-                int fill_w = std::clamp(static_cast<int>(bar_w * (row.overlap_pct / 100.0f)), 0, bar_w);
-                uint8_t br = (i == 0) ? 75 : 55;
-                uint8_t bg = (i == 0) ? 235 : 175;
-                uint8_t bb = (i == 0) ? 185 : 240;
-                fill_rect(bar_x, bar_y, fill_w, bar_h, br, bg, bb, 255);
+                    int bar_x = rr.x + 68, bar_y = rr.y + 8, bar_w = 112, bar_h = 11;
+                    fill_rect(bar_x, bar_y, bar_w, bar_h, 24, 34, 52, 255);
+                    int fill_w = std::clamp(static_cast<int>(bar_w * (row.overlap_pct / 100.0f)), 0, bar_w);
+                    uint8_t br = (i == 0) ? 75 : 55;
+                    uint8_t bg = (i == 0) ? 235 : 175;
+                    uint8_t bb = (i == 0) ? 185 : 240;
+                    fill_rect(bar_x, bar_y, fill_w, bar_h, br, bg, bb, 255);
 
-                std::snprintf(right_txt, sizeof(right_txt), "%4.1f%% (%2.0f%%)", row.overlap_pct, row.rel_prob_pct);
-                draw_text(rr.x + 188, rr.y + 9, right_txt, 1, 200, 230, 250);
+                    std::snprintf(right_txt, sizeof(right_txt), "%4.1f%% (%2.0f%%)", row.overlap_pct, row.rel_prob_pct);
+                    draw_text(rr.x + 188, rr.y + 9, right_txt, 1, 200, 230, 250);
+                }
             }
         }
 
@@ -611,7 +756,7 @@ public:
         if (!ms.dispatch_status.empty()) {
             draw_text(20, 788, ("INF: " + ms.dispatch_status).substr(0, 48), 1, 120, 235, 195);
         }
-        draw_text(20, 804, "1-9: INFER ON/OFF | B: BENCH | M: BOX", 1, 115, 150, 185);
+        draw_text(20, 804, "DROP JPG/PNG | 1-9: INFER | B: BENCH", 1, 115, 150, 185);
         draw_text(20, 818, "Z: ZOOM | H: HEATMAP | L: RAYS | R: RST", 1, 115, 150, 185);
         dirty_tex = false;
     }
