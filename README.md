@@ -2,6 +2,14 @@
 
 > **Intelligence represented purely as geometry** — a zero-weight, zero-backpropagation CUDA Driver API + OpenGL 4.6 geometric intelligence engine designed to run at **~97,000 images/sec** with **sub-millisecond interactive inference** on consumer GPUs (no `nvcc` / CUDA Toolkit required).
 
+<p align="center">
+  <img src="docs/images/gllm_live_inference_r.png" alt="GLLM Live 2-Stage CUDA Sketch Inference spotlighting all 8 structural sub-shadows of class 'r'" width="49%" />
+  <img src="docs/images/gllm_sphere_overview.png" alt="GLLM 1-Billion-Point 3D Sphere Lattice with 496 non-overlapping sub-shadows converging to 62 outer-shell nodes" width="49%" />
+</p>
+<p align="center">
+  <em>Left: Live 2-stage CUDA sketch inference (<code>MATCH: 'r' #53.0</code>, <code>56.7%</code> overlap) spotlighting all 8 non-overlapping sub-shadows of <code>'r'</code> converging onto Outer Node #53.0.<br/>Right: 1-billion-point implicit 3D sphere lattice holding 62 classes (496 clustered sub-shadows, 0 overlaps) bound to 62 outer-shell nodes.</em>
+</p>
+
 ---
 
 ## Core Architecture

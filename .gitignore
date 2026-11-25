@@ -4,6 +4,7 @@ bin/
 *.o
 *.ppm
 *.png
+!docs/images/*.png
 
 # Local datasets & generated model checkpoints
 data/
