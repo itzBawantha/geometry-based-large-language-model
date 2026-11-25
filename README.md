@@ -10,6 +10,7 @@ GLLM separates a **1-billion-point implicit 3D sphere lattice** (`1241³`, **0 b
 
 - **`bin/gllm_train`** — Dynamically allocates guaranteed non-overlapping `W×H` spaces inside the 3D sphere lattice and binds each class to a unique neighboring outer-shell point (`R = 1.0`). Accumulates overlapping image shadows on GPU via CUDA (`atom.global.add.f32`). **Incremental by design:** run once on digits (`0–9`), then run again on English letters (`A–Z`) or custom image folders into the *same* `.gllm` model—prior spaces and shadows remain untouched with zero overlap.
 - **`bin/gllm_eval`** — Scores unseen test images against every trained class's geometric shadow map directly on the GPU via cosine-overlap matching.
+- **`bin/gllm_inspect`** — Pulls up or exports (`--json` / `--csv` / `--value` / `--label`) the complete lookup table serialized inside any `.gllm` model (outer-shell scalar ID ↔ class label ↔ outer `(x, y, z)` ↔ unique 3D lattice coordinates).
 - **`bin/gllm_viz`** — Zero-copy CUDA–OpenGL 4.6 3D visualizer rendering **only** allocated shadow spaces, their assigned outer-shell points, and 1-to-1 binding lines at 60 FPS (even on a 1-billion-point lattice).
 
 ### Repository Layout
