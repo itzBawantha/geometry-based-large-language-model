@@ -19,6 +19,7 @@ Just as the human brain dedicates specialized anatomical regions to distinct mod
 - **Minimum-Volume Spherical Packing (0 Overlap):** Every class belonging to a manifold packs radially outward from its manifold anchor in strict Euclidean-distance order (`pad_xy=1, pad_z=2`), minimizing enclosed 3D volume while guaranteeing **zero spatial overlap** between subspaces and between separate manifolds.
 - **Tight Deformed-Sphere Envelope:** Around each tightly packed cluster, GLLM computes a **162-vertex geodesic deformed-sphere boundary** (a conformally fitted organic shell — it does not waste volume forcing a perfect sphere) that strictly encloses 100% of its subspaces with minimal skin margin.
 - **CUDA-Resident Semantic Metadata Register (`GpuManifoldDesc`):** Each Operational Manifold is formally registered inside CUDA VRAM as a 128-byte aligned metadata struct containing its `manifold_id`, tight 3D bounds, volume fraction, `name`, and `semantic_label`. During inference, the CUDA PTX kernel **`route_operational_manifolds`** aggregates active sub-shadows per manifold directly on the GPU.
+- **Generalized Gaussian Pyramid Multi-Scale Query Path** ([include/gaussian_pyramid.hpp](include/gaussian_pyramid.hpp)): Builds a Burt-Adelson 5-tap binomial Gaussian Pyramid (`224 → 112 → 56 → 40 → 28`, covering `1.0×`, `1.43×`, and `2.0×` scale octaves) directly from any high-resolution input field. Each pyramid octave × 9 micro-shifts runs inside **one single CUDA kernel launch** (`match_sketch_pruned`) with per-hypothesis 2-cycle 64-bit bitmask pruning—delivering scale invariance across small, medium, and full-size shapes (and future multi-distance mammal facial features) **without retraining canonical Operational Manifolds** and with zero size-threshold hacks.
 - **Standardized Domain Modularity:**
   - **Manifold `#0` (`fundamental_text` / CUDA label: `handwritten_letters_and_numbers`):** Encapsulates all `62` core alphanumeric classes (`0–9`, `A–Z`, `a–z` → `496` clustered sub-shadows) inside **`< 0.1%`** of the 1B-point sphere volume.
   - **Future Manifolds (`#1`, `#2`, …):** Train any new domain into its own isolated Operational Manifold inside the *same* `.gllm` universe sphere using `--manifold <name> --manifold-label <semantic_tag>` (e.g., `geometric_shapes`, `mammal_eyes`, `mammal_ears`, `mammal_mouth`) — automatically anchored outside existing manifold envelopes with zero interference.
@@ -183,7 +184,8 @@ Key `gllm_train` flags:
 Makefile                              # Convenient build / train / benchmark / demo / viz targets
 include/
   cuda_driver_min.hpp                 # Minimal CUDA Driver API bindings (libcuda.so, no nvcc)
-  gllm_model.hpp                      # .gllm format, 0-overlap 3D allocator, IDX & folder loaders
+  gaussian_pyramid.hpp                # Generalized Burt-Adelson multi-scale Gaussian Pyramid engine
+  gllm_model.hpp                      # .gllm v2 format, Operational Manifolds, 0-overlap 3D allocator
   hud_canvas.hpp                      # 224x224 raw-proportion sketch canvas & HUD renderer
 kernels/
   gllm_kernels.ptx                    # JIT-compiled CUDA PTX kernels (shell, train, eval, emit, match)

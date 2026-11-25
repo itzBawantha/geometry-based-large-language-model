@@ -459,9 +459,9 @@ EMIT_DONE:
 //              score    = exp(min(0, LL - 0.5*L_max(p_c) - 0.5*H(x)) / T)  (1 FMA/pix!)
 // -----------------------------------------------------------------------------
 .visible .entry match_sketch_pruned(
-    .param .u64 param_sketch_raw,      // const float[num_shifts * pixels_img] in [0..1]
-    .param .u64 param_sketch_self_ent, // const float[num_shifts] self-entropy 0.5*H(x)
-    .param .u64 param_sketch_mask,     // uint64_t 8x8 coarse occupancy mask Q
+    .param .u64 param_sketch_raw,      // const float[num_hyps * pixels_img] in [0..1]
+    .param .u64 param_sketch_self_ent, // const float[num_hyps] self-entropy 0.5*H(x)
+    .param .u64 param_sketch_masks,    // const uint64_t[num_hyps] 8x8 coarse occupancy masks (per Gaussian pyramid level & shift)
     .param .u64 param_class_masks,     // const uint64_t[num_classes]
     .param .u64 param_class_log_odds,  // const float[num_classes * pixels_img]: log(p/(1-p))
     .param .u64 param_class_prob,      // const float[num_classes * pixels_img]: canonical shadow density in [0..1]
@@ -470,7 +470,7 @@ EMIT_DONE:
     .param .u64 param_out_status,      // uint32_t[num_classes]: 0=PRUNED, 1=CONFIRMED
     .param .u32 param_pixels_img,
     .param .u32 param_num_classes,
-    .param .u32 param_num_shifts,
+    .param .u32 param_num_shifts,      // total multi-scale pyramid hypotheses (e.g. 3 octaves x 9 shifts = 27)
     .param .f32 param_prune_ratio,     // min fraction of Q bits overlapping class mask
     .param .f32 param_inv_t_ln2        // 1.0 / (T * ln(2)) for ex2.approx.f32
 )
@@ -482,7 +482,7 @@ EMIT_DONE:
 
     ld.param.u64 %rd0,  [param_sketch_raw];
     ld.param.u64 %rd1,  [param_sketch_self_ent];
-    ld.param.u64 %rd2,  [param_sketch_mask];
+    ld.param.u64 %rd2,  [param_sketch_masks];
     ld.param.u64 %rd3,  [param_class_masks];
     ld.param.u64 %rd4,  [param_class_log_odds];
     ld.param.u64 %rd20, [param_class_prob];
@@ -502,27 +502,12 @@ EMIT_DONE:
     setp.ge.u32 %p0, %r6, %r1;
     @%p0 bra MATCH_DONE;
 
-    // --- Stage 1: Hardware 64-bit Coarse Bitmask Pruning (2 clock cycles!) ---
+    // Load class coarse 64-bit footprint mask M once
     mul.wide.u32  %rd8,  %r6, 8;
     add.u64       %rd9,  %rd3, %rd8;
     ld.global.u64 %rd10, [%rd9];        // class_mask M
 
-    and.b64  %rd11, %rd2, %rd10;        // Q & M
-    popc.b64 %r7,   %rd2;               // popc(Q)
-    popc.b64 %r8,   %rd11;              // popc(Q & M)
-
-    setp.eq.u32 %p1, %r7, 0;
-    @%p1 bra PRUNE_OUT;
-    setp.eq.u32 %p2, %r8, 0;
-    @%p2 bra PRUNE_OUT;
-
-    cvt.rn.f32.u32 %f2, %r8;
-    cvt.rn.f32.u32 %f3, %r7;
-    div.approx.f32 %f4, %f2, %f3;       // hit_ratio = popc(Q & M) / popc(Q)
-    setp.lt.f32 %p3, %f4, %f0;          // hit_ratio < prune_ratio -> PRUNE!
-    @%p3 bra PRUNE_OUT;
-
-    // --- Stage 2: Multi-Shift Symmetric Bernoulli x Continuous Soft-IoU Completeness ---
+    // Preload class bias & base pointers for Stage-2 multi-scale matching
     mul.wide.u32  %rd12, %r6, 4;
     add.u64       %rd13, %rd5, %rd12;
     ld.global.f32 %f5,   [%rd13];       // class_bias
@@ -532,20 +517,44 @@ EMIT_DONE:
     add.u64      %rd14, %rd4,  %rd12;   // class_log_odds ptr
     add.u64      %rd21, %rd20, %rd12;   // class_prob ptr
 
-    mov.f32 %f6, 0f00000000;            // best_score = 0.0
-    mov.u32 %r9, 0;                     // shift_idx s = 0
+    mov.f32 %f6,  0f00000000;           // best_score = 0.0
+    mov.u32 %r11, 0;                    // survived_hyps = 0
+    mov.u32 %r9,  0;                    // hyp_idx s = 0
 
 SHIFT_LOOP:
     setp.ge.u32 %p4, %r9, %r2;
-    @%p4 bra MATCH_CONFIRM;
+    @%p4 bra SHIFT_DONE;
 
+    // --- Stage 1 (Per-Hypothesis): Hardware 64-bit Coarse Bitmask Pruning (2 cycles!) ---
+    mul.wide.u32  %rd15, %r9, 8;
+    add.u64       %rd16, %rd2, %rd15;
+    ld.global.u64 %rd11, [%rd16];       // Q = sketch_masks[s]
+
+    and.b64  %rd8, %rd11, %rd10;        // Q & M
+    popc.b64 %r7,  %rd11;               // popc(Q)
+    popc.b64 %r8,  %rd8;                // popc(Q & M)
+
+    setp.eq.u32 %p1, %r7, 0;
+    @%p1 bra NEXT_SHIFT;
+    setp.eq.u32 %p2, %r8, 0;
+    @%p2 bra NEXT_SHIFT;
+
+    cvt.rn.f32.u32 %f2, %r8;
+    cvt.rn.f32.u32 %f3, %r7;
+    div.approx.f32 %f4, %f2, %f3;       // hit_ratio = popc(Q & M) / popc(Q)
+    setp.lt.f32 %p3, %f4, %f0;          // hit_ratio < prune_ratio -> skip this pyramid hypothesis!
+    @%p3 bra NEXT_SHIFT;
+
+    add.u32 %r11, %r11, 1;              // survived_hyps++
+
+    // --- Stage 2: Symmetric Bernoulli x Continuous Soft-IoU Completeness ---
     mul.wide.u32  %rd15, %r9, 4;
     add.u64       %rd16, %rd1, %rd15;
-    ld.global.f32 %f7,   [%rd16];       // self_entropy 0.5*H(x) for shift s
+    ld.global.f32 %f7,   [%rd16];       // self_entropy 0.5*H(x) for hyp s
 
     mul.wide.u32 %rd15, %r9, %r0;
     shl.b64      %rd15, %rd15, 2;
-    add.u64      %rd16, %rd0, %rd15;    // sketch_raw ptr for shift s
+    add.u64      %rd16, %rd0, %rd15;    // sketch_raw ptr for hyp s
 
     mov.f32 %f8,  %f5;                  // ll = class_bias
     mov.f32 %f13, 0f00000000;           // inter = 0.0 (sum min(x, p))
@@ -583,14 +592,19 @@ SHIFT_EVAL:
     min.f32        %f12, %f12, 0f3f800000;
 
     // 2) Continuous Soft-IoU density completeness = sum min(x,p) / (sum max(x,p) + 1e-6)
-    //    Strictly penalizes missing shadow mass (e.g. dots/partial strokes) & void overflow!
     add.f32        %f14, %f14, 0f358637bd;
     div.approx.f32 %f18, %f13, %f14;
     mul.f32        %f12, %f12, %f18;
 
     max.f32 %f6, %f6, %f12;             // best_score = max(best_score, score)
+
+NEXT_SHIFT:
     add.u32 %r9, %r9, 1;
     bra SHIFT_LOOP;
+
+SHIFT_DONE:
+    setp.eq.u32 %p1, %r11, 0;
+    @%p1 bra PRUNE_OUT;
 
 MATCH_CONFIRM:
     mul.wide.u32  %rd18, %r6, 4;

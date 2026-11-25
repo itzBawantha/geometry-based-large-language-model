@@ -10,6 +10,7 @@
 // =============================================================================
 
 #include "../include/cuda_driver_min.hpp"
+#include "../include/gaussian_pyramid.hpp"
 #include "../include/gllm_model.hpp"
 #include "../include/hud_canvas.hpp"
 
@@ -378,8 +379,8 @@ int main(int argc, char** argv) {
             h_bias[r] = static_cast<float>(bs - 0.5 * lmax);
         }
 
-        const uint32_t kNumShifts = 9u;
-        CUdeviceptr dm = 0, dlo = 0, dpr = 0, db = 0, dsk = 0, dent = 0, dov = 0, dst = 0;
+        const uint32_t kMaxHyps = 36u;
+        CUdeviceptr dm = 0, dlo = 0, dpr = 0, db = 0, dsk = 0, dent = 0, dsqm = 0, dov = 0, dst = 0;
         CU_CHECK(cuMemAlloc_v2(&dm, R * sizeof(uint64_t)));
         CU_CHECK(cuMemcpyHtoD_v2(dm, h_masks.data(), R * sizeof(uint64_t)));
         CU_CHECK(cuMemAlloc_v2(&dlo, h_lo.size() * sizeof(float)));
@@ -388,8 +389,9 @@ int main(int argc, char** argv) {
         CU_CHECK(cuMemcpyHtoD_v2(dpr, h_pr.data(), h_pr.size() * sizeof(float)));
         CU_CHECK(cuMemAlloc_v2(&db, R * sizeof(float)));
         CU_CHECK(cuMemcpyHtoD_v2(db, h_bias.data(), R * sizeof(float)));
-        CU_CHECK(cuMemAlloc_v2(&dsk, static_cast<size_t>(kNumShifts) * P * sizeof(float)));
-        CU_CHECK(cuMemAlloc_v2(&dent, kNumShifts * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&dsk,  static_cast<size_t>(kMaxHyps) * P * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&dent, kMaxHyps * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&dsqm, kMaxHyps * sizeof(uint64_t)));
         CU_CHECK(cuMemAlloc_v2(&dov, R * sizeof(float)));
         CU_CHECK(cuMemAlloc_v2(&dst, R * sizeof(uint32_t)));
 
@@ -397,40 +399,22 @@ int main(int argc, char** argv) {
         CU_CHECK(cuEventCreate(&me0, 0));
         CU_CHECK(cuEventCreate(&me1, 0));
 
-        std::vector<float> h_raw(static_cast<size_t>(kNumShifts) * P);
-        std::vector<float> h_ent(kNumShifts), h_ov(R);
+        std::vector<float> h_ov(R);
         std::vector<uint32_t> h_st(R);
         std::vector<float> best_by_oid(max_oid + 1u);
         float prune_ratio = 0.68f;
         float inv_t_ln2   = static_cast<float>(1.0 / (200.0 * std::log(2.0)));
 
-        auto run_live = [&](const float* norm28, float& out_ms) {
-            uint32_t s = 0;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    float* dp = &h_raw[static_cast<size_t>(s) * P];
-                    std::fill(dp, dp + P, 0.0f);
-                    for (int y = 0; y < 28; ++y) {
-                        int sy = y - dy;
-                        if (sy < 0 || sy >= 28) continue;
-                        for (int x = 0; x < 28; ++x) {
-                            int sx = x - dx;
-                            if (sx >= 0 && sx < 28) dp[y * 28 + x] = norm28[sy * 28 + sx];
-                        }
-                    }
-                    double e = 0.0;
-                    for (uint32_t p = 0; p < P; ++p) {
-                        double xc = std::clamp(static_cast<double>(dp[p]), 1e-5, 1.0 - 1e-5);
-                        e += xc * std::log(xc) + (1.0 - xc) * std::log(1.0 - xc);
-                    }
-                    h_ent[s++] = static_cast<float>(0.5 * e);
-                }
+        auto run_live_stack = [&](const gllm::MultiScaleQueryStack& qs, float& out_ms) {
+            uint32_t nh = std::min<uint32_t>(qs.num_hyps, kMaxHyps);
+            if (nh == 0u) {
+                return std::make_pair(std::vector<std::pair<float, uint32_t>>{}, true);
             }
-            uint64_t qm = gllm::compute_coarse_mask64(norm28, 0.24f);
-            CU_CHECK(cuMemcpyHtoD_v2(dsk, h_raw.data(), h_raw.size() * sizeof(float)));
-            CU_CHECK(cuMemcpyHtoD_v2(dent, h_ent.data(), h_ent.size() * sizeof(float)));
-            uint32_t pp = P, nc = R, ns = kNumShifts;
-            void* args[] = {&dsk, &dent, &qm, &dm, &dlo, &dpr, &db, &dov, &dst, &pp, &nc, &ns, &prune_ratio, &inv_t_ln2};
+            CU_CHECK(cuMemcpyHtoD_v2(dsk,  qs.raw_hyps.data(),       static_cast<size_t>(nh) * P * sizeof(float)));
+            CU_CHECK(cuMemcpyHtoD_v2(dent, qs.self_entropies.data(), static_cast<size_t>(nh) * sizeof(float)));
+            CU_CHECK(cuMemcpyHtoD_v2(dsqm, qs.coarse_masks.data(),   static_cast<size_t>(nh) * sizeof(uint64_t)));
+            uint32_t pp = P, nc = R, ns = nh;
+            void* args[] = {&dsk, &dent, &dsqm, &dm, &dlo, &dpr, &db, &dov, &dst, &pp, &nc, &ns, &prune_ratio, &inv_t_ln2};
             CU_CHECK(cuEventRecord(me0, nullptr));
             CU_CHECK(cuLaunchKernel(fn_match, (R + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
             CU_CHECK(cuEventRecord(me1, nullptr));
@@ -453,6 +437,11 @@ int main(int argc, char** argv) {
             std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             bool is_unk = ranked.empty() || (ranked[0].first * 100.0f < unknown_thresh);
             return std::make_pair(std::move(ranked), is_unk);
+        };
+
+        auto run_live = [&](const float* norm28, float& out_ms) {
+            auto qs = gllm::build_gaussian_pyramid_stack(norm28, 28u, 28u);
+            return run_live_stack(qs, out_ms);
         };
 
         auto eval_live_ds = [&](const char* title, const gllm::LabeledImageBatch& ds, bool report_10way) {
@@ -503,34 +492,44 @@ int main(int argc, char** argv) {
         if (has_mnist)  eval_live_ds("MNIST Digits", ds_mnist, true);
         if (has_emnist) eval_live_ds("EMNIST Letters", ds_emnist, false);
 
-        // Open-World OOD Rejection Test (25 single dots + 25 short partial strokes on raw 224x224 canvas)
+        // Open-World OOD Rejection & Gaussian Pyramid Scale-Invariance Audit (on raw 224x224 canvas)
         gllm::SketchSidebarHUD hud;
-        uint32_t dot_rej = 0, dash_rej = 0;
-        double dot_max = 0.0, dash_max = 0.0;
+        uint32_t dot_rej = 0;
+        double dot_max = 0.0;
         for (int k = 0; k < 25; ++k) {
             hud.clear();
             float x = 40.0f + (k % 5) * 35.0f, y = 40.0f + (k / 5) * 35.0f;
             hud.draw_stroke(x, y, x, y, 8.0f + (k % 3) * 2.5f);
             float ms = 0.0f;
-            auto res = run_live(hud.norm28.data(), ms);
+            auto qs  = gllm::build_gaussian_pyramid_stack(hud.canvas.data(), 224u, 224u);
+            auto res = run_live_stack(qs, ms);
             if (res.second) dot_rej++;
             if (!res.first.empty()) dot_max = std::max(dot_max, static_cast<double>(res.first[0].first * 100.0));
         }
-        for (int k = 0; k < 25; ++k) {
-            hud.clear();
-            float ang = k * 0.25f, len = 18.0f + (k % 5) * 7.0f;
-            hud.draw_stroke(112.0f - len * std::cos(ang), 112.0f - len * std::sin(ang),
-                            112.0f + len * std::cos(ang), 112.0f + len * std::sin(ang));
-            float ms = 0.0f;
-            auto res = run_live(hud.norm28.data(), ms);
-            if (res.second) dash_rej++;
-            if (!res.first.empty()) dash_max = std::max(dash_max, static_cast<double>(res.first[0].first * 100.0));
-        }
-        std::printf("\n[OPEN-WORLD OOD REJECTION] (< %.1f%% -> UNKNOWN)\n", unknown_thresh);
-        std::printf("          Single Click Dots:         %2u / 25 rejected (%.1f%%) | Max Score: %.1f%%\n",
+        std::printf("\n[GAUSSIAN PYRAMID SCALE-INVARIANCE & OOD AUDIT] (Burt-Adelson L28/L40/L56 x 9 shifts)\n");
+        std::printf("          Single Click Dots (OOD):   %2u / 25 rejected as UNKNOWN (%.1f%%) | Max Score: %.1f%%\n",
                     dot_rej, 100.0 * dot_rej / 25.0, dot_max);
-        std::printf("          Short Partial Strokes:     %2u / 25 rejected (%.1f%%) | Max Score: %.1f%%\n",
-                    dash_rej, 100.0 * dash_rej / 25.0, dash_max);
+        struct ScaleCase { const char* name; float rx; float ry; };
+        ScaleCase scases[3] = {
+            {"Small 'o'  (68px)", 34.0f, 38.0f},
+            {"Medium 'o' (104px)", 52.0f, 58.0f},
+            {"Full 'O'   (144px)", 72.0f, 82.0f}
+        };
+        for (const auto& sc : scases) {
+            hud.clear();
+            for (int i = 0; i < 64; ++i) {
+                float a0 = i * 6.2831853f / 64.0f, a1 = (i + 1) * 6.2831853f / 64.0f;
+                hud.draw_stroke(112.0f + sc.rx * std::cos(a0), 112.0f + sc.ry * std::sin(a0),
+                                112.0f + sc.rx * std::cos(a1), 112.0f + sc.ry * std::sin(a1));
+            }
+            float ms = 0.0f;
+            auto qs  = gllm::build_gaussian_pyramid_stack(hud.canvas.data(), 224u, 224u);
+            auto res = run_live_stack(qs, ms);
+            std::string top1 = res.first.empty() ? "NONE" : oid_to_lbl[res.first[0].second];
+            float top_sc = res.first.empty() ? 0.0f : res.first[0].first * 100.0f;
+            std::printf("          %-20s       -> '%s' (%.1f%%) | %u levels (%u hyps) | %.3f ms\n",
+                        sc.name, top1.c_str(), top_sc, qs.num_levels, qs.num_hyps, ms);
+        }
 
         CU_CHECK(cuEventDestroy_v2(me0));
         CU_CHECK(cuEventDestroy_v2(me1));
@@ -540,6 +539,7 @@ int main(int argc, char** argv) {
         CU_CHECK(cuMemFree_v2(db));
         CU_CHECK(cuMemFree_v2(dsk));
         CU_CHECK(cuMemFree_v2(dent));
+        CU_CHECK(cuMemFree_v2(dsqm));
         CU_CHECK(cuMemFree_v2(dov));
         CU_CHECK(cuMemFree_v2(dst));
     }

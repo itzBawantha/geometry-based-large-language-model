@@ -10,6 +10,7 @@
 // =============================================================================
 
 #include "../include/cuda_driver_min.hpp"
+#include "../include/gaussian_pyramid.hpp"
 #include "../include/gllm_model.hpp"
 #include "../include/hud_canvas.hpp"
 
@@ -389,7 +390,7 @@ int main(int argc, char** argv) {
     float max_alloc_radius = 0.05f;
     float step = 2.0f / static_cast<float>(model.lattice_grid);
     uint32_t match_pix = 784u; // 28x28
-    constexpr uint32_t kNumShifts = 9u; // dx, dy in {-1, 0, +1}
+    constexpr uint32_t kMaxHyps = 36u; // up to 4 Gaussian pyramid octaves x 9 micro-shifts
 
     h_log_odds.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
     h_class_prob.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
@@ -496,7 +497,8 @@ int main(int argc, char** argv) {
 
     // Upload GPU model, matcher & Operational Manifold metadata buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_counter = 0;
-    CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0, d_sketch_raw = 0, d_sketch_ent = 0;
+    CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0;
+    CUdeviceptr d_sketch_raw = 0, d_sketch_ent = 0, d_sketch_masks = 0;
     CUdeviceptr d_out_ov = 0, d_out_st = 0;
     CUdeviceptr d_manifolds = 0, d_reg_manifold = 0, d_man_score = 0, d_man_reg = 0, d_man_act = 0;
     CU_CHECK(cuMemAlloc_v2(&d_regions, h_regions.size() * sizeof(gllm::GpuRegionDesc)));
@@ -515,8 +517,9 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemcpyHtoD_v2(d_class_prob, h_class_prob.data(), h_class_prob.size() * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_bias,       h_class_bias.size() * sizeof(float)));
     CU_CHECK(cuMemcpyHtoD_v2(d_bias,      h_class_bias.data(), h_class_bias.size() * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_sketch_raw, static_cast<size_t>(kNumShifts) * match_pix * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_sketch_ent, static_cast<size_t>(kNumShifts) * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_sketch_raw,   static_cast<size_t>(kMaxHyps) * match_pix * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_sketch_ent,   static_cast<size_t>(kMaxHyps) * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_sketch_masks, static_cast<size_t>(kMaxHyps) * sizeof(uint64_t)));
     CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_regions * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_st, num_regions * sizeof(uint32_t)));
 
@@ -709,9 +712,9 @@ int main(int argc, char** argv) {
     bool dirty_lat     = true;
 
     // -------------------------------------------------------------------------
-    // Run 2-Stage CUDA Non-Linear Bernoulli Log-Likelihood Match on 28x28 Sketch!
+    // Run 2-Stage Multi-Scale Gaussian Pyramid CUDA Match (Bernoulli x Soft-IoU)
     // -------------------------------------------------------------------------
-    auto run_cuda_capture = [&]() {
+    auto run_cuda_capture = [&](bool use_canvas_pyramid = true) {
         double base_mean = 0.0;
         for (uint32_t p = 0; p < match_pix; ++p) base_mean += hud.norm28[p];
         base_mean /= match_pix;
@@ -720,40 +723,21 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // Build 9 micro-shifted variants (dx, dy in {-1, 0, +1}) + exact self-entropy H(x)
-        std::vector<float> h_sk_raw(static_cast<size_t>(kNumShifts) * match_pix, 0.0f);
-        std::vector<float> h_sk_ent(kNumShifts, 0.0f);
-        uint32_t s_idx = 0;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                float* raw_dst = &h_sk_raw[static_cast<size_t>(s_idx) * match_pix];
-                for (int y = 0; y < 28; ++y) {
-                    int sy = y - dy;
-                    if (sy < 0 || sy >= 28) continue;
-                    for (int x = 0; x < 28; ++x) {
-                        int sx = x - dx;
-                        if (sx >= 0 && sx < 28) raw_dst[y * 28 + x] = hud.norm28[sy * 28 + sx];
-                    }
-                }
-                double ent = 0.0;
-                for (uint32_t p = 0; p < match_pix; ++p) {
-                    double xc = std::clamp(static_cast<double>(raw_dst[p]), 1e-5, 1.0 - 1e-5);
-                    ent += xc * std::log(xc) + (1.0 - xc) * std::log(1.0 - xc);
-                }
-                h_sk_ent[s_idx] = static_cast<float>(0.5 * ent);
-                s_idx++;
-            }
-        }
-        uint64_t q_mask = gllm::compute_coarse_mask64(hud.norm28.data(), 0.24f);
-        uint32_t num_shifts = kNumShifts;
+        // Build Burt-Adelson Multi-Scale Gaussian Pyramid (L28=1.0x, L40=1.43x, L56=2.0x) x 9 shifts
+        gllm::MultiScaleQueryStack qstack = use_canvas_pyramid
+            ? gllm::build_gaussian_pyramid_stack(hud.canvas.data(), gllm::SketchSidebarHUD::kCanvasS, gllm::SketchSidebarHUD::kCanvasS)
+            : gllm::build_gaussian_pyramid_stack(hud.norm28.data(), 28u, 28u);
+        if (qstack.num_hyps == 0u) return;
+        uint32_t num_hyps = std::min<uint32_t>(qstack.num_hyps, kMaxHyps);
         float inv_t_ln2 = static_cast<float>(1.0 / (200.0 * std::log(2.0)));
 
-        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_raw, h_sk_raw.data(), h_sk_raw.size() * sizeof(float)));
-        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_ent, h_sk_ent.data(), h_sk_ent.size() * sizeof(float)));
+        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_raw,   qstack.raw_hyps.data(),       static_cast<size_t>(num_hyps) * match_pix * sizeof(float)));
+        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_ent,   qstack.self_entropies.data(), static_cast<size_t>(num_hyps) * sizeof(float)));
+        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_masks, qstack.coarse_masks.data(),   static_cast<size_t>(num_hyps) * sizeof(uint64_t)));
 
         void* m_params[] = {
-            &d_sketch_raw, &d_sketch_ent, &q_mask, &d_masks, &d_log_odds, &d_class_prob, &d_bias,
-            &d_out_ov, &d_out_st, &match_pix, &num_regions, &num_shifts, &prune_ratio, &inv_t_ln2
+            &d_sketch_raw, &d_sketch_ent, &d_sketch_masks, &d_masks, &d_log_odds, &d_class_prob, &d_bias,
+            &d_out_ov, &d_out_st, &match_pix, &num_regions, &num_hyps, &prune_ratio, &inv_t_ln2
         };
         CU_CHECK(cuEventRecord(ev_s, nullptr));
         CU_CHECK(cuLaunchKernel(fn_match, (num_regions + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, m_params, nullptr));
@@ -792,7 +776,7 @@ int main(int argc, char** argv) {
         // Aggregate sub-shadow variant scores per unique class (max-pool across each class's K clusters!)
         struct ClsAgg { float best_ov = -1.0f; uint32_t survived = 0; uint32_t total = 0; };
         std::map<uint32_t, ClsAgg> agg;
-        uint32_t reg_survived = 0, reg_pruned = 0;
+        uint32_t reg_survived = 0;
         for (uint32_t r = 0; r < num_regions; ++r) {
             uint32_t oid = model.classes[r].outer_idx;
             auto& a = agg[oid];
@@ -801,8 +785,6 @@ int main(int argc, char** argv) {
                 a.survived++;
                 reg_survived++;
                 if (h_ov[r] > a.best_ov) a.best_ov = h_ov[r];
-            } else {
-                reg_pruned++;
             }
         }
 
@@ -850,8 +832,9 @@ int main(int argc, char** argv) {
         hud.dirty_tex = true;
 
         // Print crisp diagnostic table to terminal
-        std::printf("\n[CAPTURE] CUDA 2-Stage Match: %.3f ms | Classes: %u/%u | Sub-Shadows: %u/%u survived (%u pruned)\n",
-                    ms, match_summary.survived_count, num_classes, reg_survived, num_regions, reg_pruned);
+        std::printf("\n[CAPTURE] CUDA Gaussian Pyramid (%u levels, %u hyps): %.3f ms | Manifold: '%s' (%s) | Classes: %u/%u | Sub-Shadows: %u/%u survived\n",
+                    qstack.num_levels, num_hyps, ms, routed_man_name.c_str(), routed_man_sem.c_str(),
+                    match_summary.survived_count, num_classes, reg_survived, num_regions);
         if (match_summary.is_unknown) {
             std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 28.0%% threshold)\n",
                         match_summary.ranked.empty() ? 0.0f : match_summary.ranked[0].overlap_pct);
@@ -893,7 +876,7 @@ int main(int argc, char** argv) {
                     tmp.swap(tr);
                 }
                 hud.load_raw_28x28(tmp.data());
-                run_cuda_capture();
+                run_cuda_capture(false);
             }
             gzclose(f);
         }
@@ -1168,6 +1151,7 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_bias));
     CU_CHECK(cuMemFree_v2(d_sketch_raw));
     CU_CHECK(cuMemFree_v2(d_sketch_ent));
+    CU_CHECK(cuMemFree_v2(d_sketch_masks));
     CU_CHECK(cuMemFree_v2(d_out_ov));
     CU_CHECK(cuMemFree_v2(d_out_st));
     CU_CHECK(cuMemFree_v2(d_manifolds));

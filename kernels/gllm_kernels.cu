@@ -76,7 +76,7 @@ extern "C" __global__ void eval_score_shadows(
 extern "C" __global__ void match_sketch_pruned(
     const float* __restrict__ sketch_raw,
     const float* __restrict__ sketch_self_ent,
-    uint64_t sketch_mask,
+    const uint64_t* __restrict__ sketch_masks,
     const uint64_t* __restrict__ class_masks,
     const float* __restrict__ class_log_odds,
     const float* __restrict__ class_prob,
@@ -85,30 +85,32 @@ extern "C" __global__ void match_sketch_pruned(
     uint32_t* __restrict__ out_status,
     uint32_t pixels_img,
     uint32_t num_classes,
-    uint32_t num_shifts,
+    uint32_t num_hyps,
     float prune_ratio,
     float inv_t_ln2
 ) {
     uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= num_classes) return;
 
-    // Stage 1: Hardware 64-bit coarse footprint pruning (and.b64 + popc.b64)
-    int qbits = __popcll(sketch_mask);
-    int hits  = __popcll(sketch_mask & class_masks[c]);
-    if (qbits == 0 || hits == 0 || (static_cast<float>(hits) / static_cast<float>(qbits)) < prune_ratio) {
-        out_overlap[c] = 0.0f;
-        out_status[c]  = 0u;
-        return;
-    }
-
-    // Stage 2: Multi-shift symmetric Bernoulli likelihood x continuous Soft-IoU completeness
-    //   - Bernoulli log-odds strictly separates core vs void strokes
-    //   - Soft-IoU = sum min(x, p) / sum max(x, p) strictly penalizes missing shadow mass & void overflow
+    // Multi-Scale Gaussian Pyramid (octaves x shifts):
+    //   Stage 1: Per-hypothesis hardware 64-bit bitmask pruning (and.b64 + popc.b64)
+    //   Stage 2: Symmetric Bernoulli log-likelihood x Continuous Soft-IoU completeness
+    uint64_t cmask = class_masks[c];
     const float* log_odds = class_log_odds + static_cast<size_t>(c) * pixels_img;
     const float* prob     = class_prob     + static_cast<size_t>(c) * pixels_img;
     float bias = class_bias[c];
     float best_score = 0.0f;
-    for (uint32_t s = 0; s < num_shifts; ++s) {
+    uint32_t survived = 0u;
+
+    for (uint32_t s = 0; s < num_hyps; ++s) {
+        uint64_t qmask = sketch_masks[s];
+        int qbits = __popcll(qmask);
+        int hits  = __popcll(qmask & cmask);
+        if (qbits == 0 || hits == 0 || (static_cast<float>(hits) / static_cast<float>(qbits)) < prune_ratio) {
+            continue;
+        }
+        survived++;
+
         const float* sraw = sketch_raw + static_cast<size_t>(s) * pixels_img;
         float ll = bias, inter = 0.0f, uni = 0.0f;
         for (uint32_t p = 0; p < pixels_img; ++p) {
@@ -123,8 +125,14 @@ extern "C" __global__ void match_sketch_pruned(
         float iou  = inter / (uni + 1e-6f);
         best_score = fmaxf(best_score, bern * iou);
     }
-    out_overlap[c] = best_score;
-    out_status[c]  = 1u;
+
+    if (survived == 0u) {
+        out_overlap[c] = 0.0f;
+        out_status[c]  = 0u;
+    } else {
+        out_overlap[c] = best_score;
+        out_status[c]  = 1u;
+    }
 }
 
 // 128-byte CUDA-resident Operational Manifold Metadata Register
