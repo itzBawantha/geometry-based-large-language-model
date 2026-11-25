@@ -1,0 +1,4 @@
+cuda_sphere
+*.o
+*.ppm
+*.png

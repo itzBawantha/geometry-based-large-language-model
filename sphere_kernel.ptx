@@ -1,0 +1,241 @@
+// =============================================================================
+// CUDA PTX Kernel: Outer-Layer Point Sphere Generator & Real-Time Animator
+// Target: sm_52+ (JIT-compiled by NVIDIA CUDA Driver to native GPU SASS)
+//
+// Each thread computes 1 point strictly on the outer spherical shell using a
+// stateless PCG32 uniform spherical sampler (zero pole clustering, zero moire
+// artifacts at any point count from 1M to 10M+), applies the active CUDA mode
+// and palette, and performs two coalesced 128-bit vector stores directly into
+// the mapped OpenGL VBO.
+//
+// Vertex layout (32 bytes per point, 16-byte aligned):
+//   float4 pos_wave : { px, py, pz, wave_norm }
+//   float4 color    : { r,  g,  b,  alpha     }
+// =============================================================================
+
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry update_sphere_points(
+    .param .u64 param_out_ptr,
+    .param .u32 param_count,
+    .param .f32 param_time,
+    .param .u32 param_mode,
+    .param .u32 param_palette
+)
+{
+    .reg .pred %p<10>;
+    .reg .u32  %r<24>;
+    .reg .u64  %rd<8>;
+    .reg .f32  %f<48>;
+
+    // Load kernel arguments
+    ld.param.u64 %rd0, [param_out_ptr];
+    ld.param.u32 %r0,  [param_count];
+    ld.param.f32 %f0,  [param_time];
+    ld.param.u32 %r1,  [param_mode];
+    ld.param.u32 %r2,  [param_palette];
+
+    // Global 1D thread index: idx = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;
+
+    // Bounds check
+    setp.ge.u32 %p0, %r6, %r0;
+    @%p0 bra DONE;
+
+    // -------------------------------------------------------------------------
+    // 1. Uniform Outer-Sphere Sampling via PCG32 (Archimedes' Hat-Box Theorem)
+    //    Produces exact uniform area density on S^2 with zero moire patterns.
+    // -------------------------------------------------------------------------
+    // Hash #1: u1 -> ny in [-1, 1]
+    shl.b32    %r7,  %r6, 1;
+    add.u32    %r7,  %r7, 1;
+    mad.lo.u32 %r8,  %r7, 747796405, 2891336453;
+    shr.u32    %r9,  %r8, 28;
+    add.u32    %r9,  %r9, 4;
+    shr.u32    %r10, %r8, %r9;
+    xor.b32    %r10, %r10, %r8;
+    mul.lo.u32 %r10, %r10, 277803737;
+    shr.u32    %r11, %r10, 22;
+    xor.b32    %r11, %r11, %r10;
+    shr.u32    %r11, %r11, 8;                        // 24-bit uniform uint
+    cvt.rn.f32.u32 %f2, %r11;
+    mul.f32    %f2, %f2, 0f33800000;                 // u1 in [0, 1)
+    fma.rn.f32 %f1, %f2, 0f40000000, 0fbf800000;     // ny = 2.0 * u1 - 1.0
+
+    // Hash #2: u2 -> theta in [0, 2*pi)
+    add.u32    %r12, %r7, 1;
+    mad.lo.u32 %r13, %r12, 747796405, 2891336453;
+    shr.u32    %r14, %r13, 28;
+    add.u32    %r14, %r14, 4;
+    shr.u32    %r15, %r13, %r14;
+    xor.b32    %r15, %r15, %r13;
+    mul.lo.u32 %r15, %r15, 277803737;
+    shr.u32    %r16, %r15, 22;
+    xor.b32    %r16, %r16, %r15;
+    shr.u32    %r16, %r16, 8;                        // 24-bit uniform uint
+    cvt.rn.f32.u32 %f5, %r16;
+    mul.f32    %f5, %f5, 0f33800000;                 // u2 in [0, 1)
+    mul.f32    %f5, %f5, 0f40c90fdb;                 // theta = 2*pi * u2
+
+    // Hash #3: u3 in [0, 1) for outer-shell crust mode
+    add.u32    %r17, %r7, 2;
+    mad.lo.u32 %r18, %r17, 747796405, 2891336453;
+    shr.u32    %r19, %r18, 28;
+    add.u32    %r19, %r19, 4;
+    shr.u32    %r20, %r18, %r19;
+    xor.b32    %r20, %r20, %r18;
+    mul.lo.u32 %r20, %r20, 277803737;
+    shr.u32    %r21, %r20, 22;
+    xor.b32    %r21, %r21, %r20;
+    shr.u32    %r21, %r21, 8;
+    cvt.rn.f32.u32 %f28, %r21;
+    mul.f32    %f28, %f28, 0f33800000;               // u3 in [0, 1)
+
+    // r_perp = sqrt(max(0.0, 1.0 - ny * ny))
+    mul.f32         %f3, %f1, %f1;
+    sub.f32         %f3, 0f3f800000, %f3;
+    max.f32         %f3, %f3, 0f00000000;
+    sqrt.approx.f32 %f4, %f3;                        // r_perp
+
+    sin.approx.f32  %f6, %f5;                        // sin(theta)
+    cos.approx.f32  %f7, %f5;                        // cos(theta)
+    mul.f32         %f8, %f7, %f4;                   // nx = cos(theta) * r_perp
+    // %f1 = ny
+    mul.f32         %f9, %f6, %f4;                   // nz = sin(theta) * r_perp
+
+    // -------------------------------------------------------------------------
+    // 2. Outer Layer Radius & Wave Accent (mode 0 = Pure Sphere, 1 = Ripples, 2 = Crust)
+    //    Outputs: %f16 = radius, %f17 = wave_norm in [0, 1]
+    // -------------------------------------------------------------------------
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra MODE_PURE;
+    setp.eq.u32 %p2, %r1, 1;
+    @%p2 bra MODE_RIPPLE;
+    bra MODE_CRUST;
+
+MODE_PURE:
+    // Exact unit outer spherical shell: R = 1.0000
+    mov.f32         %f16, 0f3f800000;
+    // Traveling luminous spherical wave across the point colors
+    mul.f32         %f10, %f1, 0f40a00000;           // 5.0 * ny
+    fma.rn.f32      %f10, %f8, 0f40400000, %f10;     // + 3.0 * nx
+    fma.rn.f32      %f10, %f0, 0fc0000000, %f10;     // - 2.0 * t
+    sin.approx.f32  %f11, %f10;
+    fma.rn.f32      %f17, %f11, 0f3f000000, 0f3f000000; // 0.5 + 0.5*sin
+    bra MODE_DONE;
+
+MODE_RIPPLE:
+    // Harmonic surface ripples across the outer spherical shell
+    mul.f32         %f10, %f8, 0f40c00000;           // 6.0 * nx
+    fma.rn.f32      %f10, %f1, 0f40a00000, %f10;     // + 5.0 * ny
+    fma.rn.f32      %f10, %f0, 0fc00ccccd, %f10;     // - 2.2 * t
+    sin.approx.f32  %f11, %f10;
+
+    mul.f32         %f12, %f9, 0f40e00000;           // 7.0 * nz
+    fma.rn.f32      %f12, %f1, 0fc0800000, %f12;     // - 4.0 * ny
+    fma.rn.f32      %f12, %f0, 0f3fd9999a, %f12;     // + 1.7 * t
+    cos.approx.f32  %f13, %f12;
+
+    mul.f32         %f14, %f1, 0f41300000;           // 11.0 * ny
+    fma.rn.f32      %f14, %f0, 0f40400000, %f14;     // + 3.0 * t
+    sin.approx.f32  %f15, %f14;
+
+    mul.f32         %f11, %f11, %f13;
+    mul.f32         %f11, %f11, 0f3f000000;          // 0.5 * s1 * c2
+    fma.rn.f32      %f11, %f15, 0f3e800000, %f11;    // + 0.25 * s3
+
+    // radius = 1.0 + 0.030 * w
+    fma.rn.f32      %f16, %f11, 0f3cf5c28f, 0f3f800000;
+    fma.rn.f32      %f17, %f11, 0f3f266666, 0f3f000000;
+    max.f32         %f17, %f17, 0f00000000;
+    min.f32         %f17, %f17, 0f3f800000;
+    bra MODE_DONE;
+
+MODE_CRUST:
+    // Thin multi-micro-layer outer shell crust: R in [0.975, 1.005]
+    mov.f32         %f17, %f28;                      // u3 in [0, 1)
+    mul.f32         %f10, %f8, 0f41000000;           // 8.0 * nx
+    fma.rn.f32      %f10, %f0, 0f40000000, %f10;     // + 2.0 * t
+    sin.approx.f32  %f11, %f10;
+    mul.f32         %f11, %f11, %f17;
+    fma.rn.f32      %f16, %f17, 0f3cf5c28f, 0f3f79999a;
+    fma.rn.f32      %f16, %f11, 0f3c449ba6, %f16;
+
+MODE_DONE:
+    // Final 3D point position on the outer layer
+    mul.f32 %f18, %f8, %f16;                         // px = nx * radius
+    mul.f32 %f19, %f1, %f16;                         // py = ny * radius
+    mul.f32 %f20, %f9, %f16;                         // pz = nz * radius
+    mov.f32 %f21, %f17;                              // wave_norm
+
+    // -------------------------------------------------------------------------
+    // 3. Per-Point Color Computed in CUDA
+    //    lat = 0.5 * ny + 0.5 in [0, 1]
+    // -------------------------------------------------------------------------
+    fma.rn.f32 %f26, %f1, 0f3f000000, 0f3f000000;
+
+    setp.eq.u32 %p3, %r2, 0;
+    @%p3 bra PAL_COSMIC;
+    setp.eq.u32 %p4, %r2, 1;
+    @%p4 bra PAL_SOLAR;
+    setp.eq.u32 %p5, %r2, 2;
+    @%p5 bra PAL_HOLO;
+    bra PAL_NORMAL;
+
+PAL_COSMIC:
+    // Electric Cyan -> Deep Cobalt -> Neon Violet with luminous wave highlights
+    sub.f32    %f27, 0f3f800000, %f26;               // 1 - lat
+    fma.rn.f32 %f22, %f27, 0f3f0ccccd, 0f3da3d70a;   // r = 0.08 + 0.55*(1-lat) + 0.35*wave
+    fma.rn.f32 %f22, %f17, 0f3eb33333, %f22;
+    fma.rn.f32 %f23, %f26, 0f3f266666, 0f3df5c28f;   // g = 0.12 + 0.65*lat + 0.30*wave
+    fma.rn.f32 %f23, %f17, 0f3eb33333, %f23;
+    fma.rn.f32 %f24, %f17, 0f3e800000, 0f3f400000;   // b = 0.75 + 0.25*wave
+    mov.f32    %f25, 0f3f800000;
+    bra PAL_DONE;
+
+PAL_SOLAR:
+    // Deep Sapphire -> Turquoise -> Molten Gold
+    fma.rn.f32 %f22, %f17, 0f3f666666, 0f3da3d70a;
+    fma.rn.f32 %f23, %f17, 0f3f266666, 0f3e19999a;
+    fma.rn.f32 %f23, %f26, 0f3e4ccccd, %f23;
+    sub.f32    %f27, 0f3f800000, %f17;
+    fma.rn.f32 %f24, %f27, 0f3f0ccccd, 0f3e4ccccd;
+    mov.f32    %f25, 0f3f800000;
+    bra PAL_DONE;
+
+PAL_HOLO:
+    // Crisp Holographic Ice-Cyan
+    fma.rn.f32 %f22, %f17, 0f3ee66666, 0f3e19999a;
+    fma.rn.f32 %f23, %f17, 0f3eb33333, 0f3f266666;
+    fma.rn.f32 %f24, %f26, 0f3e19999a, 0f3f59999a;
+    mov.f32    %f25, 0f3f800000;
+    bra PAL_DONE;
+
+PAL_NORMAL:
+    // Spherical surface normal RGB spectrum
+    fma.rn.f32 %f22, %f8, 0f3f000000, 0f3f000000;
+    fma.rn.f32 %f23, %f1, 0f3f000000, 0f3f000000;
+    fma.rn.f32 %f24, %f9, 0f3f000000, 0f3f000000;
+    mov.f32    %f25, 0f3f800000;
+
+PAL_DONE:
+    min.f32 %f22, %f22, 0f3f800000;
+    min.f32 %f23, %f23, 0f3f800000;
+    min.f32 %f24, %f24, 0f3f800000;
+
+    // -------------------------------------------------------------------------
+    // 4. Coalesced 128-bit Vector Stores directly into Mapped OpenGL VBO
+    // -------------------------------------------------------------------------
+    mul.wide.u32 %rd1, %r6, 32;
+    add.u64      %rd2, %rd0, %rd1;
+    st.global.v4.f32 [%rd2],    {%f18, %f19, %f20, %f21};
+    st.global.v4.f32 [%rd2+16], {%f22, %f23, %f24, %f25};
+
+DONE:
+    ret;
+}
