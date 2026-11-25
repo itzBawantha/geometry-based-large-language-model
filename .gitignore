@@ -1,4 +1,12 @@
+# Compiled binaries & build artifacts
 cuda_sphere
+bin/
 *.o
 *.ppm
 *.png
+
+# Local datasets & generated model checkpoints
+data/
+models/
+lattice_mnist/cuda_lattice_mnist
+lattice_mnist/trained_shadows.bin
