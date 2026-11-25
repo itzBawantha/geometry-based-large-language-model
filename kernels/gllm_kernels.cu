@@ -72,3 +72,34 @@ extern "C" __global__ void eval_score_shadows(
     }
     scores[tid] = dot_val / sqrtf(norm2 + 1e-6f);
 }
+
+extern "C" __global__ void match_sketch_pruned(
+    const float* __restrict__ sketch_centered,
+    uint64_t sketch_mask,
+    const uint64_t* __restrict__ class_masks,
+    const float* __restrict__ class_templates,
+    float* __restrict__ out_overlap,
+    uint32_t* __restrict__ out_status,
+    uint32_t pixels_img,
+    uint32_t num_classes,
+    float prune_ratio
+) {
+    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_classes) return;
+
+    // Stage 1: Hardware 64-bit coarse footprint pruning (and.b64 + popc.b64)
+    int qbits = __popcll(sketch_mask);
+    int hits  = __popcll(sketch_mask & class_masks[c]);
+    if (qbits == 0 || hits == 0 || (static_cast<float>(hits) / static_cast<float>(qbits)) < prune_ratio) {
+        out_overlap[c] = 0.0f;
+        out_status[c]  = 0u;
+        return;
+    }
+
+    // Stage 2: Exact WxH centered cosine confirmation
+    const float* tmpl = class_templates + static_cast<size_t>(c) * pixels_img;
+    float dot_val = 0.0f;
+    for (uint32_t p = 0; p < pixels_img; ++p) dot_val += sketch_centered[p] * tmpl[p];
+    out_overlap[c] = fminf(fmaxf(dot_val, 0.0f), 1.0f);
+    out_status[c]  = 1u;
+}
