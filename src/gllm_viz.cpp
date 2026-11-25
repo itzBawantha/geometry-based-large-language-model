@@ -20,15 +20,34 @@
 #include <GL/glext.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <string>
 #include <vector>
+
+static bool visual_equiv_label(const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    if (a.size() == 1 && b.size() == 1) {
+        char ca = a[0], cb = b[0];
+        if (std::tolower(static_cast<unsigned char>(ca)) ==
+            std::tolower(static_cast<unsigned char>(cb))) return true;
+        auto grp = [](char c) -> int {
+            if (c == '0' || c == 'O' || c == 'o') return 1;
+            if (c == '1' || c == 'I' || c == 'l') return 2;
+            return 0;
+        };
+        int ga = grp(ca), gb = grp(cb);
+        if (ga != 0 && ga == gb) return true;
+    }
+    return false;
+}
 
 struct Vec3 { float x, y, z; };
 static inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
@@ -338,6 +357,10 @@ static void save_ppm(const std::string& path, int w, int h) {
 
 int main(int argc, char** argv) {
     std::string model_path, screenshot_path, test_idx_img;
+    std::string bench_mnist_dir = "data/mnist";
+    std::string bench_emnist_dir = "data/emnist_byclass";
+    bool start_benchmark = false;
+    float bench_rate_ips = 6.0f;
     int test_idx_pos = -1;
     bool test_transpose = false;
     uint32_t heatmap_mode = 0;
@@ -353,12 +376,16 @@ int main(int argc, char** argv) {
         else if (a == "--focus" && i + 1 < argc) forced_focus = std::atoi(argv[++i]);
         else if (a == "--dist" && i + 1 < argc) init_dist = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--prune-ratio" && i + 1 < argc) prune_ratio = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--benchmark") start_benchmark = true;
+        else if (a == "--bench-mnist" && i + 1 < argc) bench_mnist_dir = argv[++i];
+        else if (a == "--bench-emnist" && i + 1 < argc) bench_emnist_dir = argv[++i];
+        else if (a == "--bench-rate" && i + 1 < argc) bench_rate_ips = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.5f, 120.0f);
         else if (a == "--test-img" && i + 2 < argc) { test_idx_img = argv[++i]; test_idx_pos = std::atoi(argv[++i]); }
         else if (a == "--test-transpose") test_transpose = true;
     }
 
     if (model_path.empty()) {
-        std::cerr << "Usage: gllm_viz --model <path.gllm> [--heatmap] [--prune-ratio 0.65] [--screenshot out.ppm]\n";
+        std::cerr << "Usage: gllm_viz --model <path.gllm> [--benchmark] [--bench-rate 6] [--heatmap] [--screenshot out.ppm]\n";
         return 1;
     }
 
@@ -714,7 +741,7 @@ int main(int argc, char** argv) {
     // -------------------------------------------------------------------------
     // Run 2-Stage Multi-Scale Gaussian Pyramid CUDA Match (Bernoulli x Soft-IoU)
     // -------------------------------------------------------------------------
-    auto run_cuda_capture = [&](bool use_canvas_pyramid = true) {
+    auto run_cuda_capture = [&](bool use_canvas_pyramid = true, bool verbose = true) {
         double base_mean = 0.0;
         for (uint32_t p = 0; p < match_pix; ++p) base_mean += hud.norm28[p];
         base_mean /= match_pix;
@@ -788,12 +815,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        auto prev_bench = match_summary.bench;
         match_summary = gllm::MatchSummary{};
         match_summary.has_result        = true;
         match_summary.cuda_ms           = ms;
         match_summary.total_classes     = num_classes;
         match_summary.manifold_name     = routed_man_name;
         match_summary.manifold_semantic = routed_man_sem;
+        match_summary.bench             = prev_bench;
 
         for (uint32_t oid : unique_outer_ids) {
             const auto& a = agg[oid];
@@ -831,31 +860,162 @@ int main(int argc, char** argv) {
         dirty_lat = true;
         hud.dirty_tex = true;
 
-        // Print crisp diagnostic table to terminal
-        std::printf("\n[CAPTURE] CUDA Gaussian Pyramid (%u levels, %u hyps): %.3f ms | Manifold: '%s' (%s) | Classes: %u/%u | Sub-Shadows: %u/%u survived\n",
-                    qstack.num_levels, num_hyps, ms, routed_man_name.c_str(), routed_man_sem.c_str(),
-                    match_summary.survived_count, num_classes, reg_survived, num_regions);
-        if (match_summary.is_unknown) {
-            std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 28.0%% threshold)\n",
-                        match_summary.ranked.empty() ? 0.0f : match_summary.ranked[0].overlap_pct);
-        } else {
-            const auto& w = match_summary.ranked[0];
-            std::printf("  -> WINNER: '%s' (Outer Point #%.1f) | Overlap: %.1f%% | Relative Prob: %.1f%%\n",
-                        w.label.c_str(), static_cast<float>(w.outer_idx), w.overlap_pct, w.rel_prob_pct);
+        // Print crisp diagnostic table to terminal (suppressed per-frame during live visual benchmark)
+        if (verbose) {
+            std::printf("\n[CAPTURE] CUDA Gaussian Pyramid (%u levels, %u hyps): %.3f ms | Manifold: '%s' (%s) | Classes: %u/%u | Sub-Shadows: %u/%u survived\n",
+                        qstack.num_levels, num_hyps, ms, routed_man_name.c_str(), routed_man_sem.c_str(),
+                        match_summary.survived_count, num_classes, reg_survived, num_regions);
+            if (match_summary.is_unknown) {
+                std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 28.0%% threshold)\n",
+                            match_summary.ranked.empty() ? 0.0f : match_summary.ranked[0].overlap_pct);
+            } else {
+                const auto& w = match_summary.ranked[0];
+                std::printf("  -> WINNER: '%s' (Outer Point #%.1f) | Overlap: %.1f%% | Relative Prob: %.1f%%\n",
+                            w.label.c_str(), static_cast<float>(w.outer_idx), w.overlap_pct, w.rel_prob_pct);
+            }
+            int topk = std::min<int>(10, static_cast<int>(match_summary.ranked.size()));
+            for (int i = 0; i < topk; ++i) {
+                const auto& r = match_summary.ranked[i];
+                std::printf("     #%2d  %-4s (Outer #%-4.1f)  Overlap: %5.1f%%  | RelProb: %5.1f%%\n",
+                            i + 1, r.label.c_str(), static_cast<float>(r.outer_idx), r.overlap_pct, r.rel_prob_pct);
+            }
+            std::cout << "  -> Pruned as improbable (" << match_summary.pruned_count << "): ";
+            for (size_t i = 0; i < match_summary.pruned_labels.size(); ++i) {
+                if (i > 0) std::cout << " ";
+                std::cout << match_summary.pruned_labels[i];
+            }
+            std::cout << "\n";
         }
-        int topk = std::min<int>(10, static_cast<int>(match_summary.ranked.size()));
-        for (int i = 0; i < topk; ++i) {
-            const auto& r = match_summary.ranked[i];
-            std::printf("     #%2d  %-4s (Outer #%-4.1f)  Overlap: %5.1f%%  | RelProb: %5.1f%%\n",
-                        i + 1, r.label.c_str(), static_cast<float>(r.outer_idx), r.overlap_pct, r.rel_prob_pct);
-        }
-        std::cout << "  -> Pruned as improbable (" << match_summary.pruned_count << "): ";
-        for (size_t i = 0; i < match_summary.pruned_labels.size(); ++i) {
-            if (i > 0) std::cout << " ";
-            std::cout << match_summary.pruned_labels[i];
-        }
-        std::cout << "\n";
     };
+
+    // -------------------------------------------------------------------------
+    // Real-Time Visual Benchmark Engine (Streams 68,405 unseen holdout images!)
+    // -------------------------------------------------------------------------
+    struct BenchSample {
+        const uint8_t* pixels = nullptr;
+        std::string    truth;
+        bool           is_digit = false;
+    };
+    gllm::LabeledImageBatch bench_mnist, bench_emnist;
+    std::vector<BenchSample> bench_stream;
+    bool bench_loaded = false;
+    size_t bench_cursor = 0;
+    double bench_accum = 0.0;
+
+    auto ensure_bench_loaded = [&]() -> bool {
+        if (bench_loaded) return !bench_stream.empty();
+        bench_loaded = true;
+        std::vector<std::string> dnames = {"0","1","2","3","4","5","6","7","8","9"};
+        std::vector<std::string> lnames = {
+            "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+            "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z"
+        };
+        std::string mi = bench_mnist_dir + "/t10k-images-idx3-ubyte.gz";
+        std::string ml = bench_mnist_dir + "/t10k-labels-idx1-ubyte.gz";
+        if (std::filesystem::exists(mi) && std::filesystem::exists(ml)) {
+            bench_mnist = gllm::load_idx_dataset(mi, ml, dnames, 0, false, 0, 9);
+        }
+        std::string ei = bench_emnist_dir + "/emnist-byclass-test-images-idx3-ubyte.gz";
+        std::string el = bench_emnist_dir + "/emnist-byclass-test-labels-idx1-ubyte.gz";
+        if (std::filesystem::exists(ei) && std::filesystem::exists(el)) {
+            bench_emnist = gllm::load_idx_dataset(ei, el, lnames, 10, true, 10, 61);
+        }
+        // Interleave MNIST + EMNIST deterministically so user sees a lively mix of digits & letters!
+        uint32_t max_n = std::max(bench_mnist.count, bench_emnist.count);
+        bench_stream.reserve(bench_mnist.count + bench_emnist.count);
+        for (uint32_t i = 0; i < max_n; ++i) {
+            if (i < bench_mnist.count) {
+                bench_stream.push_back({&bench_mnist.pixels[static_cast<size_t>(i) * 784u], bench_mnist.labels[i], true});
+            }
+            if (i < bench_emnist.count) {
+                bench_stream.push_back({&bench_emnist.pixels[static_cast<size_t>(i) * 784u], bench_emnist.labels[i], false});
+            }
+        }
+        // Deterministic Fisher-Yates shuffle (LCG seed=42) for diverse live stream across all 62 classes
+        uint64_t rng = 42ULL;
+        for (size_t i = bench_stream.size(); i > 1; --i) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            size_t j = static_cast<size_t>((rng >> 16) % i);
+            std::swap(bench_stream[i - 1], bench_stream[j]);
+        }
+        std::cout << "[BENCH-VIZ] Loaded " << bench_stream.size()
+                  << " unseen holdout images (MNIST=" << bench_mnist.count
+                  << ", EMNIST=" << bench_emnist.count << ")\n";
+        return !bench_stream.empty();
+    };
+
+    auto step_visual_benchmark = [&]() {
+        if (!match_summary.bench.active || bench_stream.empty()) return;
+        if (bench_cursor >= bench_stream.size()) {
+            match_summary.bench.paused = true;
+            hud.dirty_tex = true;
+            return;
+        }
+        const auto& sample = bench_stream[bench_cursor++];
+        hud.load_raw_28x28(sample.pixels);
+        run_cuda_capture(false, false);
+
+        auto& b = match_summary.bench;
+        b.processed++;
+        b.total       = static_cast<uint32_t>(bench_stream.size());
+        b.truth_label = sample.truth;
+        std::string p1 = (!match_summary.ranked.empty()) ? match_summary.ranked[0].label : "";
+        bool exact = (!match_summary.is_unknown && p1 == sample.truth);
+        bool equiv = (!match_summary.is_unknown && visual_equiv_label(p1, sample.truth));
+        bool in_t3 = false;
+        for (size_t k = 0; k < std::min<size_t>(3, match_summary.ranked.size()); ++k) {
+            if (match_summary.ranked[k].label == sample.truth) { in_t3 = true; break; }
+        }
+        if (exact) b.exact_ok++;
+        if (equiv) b.equiv_ok++;
+        if (in_t3) b.top3_ok++;
+        if (sample.is_digit) {
+            b.digit_tot++;
+            for (const auto& r : match_summary.ranked) {
+                if (r.outer_idx < 10u) {
+                    if (r.label == sample.truth) b.digit_ok++;
+                    break;
+                }
+            }
+        }
+        b.verdict = match_summary.is_unknown ? "UNK" : (exact ? "HIT" : (equiv ? "EQUIV" : "MISS"));
+        hud.dirty_tex = true;
+
+        if (b.processed % 50u == 0u) {
+            std::printf("[BENCH-VIZ] %5u/%u | Exact: %.1f%% | Equiv: %.1f%% | Top3: %.1f%% | Digits10: %.1f%% | %.2f ms\n",
+                        b.processed, b.total,
+                        100.0 * b.exact_ok / b.processed,
+                        100.0 * b.equiv_ok / b.processed,
+                        100.0 * b.top3_ok  / b.processed,
+                        b.digit_tot ? 100.0 * b.digit_ok / b.digit_tot : 0.0,
+                        match_summary.cuda_ms);
+        }
+    };
+
+    auto toggle_visual_benchmark = [&]() {
+        if (match_summary.bench.active) {
+            match_summary.bench.active = false;
+            match_summary.bench.paused = false;
+            hud.dirty_tex = true;
+            std::cout << "[BENCH-VIZ] Stopped live visual benchmark (returned to sketch canvas).\n";
+        } else if (ensure_bench_loaded()) {
+            match_summary.bench = gllm::VisualBenchStats{};
+            match_summary.bench.active   = true;
+            match_summary.bench.paused   = false;
+            match_summary.bench.total    = static_cast<uint32_t>(bench_stream.size());
+            match_summary.bench.rate_ips = bench_rate_ips;
+            bench_cursor = 0;
+            bench_accum  = 0.0;
+            step_visual_benchmark();
+            std::cout << "[BENCH-VIZ] Started live visual benchmark (" << bench_rate_ips
+                      << " imgs/s). Keys: SPACE pause, S step, +/- speed, B stop.\n";
+        } else {
+            std::cout << "[BENCH-VIZ] No holdout datasets found in " << bench_mnist_dir
+                      << " or " << bench_emnist_dir << " (run ./scripts/download_mnist.sh first).\n";
+        }
+    };
+
+    if (start_benchmark) toggle_visual_benchmark();
 
     // Optional automated test-image capture for verification screenshots
     if (!test_idx_img.empty() && test_idx_pos >= 0) {
@@ -927,12 +1087,37 @@ int main(int argc, char** argv) {
                             prev_cy = static_cast<float>(hy - hud.canvas_rect.y);
                             hud.draw_stroke(prev_cx, prev_cy, prev_cx, prev_cy);
                         } else if (hud.btn_capture.contains(hx, hy)) {
-                            run_cuda_capture();
+                            if (match_summary.bench.active) {
+                                match_summary.bench.paused = !match_summary.bench.paused;
+                                hud.dirty_tex = true;
+                            } else {
+                                run_cuda_capture();
+                            }
                         } else if (hud.btn_clear.contains(hx, hy)) {
-                            hud.clear();
-                            match_summary = gllm::MatchSummary{};
-                            focus_cls = no_focus;
-                            dirty_lat = true;
+                            if (match_summary.bench.active) {
+                                // Cycle speed presets: 1 -> 2 -> 6 -> 15 -> 60 -> MAX RT -> 1
+                                if (match_summary.bench.realtime) {
+                                    match_summary.bench.realtime = false;
+                                    bench_rate_ips = 1.0f;
+                                } else if (bench_rate_ips < 1.5f) {
+                                    bench_rate_ips = 2.0f;
+                                } else if (bench_rate_ips < 5.0f) {
+                                    bench_rate_ips = 6.0f;
+                                } else if (bench_rate_ips < 14.0f) {
+                                    bench_rate_ips = 15.0f;
+                                } else if (bench_rate_ips < 55.0f) {
+                                    bench_rate_ips = 60.0f;
+                                } else {
+                                    match_summary.bench.realtime = true;
+                                }
+                                match_summary.bench.rate_ips = bench_rate_ips;
+                                hud.dirty_tex = true;
+                            } else {
+                                hud.clear();
+                                match_summary = gllm::MatchSummary{};
+                                focus_cls = no_focus;
+                                dirty_lat = true;
+                            }
                         } else if (match_summary.has_result) {
                             for (int r = 0; r < 10 && r < static_cast<int>(match_summary.ranked.size()); ++r) {
                                 if (hud.row_rects[r].contains(hx, hy)) {
@@ -976,9 +1161,40 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = ev.key.keysym.sym;
                 if (k == SDLK_ESCAPE || k == SDLK_q) running = false;
                 else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) run_cuda_capture();
-                else if (k == SDLK_c || k == SDLK_BACKSPACE) {
+                else if (k == SDLK_b) toggle_visual_benchmark();
+                else if (k == SDLK_s && match_summary.bench.active) { match_summary.bench.paused = true; step_visual_benchmark(); }
+                else if (k == SDLK_t && match_summary.bench.active) {
+                    match_summary.bench.realtime = !match_summary.bench.realtime;
+                    hud.dirty_tex = true;
+                } else if ((k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS) && match_summary.bench.active) {
+                    if (bench_rate_ips >= 55.0f) {
+                        match_summary.bench.realtime = true;
+                    } else {
+                        match_summary.bench.realtime = false;
+                        bench_rate_ips = std::min(60.0f, bench_rate_ips * 1.5f);
+                        match_summary.bench.rate_ips = bench_rate_ips;
+                    }
+                    hud.dirty_tex = true;
+                } else if ((k == SDLK_MINUS || k == SDLK_KP_MINUS) && match_summary.bench.active) {
+                    if (match_summary.bench.realtime) {
+                        match_summary.bench.realtime = false;
+                        bench_rate_ips = 30.0f;
+                    } else {
+                        bench_rate_ips = std::max(0.5f, bench_rate_ips / 1.5f);
+                    }
+                    match_summary.bench.rate_ips = bench_rate_ips;
+                    hud.dirty_tex = true;
+                } else if (k == SDLK_c || k == SDLK_BACKSPACE) {
+                    match_summary.bench.active = false;
                     hud.clear(); match_summary = gllm::MatchSummary{}; focus_cls = no_focus; dirty_lat = true;
-                } else if (k == SDLK_SPACE) { focus_cls = no_focus; dirty_lat = true; hud.dirty_tex = true; }
+                } else if (k == SDLK_SPACE) {
+                    if (match_summary.bench.active) {
+                        match_summary.bench.paused = !match_summary.bench.paused;
+                        hud.dirty_tex = true;
+                    } else {
+                        focus_cls = no_focus; dirty_lat = true; hud.dirty_tex = true;
+                    }
+                }
                 else if (k == SDLK_RIGHT) { focus_cls = (focus_cls >= no_focus) ? 0u : ((focus_cls + 1u) % (max_outer_id + 1u)); dirty_lat = true; hud.dirty_tex = true; }
                 else if (k == SDLK_LEFT)  { focus_cls = (focus_cls >= no_focus) ? max_outer_id : ((focus_cls + max_outer_id) % (max_outer_id + 1u)); dirty_lat = true; hud.dirty_tex = true; }
                 else if (k == SDLK_h) { heatmap_mode = 1u - heatmap_mode; dirty_lat = true; }
@@ -995,6 +1211,21 @@ int main(int argc, char** argv) {
         }
 
         if (auto_rot && !orbit_dragging && screenshot_path.empty()) cam_yaw += static_cast<float>(dt) * 0.20f;
+
+        if (match_summary.bench.active && !match_summary.bench.paused && screenshot_path.empty()) {
+            if (match_summary.bench.realtime) {
+                for (int burst = 0; burst < 16 && !match_summary.bench.paused; ++burst) {
+                    step_visual_benchmark();
+                }
+            } else {
+                bench_accum += dt;
+                double interval = 1.0 / std::max(0.5f, bench_rate_ips);
+                if (bench_accum >= interval) {
+                    bench_accum = std::fmod(bench_accum, interval);
+                    step_visual_benchmark();
+                }
+            }
+        }
 
         if (dirty_lat) {
             CU_CHECK(cuMemsetD32_v2(d_counter, 0u, 1));

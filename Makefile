@@ -4,7 +4,7 @@
 MODEL ?= models/sphere_1b.gllm
 CLUSTERS ?= 8
 
-.PHONY: all train benchmark demo viz inspect clean legacy
+.PHONY: all train benchmark benchmark-viz demo viz inspect clean legacy
 
 all:
 	@./scripts/build.sh
@@ -14,6 +14,9 @@ train: all
 
 benchmark: all
 	@./scripts/benchmark.sh $(MODEL)
+
+benchmark-viz: all
+	@./scripts/benchmark.sh --visual $(MODEL)
 
 demo: all
 	@./scripts/train_custom.sh --model models/demo_shapes.gllm --demo --clusters 4

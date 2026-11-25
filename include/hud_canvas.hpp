@@ -20,6 +20,22 @@ struct MatchResultRow {
     bool  pruned        = false;
 };
 
+struct VisualBenchStats {
+    bool     active    = false;
+    bool     paused    = false;
+    bool     realtime  = false; // MAX uncapped multi-image-per-frame real-time mode
+    uint32_t processed = 0;
+    uint32_t total     = 0;
+    uint32_t exact_ok  = 0;
+    uint32_t equiv_ok  = 0;
+    uint32_t top3_ok   = 0;
+    uint32_t digit_tot = 0;
+    uint32_t digit_ok  = 0;
+    float    rate_ips  = 6.0f;
+    std::string truth_label;
+    std::string verdict; // "HIT", "EQUIV", "MISS", "UNK"
+};
+
 struct MatchSummary {
     bool     has_result     = false;
     bool     is_unknown     = false;
@@ -29,6 +45,7 @@ struct MatchSummary {
     uint32_t survived_count = 0;
     std::string manifold_name;                 // Routed Operational Manifold (e.g. "fundamental_text")
     std::string manifold_semantic;             // CUDA semantic register (e.g. "handwritten_letters_and_numbers")
+    VisualBenchStats bench;                    // Live visual benchmark telemetry when active
     std::vector<MatchResultRow> ranked;        // Surviving classes sorted by overlap desc
     std::vector<std::string>    pruned_labels; // Labels eliminated at Stage 1
 };
@@ -415,7 +432,11 @@ public:
         fill_rect(0, 0, kPanelW, kPanelH, 10, 15, 28, 228);
         fill_rect(kPanelW - 2, 0, 2, kPanelH, 42, 96, 148, 200);
 
-        draw_text(20, 16, "GLLM SKETCH INFERENCE", 2, 125, 220, 255);
+        if (ms.bench.active) {
+            draw_text(20, 16, "LIVE VISUAL BENCHMARK", 2, 120, 255, 200);
+        } else {
+            draw_text(20, 16, "GLLM SKETCH INFERENCE", 2, 125, 220, 255);
+        }
 
         // 1. Drawing canvas (224x224) + subtle 22x22 canonical scale guide frame (176x176)
         fill_rect(canvas_rect.x, canvas_rect.y, canvas_rect.w, canvas_rect.h, 8, 12, 22, 255);
@@ -446,22 +467,70 @@ public:
         }
         stroke_rect(preview_rect.x, preview_rect.y, preview_rect.w, preview_rect.h, 60, 120, 175, 255);
 
-        // 3. Buttons: [ CAPTURE ] and [ CLEAR ]
+        // 3. Buttons: [ CAPTURE / CLEAR ] in sketch mode, or [ PAUSE / SPEED ] in Live Visual Benchmark mode
         fill_rect(btn_capture.x, btn_capture.y, btn_capture.w, btn_capture.h,
                   hover_capture ? 32 : 18, hover_capture ? 148 : 118, hover_capture ? 175 : 148, 255);
         stroke_rect(btn_capture.x, btn_capture.y, btn_capture.w, btn_capture.h, 110, 235, 255, 255);
-        draw_text(btn_capture.x + 30, btn_capture.y + 10, "CAPTURE", 2, 245, 255, 255);
+        if (ms.bench.active) {
+            draw_text(btn_capture.x + (ms.bench.paused ? 34 : 42), btn_capture.y + 10,
+                      ms.bench.paused ? "RESUME" : "PAUSE", 2, 245, 255, 255);
+        } else {
+            draw_text(btn_capture.x + 30, btn_capture.y + 10, "CAPTURE", 2, 245, 255, 255);
+        }
 
         fill_rect(btn_clear.x, btn_clear.y, btn_clear.w, btn_clear.h,
                   hover_clear ? 70 : 42, hover_clear ? 82 : 52, hover_clear ? 105 : 74, 255);
         stroke_rect(btn_clear.x, btn_clear.y, btn_clear.w, btn_clear.h, 120, 145, 180, 255);
-        draw_text(btn_clear.x + 42, btn_clear.y + 10, "CLEAR", 2, 220, 232, 248);
+        if (ms.bench.active) {
+            char sp[24];
+            if (ms.bench.realtime) std::snprintf(sp, sizeof(sp), "MAX RT");
+            else if (ms.bench.rate_ips < 1.0f) std::snprintf(sp, sizeof(sp), "%.1f/s", ms.bench.rate_ips);
+            else std::snprintf(sp, sizeof(sp), "%.0f/s >>", ms.bench.rate_ips);
+            draw_text(btn_clear.x + 28, btn_clear.y + 10, sp, 2, 255, 225, 130);
+        } else {
+            draw_text(btn_clear.x + 42, btn_clear.y + 10, "CLEAR", 2, 220, 232, 248);
+        }
 
-        // 4. Match Summary Card
+        // 4. Match Summary / Live Visual Benchmark Telemetry Card
         fill_rect(18, 330, 300, 96, 16, 24, 42, 245);
-        stroke_rect(18, 330, 300, 96, 52, 92, 138, 255);
+        stroke_rect(18, 330, 300, 96, ms.bench.active ? 75 : 52, ms.bench.active ? 195 : 92, ms.bench.active ? 165 : 138, 255);
 
-        if (!ms.has_result) {
+        if (ms.bench.active) {
+            const auto& b = ms.bench;
+            std::string pred = (ms.is_unknown || ms.ranked.empty()) ? "?" : ms.ranked[0].label;
+            char hdr[64], r2[64], r3[64], r4[64];
+            std::snprintf(hdr, sizeof(hdr), "GT '%s' > '%s' %s",
+                          b.truth_label.c_str(), pred.c_str(), b.verdict.c_str());
+            uint8_t hr = 255, hg = 115, hb = 100;
+            if (b.verdict == "HIT")        { hr = 110; hg = 255; hb = 185; }
+            else if (b.verdict == "EQUIV") { hr = 255; hg = 220; hb = 105; }
+            draw_text(28, 338, hdr, 2, hr, hg, hb);
+
+            float ex = b.processed ? (100.0f * b.exact_ok / b.processed) : 0.0f;
+            float eq = b.processed ? (100.0f * b.equiv_ok / b.processed) : 0.0f;
+            float t3 = b.processed ? (100.0f * b.top3_ok  / b.processed) : 0.0f;
+            std::snprintf(r2, sizeof(r2), "TOP1 %.1f%% | EQ %.1f%% | T3 %.1f%%", ex, eq, t3);
+            draw_text(28, 360, r2, 1, 210, 240, 255);
+
+            float dg = b.digit_tot ? (100.0f * b.digit_ok / b.digit_tot) : 0.0f;
+            std::snprintf(r3, sizeof(r3), "DIGITS %.1f%% | %u/%u | %.2fms",
+                          dg, b.processed, b.total, ms.cuda_ms);
+            draw_text(28, 376, r3, 1, 130, 225, 255);
+
+            if (b.realtime) {
+                std::snprintf(r4, sizeof(r4), "%s MAX-RT (T/-) | SPC PAUSE | B END",
+                              b.paused ? "PAUSED" : "LIVE");
+            } else {
+                std::snprintf(r4, sizeof(r4), "%s %.1f/s (+/-,T) | SPC PAUSE | B END",
+                              b.paused ? "PAUSED" : "LIVE", b.rate_ips);
+            }
+            draw_text(28, 392, r4, 1, 255, 200, 120);
+
+            // Live benchmark progress bar
+            fill_rect(28, 410, 280, 7, 24, 38, 58, 255);
+            int pw = b.total ? std::clamp(static_cast<int>(280.0f * b.processed / b.total), 1, 280) : 0;
+            fill_rect(28, 410, pw, 7, 70, 235, 185, 255);
+        } else if (!ms.has_result) {
             draw_text(30, 344, "DRAW INSIDE GUIDE -> CAPTURE", 1, 175, 205, 235);
             char buf[64];
             if (num_regions > num_classes) {
@@ -538,8 +607,8 @@ public:
         }
 
         // Footer hint
-        draw_text(20, 800, "DRAG RIGHT: ORBIT | M: MANIFOLD", 1, 115, 150, 185);
-        draw_text(20, 816, "H: HEATMAP | Z: ZOOM | UP/DN: SHELL", 1, 115, 150, 185);
+        draw_text(20, 800, "B: LIVE BENCH | M: MANIFOLD | Z: ZOOM", 1, 115, 150, 185);
+        draw_text(20, 816, "H: HEATMAP | UP/DN: SHELL | R: RESET", 1, 115, 150, 185);
         dirty_tex = false;
     }
 };

@@ -76,10 +76,15 @@ Downloads MNIST (`60,000` digits) + EMNIST ByClass (`352,897` letters) and train
 # or: make train
 ```
 
-### 3. Run the Full Reproducible Benchmark (68,405 Unseen Images + OOD Audit)
+### 3. Run the Full Reproducible Benchmark (CLI or Live 3D Visual Mode!)
 ```bash
+# Full fast CLI benchmark (68,405 unseen images + CUDA manifold routing + OOD audit):
 ./scripts/benchmark.sh
 # or: make benchmark
+
+# Real-Time Visual Benchmark inside the 3D sphere visualizer (watch live GPU matches & firing rays!):
+./scripts/benchmark.sh --visual
+# or: make benchmark-viz
 ```
 
 ### 4. Launch the Interactive 3D Sphere & Live Sketch Inference UI
@@ -174,6 +179,7 @@ Key `gllm_train` flags:
 ## Interactive Visualizer Controls (`gllm_viz`)
 
 - **Left Sketch Canvas (`224×224`, fixed 8:1 raw-proportion scale):** `Left-drag` draw inside the subtle `22×22` scale guide • `[CAPTURE]` or `Enter` run 2-stage CUDA match • `[CLEAR]` / `Right-click` / `C` clear • Click any **Top-10 row** to spotlight all `K` sub-shadows of that class in 3D.
+- **Real-Time Visual Benchmark Mode:** Press **`B`** anytime (or launch with `--benchmark`) to stream unseen holdout test images live through the CUDA matcher while watching the 3D sphere spotlight winning sub-shadows & firing rays • `Space` pause/resume • `S` single-step • `+` / `-` adjust playback speed (`0.5–60 imgs/s`).
 - **Right 3D Sphere Viewport:** `Left-drag` / `Scroll` orbit & zoom • `M` toggle Operational Manifold deformed-sphere shell • `Z` toggle core close-up vs. full 1B sphere • `Left / Right / Space` cycle class focus • `H` thermal density heatmap • `L` toggle `K`-to-1 binding rays • `Up / Down` ghost-reveal unassigned 1.2M outer-shell points • `R` reset view • `Q / Esc` quit.
 
 ---
