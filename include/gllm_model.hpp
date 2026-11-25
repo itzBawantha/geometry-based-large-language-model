@@ -17,8 +17,9 @@
 namespace gllm {
 
 constexpr uint32_t kModelMagic   = 0x4D4C4C47u; // "GLLM"
-constexpr uint32_t kModelVersion = 2u;          // v2 adds Operational Manifolds + CUDA semantic metadata
+constexpr uint32_t kModelVersion = 4u;          // v4 adds hierarchical 3D AABB manifolds + shared outer-shell concept bindings
 constexpr uint32_t kManifoldVerts = 162u;       // 2x-subdivided geodesic icosphere (162 verts, 320 tris)
+constexpr uint32_t kInvalidId     = 0xFFFFFFFFu;
 
 // GPU-compatible 32-byte region descriptor (matches kernels/gllm_kernels.ptx)
 struct alignas(16) GpuRegionDesc {
@@ -36,12 +37,13 @@ struct alignas(16) GpuManifoldDesc {
     uint32_t manifold_id;
     uint32_t class_count;
     uint32_t region_count;
-    uint32_t reserved;
+    uint32_t parent_manifold_id; // kInvalidId (0xFFFFFFFF) for root manifolds
     float    center_x, center_y, center_z, max_radius;
     float    min_x, min_y, min_z, volume_fraction;
-    float    max_x, max_y, max_z, pad1;
-    char     name[32];           // e.g. "fundamental_text"
-    char     semantic_label[48]; // e.g. "handwritten_letters_and_numbers"
+    float    max_x, max_y, max_z;
+    uint32_t outer_idx;          // Shared outer-shell concept node ID (kInvalidId if unbound)
+    char     name[32];           // e.g. "fundamental_text", "animals/cats/face"
+    char     semantic_label[48]; // e.g. "handwritten_letters_and_numbers", "face"
 };
 static_assert(sizeof(GpuManifoldDesc) == 144, "GpuManifoldDesc must be 144 bytes for CUDA alignment");
 
@@ -124,13 +126,19 @@ inline const GeodesicSphereMesh& unit_geodesic_sphere() {
 
 struct ManifoldRecord {
     uint32_t manifold_id = 0;
+    uint32_t parent_manifold_id = kInvalidId; // kInvalidId = root manifold
+    uint32_t depth = 0;                       // Hierarchy depth (0=root, 1=species, 2=face, 3=feature)
+    uint32_t envelope_mode = 0;               // 0 = geodesic deformed sphere, 1 = exact 3D Bounding Box (AABB)
+    uint32_t outer_idx = kInvalidId;          // Outer-shell concept node ID (shared across matching concept_label!)
+    float    outer_x = 0.0f, outer_y = 0.0f, outer_z = 1.0f;
+    std::string concept_label;                // Outer-shell concept word (e.g. "animals", "cat", "dog", "face")
     std::string name = "fundamental_text";
     std::string semantic_label = "handwritten_letters_and_numbers";
     uint32_t anchor_x = 620, anchor_y = 620, anchor_z = 620; // Lattice packing center
     float center_x = 0.0f, center_y = 0.0f, center_z = 0.0f; // World center of enclosed subspaces
     float min_x = 0.0f, min_y = 0.0f, min_z = 0.0f;          // Tight world AABB min
     float max_x = 0.0f, max_y = 0.0f, max_z = 0.0f;          // Tight world AABB max
-    float max_radius = 0.0f;                                 // Tight max deformed-sphere radius
+    float max_radius = 0.0f;                                 // Tight max radius / box half-diagonal
     float volume_fraction = 0.0f;                            // Fraction of 1B unit sphere volume used
     uint32_t min_lx = 0, min_ly = 0, min_lz = 0;             // Tight lattice AABB min
     uint32_t max_lx = 0, max_ly = 0, max_lz = 0;             // Tight lattice AABB max
@@ -145,7 +153,9 @@ struct ClassRecord {
     float outer_x = 0.0f, outer_y = 0.0f, outer_z = 1.0f;
     uint32_t train_count = 0;          // Total shadows accumulated into this region
     uint32_t manifold_id = 0;          // Operational Manifold membership ID
-    std::vector<float> shadow_sum;     // width * height raw accumulated shadow totals
+    uint32_t channels    = 1;          // 1 = grayscale luminance only, 3 = luminance + packed RGB (0x01RRGGBB)
+    std::vector<float>    shadow_sum;  // width * height raw accumulated shadow totals
+    std::vector<uint32_t> shadow_rgb;  // width * height packed 0x01RRGGBB (when channels == 3)
 };
 
 struct GeometricModel {
@@ -226,10 +236,72 @@ struct GeometricModel {
     }
 
     uint32_t next_outer_idx() const {
-        if (classes.empty()) return 0u;
+        bool has_any = false;
         uint32_t mx = 0u;
-        for (const auto& c : classes) mx = std::max(mx, c.outer_idx);
-        return mx + 1u;
+        for (const auto& c : classes) {
+            if (!has_any || c.outer_idx > mx) mx = c.outer_idx;
+            has_any = true;
+        }
+        for (const auto& m : manifolds) {
+            if (m.outer_idx != kInvalidId) {
+                if (!has_any || m.outer_idx > mx) mx = m.outer_idx;
+                has_any = true;
+            }
+        }
+        return has_any ? (mx + 1u) : 0u;
+    }
+
+    // Find or allocate a shared outer-shell concept node ID for a concept word (e.g. "animals", "cat", "dog", "face")
+    uint32_t find_or_assign_concept_outer(const std::string& concept_word, float& ox, float& oy, float& oz) const {
+        for (const auto& m : manifolds) {
+            if (m.outer_idx != kInvalidId && m.concept_label == concept_word) {
+                ox = m.outer_x; oy = m.outer_y; oz = m.outer_z;
+                return m.outer_idx;
+            }
+        }
+        for (const auto& c : classes) {
+            if (c.label == concept_word) {
+                ox = c.outer_x; oy = c.outer_y; oz = c.outer_z;
+                return c.outer_idx;
+            }
+        }
+        uint32_t oidx = next_outer_idx();
+        assign_outer_point(oidx, ox, oy, oz);
+        return oidx;
+    }
+
+    // Create a hierarchical 3D Bounding Box manifold bound to a (potentially shared!) outer-shell concept node
+    uint32_t create_hierarchical_manifold(const std::string& name,
+                                          const std::string& concept_word,
+                                          const std::string& semantic_label,
+                                          uint32_t parent_id,
+                                          uint32_t anchor_x, uint32_t anchor_y, uint32_t anchor_z,
+                                          uint32_t envelope_mode = 1u) {
+        int existing = find_manifold_by_name(name);
+        if (existing >= 0) return manifolds[existing].manifold_id;
+
+        uint32_t new_id = 0u;
+        for (const auto& m : manifolds) new_id = std::max(new_id, m.manifold_id + 1u);
+
+        uint32_t depth = 0u;
+        if (parent_id != kInvalidId) {
+            if (const ManifoldRecord* pm = get_manifold(parent_id)) depth = pm->depth + 1u;
+        }
+
+        ManifoldRecord m;
+        m.manifold_id        = new_id;
+        m.parent_manifold_id = parent_id;
+        m.depth              = depth;
+        m.envelope_mode      = envelope_mode;
+        m.name               = name;
+        m.concept_label      = concept_word.empty() ? name : concept_word;
+        m.semantic_label     = semantic_label.empty() ? m.concept_label : semantic_label;
+        m.anchor_x           = anchor_x;
+        m.anchor_y           = anchor_y;
+        m.anchor_z           = anchor_z;
+        m.outer_idx          = find_or_assign_concept_outer(m.concept_label, m.outer_x, m.outer_y, m.outer_z);
+        manifolds.push_back(std::move(m));
+        return new_id;
     }
 
     uint32_t unique_class_count() const {
@@ -384,21 +456,23 @@ struct GeometricModel {
         return false;
     }
 
-    // Recompute exact tight-fitting deformed-sphere Operational Manifold envelopes for all manifolds
+    // Recompute exact manifold envelopes (supports both exact 3D AABB bounding boxes AND geodesic deformed spheres)
+    // Propagates bounds bottom-up through parent_manifold_id so every parent box strictly encloses all child boxes!
     void recompute_manifold_envelopes() {
         if (manifolds.empty() && !classes.empty()) {
             find_or_create_manifold("fundamental_text", "handwritten_letters_and_numbers");
         }
         const auto& geo = unit_geodesic_sphere();
         float step = 2.0f / static_cast<float>(lattice_grid);
+        constexpr double kUnitSphereVol = (4.0 / 3.0) * 3.14159265358979323846;
 
-        for (auto& m : manifolds) {
-            struct Pt3 { float x, y, z; };
-            std::vector<Pt3> corners;
+        // Track direct lattice bounds per manifold first
+        std::vector<bool> has_bounds(manifolds.size(), false);
+        for (size_t mi = 0; mi < manifolds.size(); ++mi) {
+            auto& m = manifolds[mi];
             uint32_t min_lx = lattice_grid, min_ly = lattice_grid, min_lz = lattice_grid;
             uint32_t max_lx = 0, max_ly = 0, max_lz = 0;
-            double sx = 0.0, sy = 0.0, sz = 0.0;
-
+            bool any = false;
             for (const auto& c : classes) {
                 if (c.manifold_id != m.manifold_id) continue;
                 uint32_t x0 = c.ox, x1 = c.ox + c.width - 1u;
@@ -407,7 +481,105 @@ struct GeometricModel {
                 min_lx = std::min(min_lx, x0); max_lx = std::max(max_lx, x1);
                 min_ly = std::min(min_ly, y0); max_ly = std::max(max_ly, y1);
                 min_lz = std::min(min_lz, z0); max_lz = std::max(max_lz, z0);
+                any = true;
+            }
+            if (any) {
+                if (m.envelope_mode == 1u) {
+                    // Tight exact 3D bounding box padding (2 voxels XY, 4 voxels Z so flat planes have crisp 3D depth)
+                    uint32_t px = 2u, pz = 4u;
+                    m.min_lx = (min_lx > px) ? (min_lx - px) : 0u;
+                    m.max_lx = std::min(lattice_grid - 1u, max_lx + px);
+                    m.min_ly = (min_ly > px) ? (min_ly - px) : 0u;
+                    m.max_ly = std::min(lattice_grid - 1u, max_ly + px);
+                    m.min_lz = (min_lz > pz) ? (min_lz - pz) : 0u;
+                    m.max_lz = std::min(lattice_grid - 1u, max_lz + pz);
+                } else {
+                    m.min_lx = min_lx; m.max_lx = max_lx;
+                    m.min_ly = min_ly; m.max_ly = max_ly;
+                    m.min_lz = min_lz; m.max_lz = max_lz;
+                }
+                has_bounds[mi] = true;
+            }
+        }
 
+        // Propagate bounds bottom-up from deepest children to root parents so parent boxes strictly enclose children!
+        uint32_t max_depth = 0u;
+        for (const auto& m : manifolds) max_depth = std::max(max_depth, m.depth);
+        for (int d = static_cast<int>(max_depth); d >= 1; --d) {
+            for (size_t ci = 0; ci < manifolds.size(); ++ci) {
+                if (static_cast<int>(manifolds[ci].depth) != d || !has_bounds[ci]) continue;
+                uint32_t pid = manifolds[ci].parent_manifold_id;
+                if (pid == kInvalidId) continue;
+                for (size_t pi = 0; pi < manifolds.size(); ++pi) {
+                    if (manifolds[pi].manifold_id != pid) continue;
+                    const auto& ch = manifolds[ci];
+                    auto& pr = manifolds[pi];
+                    uint32_t pad = (pr.envelope_mode == 1u) ? 6u : 0u;
+                    uint32_t c_minx = (ch.min_lx > pad) ? (ch.min_lx - pad) : 0u;
+                    uint32_t c_miny = (ch.min_ly > pad) ? (ch.min_ly - pad) : 0u;
+                    uint32_t c_minz = (ch.min_lz > pad) ? (ch.min_lz - pad) : 0u;
+                    uint32_t c_maxx = std::min(lattice_grid - 1u, ch.max_lx + pad);
+                    uint32_t c_maxy = std::min(lattice_grid - 1u, ch.max_ly + pad);
+                    uint32_t c_maxz = std::min(lattice_grid - 1u, ch.max_lz + pad);
+                    if (!has_bounds[pi]) {
+                        pr.min_lx = c_minx; pr.max_lx = c_maxx;
+                        pr.min_ly = c_miny; pr.max_ly = c_maxy;
+                        pr.min_lz = c_minz; pr.max_lz = c_maxz;
+                        has_bounds[pi] = true;
+                    } else {
+                        pr.min_lx = std::min(pr.min_lx, c_minx); pr.max_lx = std::max(pr.max_lx, c_maxx);
+                        pr.min_ly = std::min(pr.min_ly, c_miny); pr.max_ly = std::max(pr.max_ly, c_maxy);
+                        pr.min_lz = std::min(pr.min_lz, c_minz); pr.max_lz = std::max(pr.max_lz, c_maxz);
+                    }
+                    break;
+                }
+            }
+        }
+
+        for (size_t mi = 0; mi < manifolds.size(); ++mi) {
+            auto& m = manifolds[mi];
+            if (!has_bounds[mi]) {
+                m.center_x = (m.anchor_x + 0.5f) * step - 1.0f;
+                m.center_y = (m.anchor_y + 0.5f) * step - 1.0f;
+                m.center_z = (m.anchor_z + 0.5f) * step - 1.0f;
+                m.max_radius = 0.0f;
+                m.volume_fraction = 0.0f;
+                std::fill(std::begin(m.deformed_radii), std::end(m.deformed_radii), 0.0f);
+                continue;
+            }
+
+            if (m.envelope_mode == 1u) {
+                // Exact Minimum-Volume 3D Bounding Box (AABB) enclosing 100% of all interior pixels & child boxes!
+                m.min_x = static_cast<float>(m.min_lx) * step - 1.0f;
+                m.min_y = static_cast<float>(m.min_ly) * step - 1.0f;
+                m.min_z = static_cast<float>(m.min_lz) * step - 1.0f;
+                m.max_x = static_cast<float>(m.max_lx + 1u) * step - 1.0f;
+                m.max_y = static_cast<float>(m.max_ly + 1u) * step - 1.0f;
+                m.max_z = static_cast<float>(m.max_lz + 1u) * step - 1.0f;
+                m.center_x = 0.5f * (m.min_x + m.max_x);
+                m.center_y = 0.5f * (m.min_y + m.max_y);
+                m.center_z = 0.5f * (m.min_z + m.max_z);
+                float hx = 0.5f * (m.max_x - m.min_x);
+                float hy = 0.5f * (m.max_y - m.min_y);
+                float hz = 0.5f * (m.max_z - m.min_z);
+                m.max_radius = std::sqrt(hx * hx + hy * hy + hz * hz);
+                double vol = static_cast<double>(m.max_x - m.min_x) *
+                             static_cast<double>(m.max_y - m.min_y) *
+                             static_cast<double>(m.max_z - m.min_z);
+                m.volume_fraction = static_cast<float>(vol / kUnitSphereVol);
+                std::fill(std::begin(m.deformed_radii), std::end(m.deformed_radii), m.max_radius);
+                continue;
+            }
+
+            // Legacy mode 0: Geodesic deformed-sphere envelope (used by fundamental_text)
+            struct Pt3 { float x, y, z; };
+            std::vector<Pt3> corners;
+            double sx = 0.0, sy = 0.0, sz = 0.0;
+            for (const auto& c : classes) {
+                if (c.manifold_id != m.manifold_id) continue;
+                uint32_t x0 = c.ox, x1 = c.ox + c.width - 1u;
+                uint32_t y0 = c.oy, y1 = c.oy + c.height - 1u;
+                uint32_t z0 = c.oz;
                 float wx[2] = {(x0 + 0.5f) * step - 1.0f, (x1 + 0.5f) * step - 1.0f};
                 float wy[2] = {(y0 + 0.5f) * step - 1.0f, (y1 + 0.5f) * step - 1.0f};
                 float wz    = (z0 + 0.5f) * step - 1.0f;
@@ -418,33 +590,18 @@ struct GeometricModel {
                     }
                 }
             }
+            m.min_x = (m.min_lx + 0.5f) * step - 1.0f;
+            m.min_y = (m.min_ly + 0.5f) * step - 1.0f;
+            m.min_z = (m.min_lz + 0.5f) * step - 1.0f;
+            m.max_x = (m.max_lx + 0.5f) * step - 1.0f;
+            m.max_y = (m.max_ly + 0.5f) * step - 1.0f;
+            m.max_z = (m.max_lz + 0.5f) * step - 1.0f;
+            m.center_x = static_cast<float>(sx / std::max<size_t>(1, corners.size()));
+            m.center_y = static_cast<float>(sy / std::max<size_t>(1, corners.size()));
+            m.center_z = static_cast<float>(sz / std::max<size_t>(1, corners.size()));
 
-            if (corners.empty()) {
-                m.center_x = (m.anchor_x + 0.5f) * step - 1.0f;
-                m.center_y = (m.anchor_y + 0.5f) * step - 1.0f;
-                m.center_z = (m.anchor_z + 0.5f) * step - 1.0f;
-                m.max_radius = 0.0f;
-                m.volume_fraction = 0.0f;
-                std::fill(std::begin(m.deformed_radii), std::end(m.deformed_radii), 0.0f);
-                continue;
-            }
-
-            m.min_lx = min_lx; m.max_lx = max_lx;
-            m.min_ly = min_ly; m.max_ly = max_ly;
-            m.min_lz = min_lz; m.max_lz = max_lz;
-            m.min_x = (min_lx + 0.5f) * step - 1.0f;
-            m.min_y = (min_ly + 0.5f) * step - 1.0f;
-            m.min_z = (min_lz + 0.5f) * step - 1.0f;
-            m.max_x = (max_lx + 0.5f) * step - 1.0f;
-            m.max_y = (max_ly + 0.5f) * step - 1.0f;
-            m.max_z = (max_lz + 0.5f) * step - 1.0f;
-            m.center_x = static_cast<float>(sx / corners.size());
-            m.center_y = static_cast<float>(sy / corners.size());
-            m.center_z = static_cast<float>(sz / corners.size());
-
-            // Precompute centered corner directions & radii
             std::vector<float> cux(corners.size()), cuy(corners.size()), cuz(corners.size()), cr(corners.size());
-            float skin = step * 3.5f; // tiny skin margin (~3.5 voxels) for guaranteed strict containment
+            float skin = step * 3.5f;
             for (size_t k = 0; k < corners.size(); ++k) {
                 float dx = corners[k].x - m.center_x;
                 float dy = corners[k].y - m.center_y;
@@ -455,7 +612,6 @@ struct GeometricModel {
                 else { cux[k] = 0.0f; cuy[k] = 0.0f; cuz[k] = 1.0f; }
             }
 
-            // 1. Directional tight radial support envelope (conforms organically as a deformed sphere!)
             float raw_r[kManifoldVerts];
             for (uint32_t v = 0; v < kManifoldVerts; ++v) {
                 float vx = geo.dirs[v * 3 + 0];
@@ -472,7 +628,6 @@ struct GeometricModel {
                 raw_r[v] = best;
             }
 
-            // 2. Smooth 2 passes on geodesic mesh so membrane is continuous & organic
             float sm_r[kManifoldVerts];
             for (int pass = 0; pass < 2; ++pass) {
                 for (uint32_t v = 0; v < kManifoldVerts; ++v) {
@@ -484,11 +639,8 @@ struct GeometricModel {
                 std::memcpy(raw_r, sm_r, sizeof(raw_r));
             }
 
-            // 3. Strict containment lift: guarantee 100% of allocated corners sit strictly inside the
-            //    deformed-sphere triangle mesh (checks every corner against its enclosing geodesic triangle!)
             for (size_t k = 0; k < corners.size(); ++k) {
                 float need = cr[k] + skin;
-                // Lift the 3 vertices of the closest geodesic triangle covering direction (cux, cuy, cuz)
                 int best_t = 0;
                 float best_dot = -2.0f;
                 for (size_t t = 0; t < geo.tris.size(); t += 3) {
@@ -513,7 +665,6 @@ struct GeometricModel {
             }
             m.max_radius = mr;
 
-            // Exact volume of deformed-sphere mesh = sum over triangles of |det(p0, p1, p2)| / 6
             double vol = 0.0;
             for (size_t t = 0; t < geo.tris.size(); t += 3) {
                 uint32_t a = geo.tris[t], b = geo.tris[t + 1], c = geo.tris[t + 2];
@@ -523,29 +674,30 @@ struct GeometricModel {
                 double det = ax * (by * czv - bz * cyv) - ay * (bx * czv - bz * cxv) + az * (bx * cyv - by * cxv);
                 vol += std::abs(det) / 6.0;
             }
-            constexpr double kUnitSphereVol = (4.0 / 3.0) * 3.14159265358979323846;
             m.volume_fraction = static_cast<float>(vol / kUnitSphereVol);
         }
     }
 
-    // Build GPU-resident 128-byte GpuManifoldDesc metadata table for direct upload to CUDA VRAM!
+    // Build GPU-resident 144-byte GpuManifoldDesc metadata table for direct upload to CUDA VRAM!
     std::vector<GpuManifoldDesc> build_gpu_manifold_table() const {
         std::vector<GpuManifoldDesc> out;
         out.reserve(manifolds.size());
         for (const auto& m : manifolds) {
             GpuManifoldDesc d{};
-            d.manifold_id     = m.manifold_id;
-            d.center_x        = m.center_x;
-            d.center_y        = m.center_y;
-            d.center_z        = m.center_z;
-            d.max_radius      = m.max_radius;
-            d.min_x           = m.min_x;
-            d.min_y           = m.min_y;
-            d.min_z           = m.min_z;
-            d.volume_fraction = m.volume_fraction;
-            d.max_x           = m.max_x;
-            d.max_y           = m.max_y;
-            d.max_z           = m.max_z;
+            d.manifold_id        = m.manifold_id;
+            d.parent_manifold_id = m.parent_manifold_id;
+            d.center_x           = m.center_x;
+            d.center_y           = m.center_y;
+            d.center_z           = m.center_z;
+            d.max_radius         = m.max_radius;
+            d.min_x              = m.min_x;
+            d.min_y              = m.min_y;
+            d.min_z              = m.min_z;
+            d.volume_fraction    = m.volume_fraction;
+            d.max_x              = m.max_x;
+            d.max_y              = m.max_y;
+            d.max_z              = m.max_z;
+            d.outer_idx          = m.outer_idx;
             std::strncpy(d.name, m.name.c_str(), sizeof(d.name) - 1);
             std::strncpy(d.semantic_label, m.semantic_label.c_str(), sizeof(d.semantic_label) - 1);
             std::map<uint32_t, bool> seen_cls;
@@ -629,8 +781,10 @@ struct GeometricModel {
         for (const auto& m : manifolds) {
             char mname[32] = {};
             char msem[48]  = {};
+            char mcon[32]  = {};
             std::strncpy(mname, m.name.c_str(), 31);
             std::strncpy(msem, m.semantic_label.c_str(), 47);
+            std::strncpy(mcon, m.concept_label.c_str(), 31);
             ofs.write(reinterpret_cast<const char*>(&m.manifold_id), 4);
             ofs.write(mname, 32);
             ofs.write(msem, 48);
@@ -655,6 +809,15 @@ struct GeometricModel {
             ofs.write(reinterpret_cast<const char*>(&m.max_ly), 4);
             ofs.write(reinterpret_cast<const char*>(&m.max_lz), 4);
             ofs.write(reinterpret_cast<const char*>(m.deformed_radii), sizeof(m.deformed_radii));
+            // v4 hierarchical metadata & outer-shell concept link
+            ofs.write(reinterpret_cast<const char*>(&m.parent_manifold_id), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.depth), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.envelope_mode), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.outer_idx), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.outer_x), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.outer_y), 4);
+            ofs.write(reinterpret_cast<const char*>(&m.outer_z), 4);
+            ofs.write(mcon, 32);
         }
 
         for (const auto& c : classes) {
@@ -672,8 +835,14 @@ struct GeometricModel {
             ofs.write(reinterpret_cast<const char*>(&c.outer_z), 4);
             ofs.write(reinterpret_cast<const char*>(&c.train_count), 4);
             ofs.write(reinterpret_cast<const char*>(&c.manifold_id), 4);
+            uint32_t ch = (c.channels == 3u && c.shadow_rgb.size() == c.shadow_sum.size()) ? 3u : 1u;
+            ofs.write(reinterpret_cast<const char*>(&ch), 4);
             ofs.write(reinterpret_cast<const char*>(c.shadow_sum.data()),
                       static_cast<std::streamsize>(c.shadow_sum.size() * sizeof(float)));
+            if (ch == 3u) {
+                ofs.write(reinterpret_cast<const char*>(c.shadow_rgb.data()),
+                          static_cast<std::streamsize>(c.shadow_rgb.size() * sizeof(uint32_t)));
+            }
         }
         return ofs.good();
     }
@@ -685,7 +854,7 @@ struct GeometricModel {
         uint32_t magic = 0, ver = 0, num_classes = 0, num_manifolds = 0;
         ifs.read(reinterpret_cast<char*>(&magic), 4);
         ifs.read(reinterpret_cast<char*>(&ver), 4);
-        if (magic != kModelMagic || (ver != 1u && ver != kModelVersion)) return false;
+        if (magic != kModelMagic || ver < 1u || ver > kModelVersion) return false;
 
         ifs.read(reinterpret_cast<char*>(&lattice_grid), 4);
         ifs.read(reinterpret_cast<char*>(&outer_shell_pts), 4);
@@ -725,6 +894,24 @@ struct GeometricModel {
                 ifs.read(reinterpret_cast<char*>(&m.max_ly), 4);
                 ifs.read(reinterpret_cast<char*>(&m.max_lz), 4);
                 ifs.read(reinterpret_cast<char*>(m.deformed_radii), sizeof(m.deformed_radii));
+                if (ver >= 4u) {
+                    char mcon[32] = {};
+                    ifs.read(reinterpret_cast<char*>(&m.parent_manifold_id), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.depth), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.envelope_mode), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.outer_idx), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.outer_x), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.outer_y), 4);
+                    ifs.read(reinterpret_cast<char*>(&m.outer_z), 4);
+                    ifs.read(mcon, 32);
+                    m.concept_label = mcon;
+                } else {
+                    m.parent_manifold_id = kInvalidId;
+                    m.depth = 0u;
+                    m.envelope_mode = 0u;
+                    m.outer_idx = kInvalidId;
+                    m.concept_label = m.name;
+                }
                 manifolds.push_back(std::move(m));
             }
         }
@@ -751,9 +938,22 @@ struct GeometricModel {
             } else {
                 c.manifold_id = 0u;
             }
+            if (ver >= 3u) {
+                ifs.read(reinterpret_cast<char*>(&c.channels), 4);
+            } else {
+                c.channels = 1u;
+            }
             c.shadow_sum.resize(static_cast<size_t>(c.width) * c.height);
             ifs.read(reinterpret_cast<char*>(c.shadow_sum.data()),
                      static_cast<std::streamsize>(c.shadow_sum.size() * sizeof(float)));
+            if (ver >= 3u && c.channels == 3u) {
+                c.shadow_rgb.resize(static_cast<size_t>(c.width) * c.height);
+                ifs.read(reinterpret_cast<char*>(c.shadow_rgb.data()),
+                         static_cast<std::streamsize>(c.shadow_rgb.size() * sizeof(uint32_t)));
+            } else {
+                c.channels = 1u;
+                c.shadow_rgb.clear();
+            }
             classes.push_back(std::move(c));
         }
 

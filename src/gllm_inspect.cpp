@@ -160,19 +160,26 @@ int main(int argc, char** argv) {
     auto mtable = model.build_gpu_manifold_table();
     if (!mtable.empty()) {
         std::printf("Operational Manifolds (%zu registered in CUDA metadata):\n", mtable.size());
-        std::printf("  %-4s | %-18s | %-32s | %-7s | %-7s | %-28s | %-8s\n",
-                    "ID", "Manifold Name", "CUDA Semantic Label", "Classes", "Regions", "Tight Lattice Bounds", "Vol %");
-        std::printf("  -----+--------------------+----------------------------------+---------+---------+------------------------------+---------\n");
+        std::printf("  %-4s | %-28s | %-7s | %-16s | %-8s | %-28s | %-8s\n",
+                    "ID", "Manifold Hierarchy", "Parent", "Outer Concept", "Envelope", "Tight Lattice Bounds", "Vol %");
+        std::printf("  -----+------------------------------+---------+------------------+----------+------------------------------+---------\n");
         for (const auto& d : mtable) {
             const auto* mr = model.get_manifold(d.manifold_id);
-            char bbuf[64];
+            char bbuf[64], pbuf[16], obuf[32];
             std::snprintf(bbuf, sizeof(bbuf), "[%u..%u,%u..%u,%u..%u]",
                           mr ? mr->min_lx : 0u, mr ? mr->max_lx : 0u,
                           mr ? mr->min_ly : 0u, mr ? mr->max_ly : 0u,
                           mr ? mr->min_lz : 0u, mr ? mr->max_lz : 0u);
-            std::printf("  #%-3u | %-18s | %-32s | %-7u | %-7u | %-28s | %6.4f%%\n",
-                        d.manifold_id, d.name, d.semantic_label,
-                        d.class_count, d.region_count, bbuf, d.volume_fraction * 100.0f);
+            if (!mr || mr->parent_manifold_id == gllm::kInvalidId) std::snprintf(pbuf, sizeof(pbuf), "ROOT");
+            else std::snprintf(pbuf, sizeof(pbuf), "#%u", mr->parent_manifold_id);
+            if (!mr || mr->outer_idx == gllm::kInvalidId) std::snprintf(obuf, sizeof(obuf), "-");
+            else std::snprintf(obuf, sizeof(obuf), "#%u '%s'", mr->outer_idx, mr->concept_label.c_str());
+            std::string indent = mr ? std::string(mr->depth * 2u, ' ') : "";
+            std::string hname = (indent + d.name).substr(0, 28);
+            std::printf("  #%-3u | %-28s | %-7s | %-16s | %-8s | %-28s | %6.4f%%\n",
+                        d.manifold_id, hname.c_str(), pbuf, obuf,
+                        (mr && mr->envelope_mode == 1u) ? "3D-Box" : "Deformed",
+                        bbuf, d.volume_fraction * 100.0f);
         }
         std::printf("\n");
     }

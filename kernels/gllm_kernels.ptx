@@ -290,29 +290,31 @@ EVAL_DONE:
     .param .u64 param_counter,
     .param .u64 param_regions,     // GpuRegionDesc[num_regions] (32 bytes each)
     .param .u64 param_shadow_avg,  // flat float array of normalized [0..1] shadow maps
+    .param .u64 param_shadow_rgb,  // flat uint32_t array of packed 0x01RRGGBB per lattice point (0 = grayscale)
     .param .u32 param_num_regions,
     .param .u32 param_max_reg_pix, // max(width*height) across regions
     .param .u32 param_grid_dim,
     .param .u32 param_max_vbo_pts,
     .param .u32 param_focus,       // class_id to highlight, or >= num_regions for all
-    .param .u32 param_heatmap      // 0 = class spectral -> white-hot, 1 = thermal shadow map
+    .param .u32 param_heatmap      // 0 = true RGB (if present) or class spectral, 1 = thermal shadow map
 )
 {
-    .reg .pred %p<10>;
-    .reg .u32  %r<24>;
-    .reg .u64  %rd<12>;
+    .reg .pred %p<12>;
+    .reg .u32  %r<30>;
+    .reg .u64  %rd<16>;
     .reg .f32  %f<30>;
 
-    ld.param.u64 %rd0, [param_out_vbo];
-    ld.param.u64 %rd1, [param_counter];
-    ld.param.u64 %rd2, [param_regions];
-    ld.param.u64 %rd3, [param_shadow_avg];
-    ld.param.u32 %r0,  [param_num_regions];
-    ld.param.u32 %r1,  [param_max_reg_pix];
-    ld.param.u32 %r2,  [param_grid_dim];
-    ld.param.u32 %r3,  [param_max_vbo_pts];
-    ld.param.u32 %r4,  [param_focus];
-    ld.param.u32 %r5,  [param_heatmap];
+    ld.param.u64 %rd0,  [param_out_vbo];
+    ld.param.u64 %rd1,  [param_counter];
+    ld.param.u64 %rd2,  [param_regions];
+    ld.param.u64 %rd3,  [param_shadow_avg];
+    ld.param.u64 %rd10, [param_shadow_rgb];
+    ld.param.u32 %r0,   [param_num_regions];
+    ld.param.u32 %r1,   [param_max_reg_pix];
+    ld.param.u32 %r2,   [param_grid_dim];
+    ld.param.u32 %r3,   [param_max_vbo_pts];
+    ld.param.u32 %r4,   [param_focus];
+    ld.param.u32 %r5,   [param_heatmap];
 
     mov.u32    %r6, %ctaid.x;
     mov.u32    %r7, %ntid.x;
@@ -342,16 +344,23 @@ EVAL_DONE:
     setp.ge.u32 %p1, %r12, %r21;
     @%p1 bra EMIT_DONE;
 
-    // Load normalized shadow density avg in [0..1]
+    // Load normalized shadow density avg in [0..1] and packed RGB (0x01RRGGBB if RGB, 0 if grayscale)
     add.u32      %r22, %r19, %r12;
     mul.wide.u32 %rd6, %r22, 4;
     add.u64      %rd7, %rd3, %rd6;
     ld.global.f32 %f0, [%rd7];
 
-    // Skip untouched background pixels (<= 0.004)
+    add.u64       %rd11, %rd10, %rd6;
+    ld.global.u32 %r24,  [%rd11];       // packed RGB (bit 24 = 1 means true RGB lattice point)
+    and.b32       %r25,  %r24, 16777216;// 0x01000000
+    setp.ne.u32   %p7,   %r25, 0;
+
+    // Skip untouched background pixels ONLY when grayscale (<= 0.004); keep ALL true-RGB pixels (even dark pupils!)
+    @%p7 bra HAVE_PIX;
     setp.le.f32 %p2, %f0, 0f3b83126f;
     @%p2 bra EMIT_DONE;
 
+HAVE_PIX:
     // Exact implicit 3D lattice coordinates inside G^3 sphere!
     //   dx = pix_idx % width,  dy = pix_idx / width
     //   ix = ox + dx,  iy = oy + (height - 1 - dy),  iz = oz
@@ -392,6 +401,7 @@ EVAL_DONE:
 SHADE_REG:
     setp.ne.u32 %p5, %r5, 0;
     @%p5 bra PAL_THERMAL;
+    @%p7 bra PAL_TRUE_RGB;
 
     // Class spectral color matching assigned outer-shell point -> white-hot peak core
     cvt.rn.f32.u32 %f14, %r18;
@@ -414,6 +424,27 @@ SHADE_REG:
     fma.rn.f32 %f22, %f12, 0f3f400000, %f22;
     bra FINISH_EMIT;
 
+PAL_TRUE_RGB:
+    // Exact per-lattice-point RGB unpacked directly from CUDA VRAM (0x01RRGGBB -> float [0..1])
+    shr.u32        %r26, %r24, 16;
+    and.b32        %r26, %r26, 255;
+    shr.u32        %r27, %r24, 8;
+    and.b32        %r27, %r27, 255;
+    and.b32        %r28, %r24, 255;
+    cvt.rn.f32.u32 %f20, %r26;
+    cvt.rn.f32.u32 %f21, %r27;
+    cvt.rn.f32.u32 %f22, %r28;
+    mul.f32        %f20, %f20, 0f3b808081;  // R / 255.0
+    mul.f32        %f21, %f21, 0f3b808081;  // G / 255.0
+    mul.f32        %f22, %f22, 0f3b808081;  // B / 255.0
+    mul.f32        %f20, %f20, %f13;
+    mul.f32        %f21, %f21, %f13;
+    mul.f32        %f22, %f22, %f13;
+    mov.f32        %f23, 0f3f733333;        // alpha = 0.95 * focus_scale
+    mul.f32        %f23, %f23, %f13;
+    mov.f32        %f10, 0f3f400000;        // consistent crisp point size for true-RGB lattice points
+    bra WRITE_PT;
+
 PAL_THERMAL:
     mul.f32 %f20, %f11, 0f3fc00000;
     sub.f32 %f21, %f10, 0f3e99999a;
@@ -435,6 +466,7 @@ FINISH_EMIT:
     fma.rn.f32 %f23, %f11, 0f3f59999a, 0f3e19999a;
     mul.f32    %f23, %f23, %f13;
 
+WRITE_PT:
     atom.global.add.u32 %r23, [%rd1], 1;
     setp.ge.u32 %p6, %r23, %r3;
     @%p6 bra EMIT_DONE;

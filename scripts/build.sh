@@ -18,4 +18,10 @@ g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_bench.cpp" -o "${ROOT}/bin/gl
 echo "[BUILD] Compiling gllm_viz..."
 g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_viz.cpp" -o "${ROOT}/bin/gllm_viz" -lcuda -lSDL2 -lGL -lz -ldl -lpthread
 
-echo "[BUILD] Done: bin/gllm_train, bin/gllm_eval, bin/gllm_inspect, bin/gllm_bench, bin/gllm_viz"
+echo "[BUILD] Compiling gllm_pyramid..."
+g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_pyramid.cpp" -o "${ROOT}/bin/gllm_pyramid" -lz
+
+echo "[BUILD] Compiling gllm_hierarchy..."
+g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_hierarchy.cpp" -o "${ROOT}/bin/gllm_hierarchy" -lz
+
+echo "[BUILD] Done: bin/gllm_train, bin/gllm_eval, bin/gllm_inspect, bin/gllm_bench, bin/gllm_viz, bin/gllm_pyramid, bin/gllm_hierarchy"

@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
                 overlaps == 0 ? "PASS" : "FAIL");
     if (overlaps > 0) return 2;
 
-    // Verify Operational Manifolds containment & CUDA semantic metadata table
+    // Verify Operational Manifolds containment (exact 3D AABB box or geodesic deformed sphere) & parent nesting
     auto gpu_manifolds = model.build_gpu_manifold_table();
     const auto& geo = gllm::unit_geodesic_sphere();
     float step_w = 2.0f / static_cast<float>(model.lattice_grid);
@@ -134,22 +134,37 @@ int main(int argc, char** argv) {
         for (int ix = 0; ix < 2; ++ix) {
             for (int iy = 0; iy < 2; ++iy) {
                 total_corners++;
-                float dx = wx[ix] - m->center_x, dy = wy[iy] - m->center_y, dz = wz - m->center_z;
-                float r  = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (r <= m->max_radius + 1e-4f) {
-                    // Also check nearest geodesic vertex directional radius
-                    float inv_r = r > 1e-7f ? 1.0f / r : 0.0f;
-                    uint32_t best_v = 0; float bd = -2.0f;
-                    for (uint32_t v = 0; v < gllm::kManifoldVerts; ++v) {
-                        float dp = (dx * geo.dirs[v*3] + dy * geo.dirs[v*3+1] + dz * geo.dirs[v*3+2]) * inv_r;
-                        if (dp > bd) { bd = dp; best_v = v; }
+                if (m->envelope_mode == 1u) {
+                    // Exact 3D Bounding Box check across this manifold AND every ancestor manifold up to root!
+                    bool all_in = true;
+                    const gllm::ManifoldRecord* cur = m;
+                    while (cur) {
+                        if (wx[ix] < cur->min_x - 1e-5f || wx[ix] > cur->max_x + 1e-5f ||
+                            wy[iy] < cur->min_y - 1e-5f || wy[iy] > cur->max_y + 1e-5f ||
+                            wz     < cur->min_z - 1e-5f || wz     > cur->max_z + 1e-5f) {
+                            all_in = false;
+                            break;
+                        }
+                        cur = (cur->parent_manifold_id == gllm::kInvalidId) ? nullptr : model.get_manifold(cur->parent_manifold_id);
                     }
-                    if (r <= m->deformed_radii[best_v] + 1e-3f) enclosed_corners++;
+                    if (all_in) enclosed_corners++;
+                } else {
+                    float dx = wx[ix] - m->center_x, dy = wy[iy] - m->center_y, dz = wz - m->center_z;
+                    float r  = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (r <= m->max_radius + 1e-4f) {
+                        float inv_r = r > 1e-7f ? 1.0f / r : 0.0f;
+                        uint32_t best_v = 0; float bd = -2.0f;
+                        for (uint32_t v = 0; v < gllm::kManifoldVerts; ++v) {
+                            float dp = (dx * geo.dirs[v*3] + dy * geo.dirs[v*3+1] + dz * geo.dirs[v*3+2]) * inv_r;
+                            if (dp > bd) { bd = dp; best_v = v; }
+                        }
+                        if (r <= m->deformed_radii[best_v] + 1e-3f) enclosed_corners++;
+                    }
                 }
             }
         }
     }
-    std::printf("         Operational Manifolds: %zu | Deformed-Sphere Containment: %u/%u corners (%.1f%%)\n",
+    std::printf("         Operational Manifolds: %zu | Envelope Containment: %u/%u corners (%.1f%%)\n",
                 gpu_manifolds.size(), enclosed_corners, total_corners,
                 total_corners ? 100.0 * enclosed_corners / total_corners : 100.0);
     for (const auto& d : gpu_manifolds) {

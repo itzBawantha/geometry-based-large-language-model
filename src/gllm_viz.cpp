@@ -405,6 +405,7 @@ int main(int argc, char** argv) {
     std::vector<gllm::GpuRegionDesc> h_regions;
     std::vector<gllm::GpuOuterPoint> h_outer;
     std::vector<float>    h_shadow_avg;
+    std::vector<uint32_t> h_shadow_rgb;
     std::vector<uint64_t> h_class_masks(num_regions, 0ULL);
     std::vector<float>    h_log_odds;
     std::vector<float>    h_class_prob;
@@ -422,6 +423,19 @@ int main(int argc, char** argv) {
     h_log_odds.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
     h_class_prob.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
 
+    // Register outer-shell concept nodes from hierarchical manifolds FIRST (so shared concepts like 'face' appear!)
+    bool has_manifold_outer_links = false;
+    for (const auto& m : model.manifolds) {
+        if (m.outer_idx != gllm::kInvalidId) {
+            has_manifold_outer_links = true;
+            if (outer_to_label.find(m.outer_idx) == outer_to_label.end()) {
+                outer_to_label[m.outer_idx] = m.concept_label.empty() ? m.name : m.concept_label;
+                unique_outer_ids.push_back(m.outer_idx);
+                h_outer.push_back({m.outer_x, m.outer_y, m.outer_z, static_cast<float>(m.outer_idx)});
+            }
+        }
+    }
+
     for (uint32_t r = 0; r < num_regions; ++r) {
         const auto& rec = model.classes[r];
         uint32_t pix = rec.width * rec.height;
@@ -437,9 +451,11 @@ int main(int argc, char** argv) {
 
         float inv = rec.train_count > 0 ? (1.0f / static_cast<float>(rec.train_count)) : 0.0f;
         std::vector<float> avg(pix, 0.0f);
+        bool has_rgb = (rec.channels == 3u && rec.shadow_rgb.size() == pix);
         for (uint32_t p = 0; p < pix; ++p) {
             avg[p] = rec.shadow_sum[p] * inv;
             h_shadow_avg.push_back(avg[p]);
+            h_shadow_rgb.push_back(has_rgb ? rec.shadow_rgb[p] : 0u);
         }
 
         if (pix == match_pix) {
@@ -523,7 +539,7 @@ int main(int argc, char** argv) {
     for (uint32_t r = 0; r < num_regions; ++r) h_reg_manifold[r] = model.classes[r].manifold_id;
 
     // Upload GPU model, matcher & Operational Manifold metadata buffers
-    CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_counter = 0;
+    CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_shadow_rgb = 0, d_counter = 0;
     CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0;
     CUdeviceptr d_sketch_raw = 0, d_sketch_ent = 0, d_sketch_masks = 0;
     CUdeviceptr d_out_ov = 0, d_out_st = 0;
@@ -534,6 +550,8 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemcpyHtoD_v2(d_outer, h_outer.data(), h_outer.size() * sizeof(gllm::GpuOuterPoint)));
     CU_CHECK(cuMemAlloc_v2(&d_shadow, h_shadow_avg.size() * sizeof(float)));
     CU_CHECK(cuMemcpyHtoD_v2(d_shadow, h_shadow_avg.data(), h_shadow_avg.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_shadow_rgb, h_shadow_rgb.size() * sizeof(uint32_t)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_shadow_rgb, h_shadow_rgb.data(), h_shadow_rgb.size() * sizeof(uint32_t)));
     CU_CHECK(cuMemAlloc_v2(&d_counter, sizeof(uint32_t)));
 
     CU_CHECK(cuMemAlloc_v2(&d_masks,      h_class_masks.size() * sizeof(uint64_t)));
@@ -603,20 +621,33 @@ int main(int argc, char** argv) {
     CUgraphicsResource cu_lat_res = nullptr;
     CU_CHECK(cuGraphicsGLRegisterBuffer(&cu_lat_res, lat_vbo, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD));
 
-    // --- VBO 3: 1-to-1 / K-to-1 Binding lines (all sub-shadows converge to their class outer point!) ---
+    // --- VBO 3: Binding lines (manifold-to-outer concept rays in hierarchical mode, or K-to-1 class rays) ---
     struct LinkVert { float x, y, z, r, g, b, a, cid; };
     std::vector<LinkVert> links;
-    for (uint32_t r = 0; r < num_regions; ++r) {
-        const auto& rec = model.classes[r];
-        float ix = (rec.ox + rec.width * 0.5f) * step - 1.0f;
-        float iy = (rec.oy + rec.height * 0.5f) * step - 1.0f;
-        float iz = (rec.oz + 0.5f) * step - 1.0f;
-        float ph = rec.outer_idx * 2.4f;
-        float cr = 0.55f + 0.45f * std::cos(ph);
-        float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
-        float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
-        links.push_back({ix, iy, iz, cr, cg, cb, 0.25f, static_cast<float>(rec.outer_idx)});
-        links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.72f, static_cast<float>(rec.outer_idx)});
+    if (has_manifold_outer_links) {
+        for (const auto& m : model.manifolds) {
+            if (m.outer_idx == gllm::kInvalidId || m.max_radius <= 1e-6f) continue;
+            float ph = m.outer_idx * 2.4f;
+            float cr = 0.55f + 0.45f * std::cos(ph);
+            float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
+            float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
+            // Connect top-center of each manifold's 3D bounding box directly to its outer-shell concept node!
+            links.push_back({m.center_x, m.max_y, m.center_z, cr, cg, cb, 0.72f, static_cast<float>(m.outer_idx)});
+            links.push_back({m.outer_x,  m.outer_y, m.outer_z, cr, cg, cb, 0.96f, static_cast<float>(m.outer_idx)});
+        }
+    } else {
+        for (uint32_t r = 0; r < num_regions; ++r) {
+            const auto& rec = model.classes[r];
+            float ix = (rec.ox + rec.width * 0.5f) * step - 1.0f;
+            float iy = (rec.oy + rec.height * 0.5f) * step - 1.0f;
+            float iz = (rec.oz + 0.5f) * step - 1.0f;
+            float ph = rec.outer_idx * 2.4f;
+            float cr = 0.55f + 0.45f * std::cos(ph);
+            float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
+            float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
+            links.push_back({ix, iy, iz, cr, cg, cb, 0.25f, static_cast<float>(rec.outer_idx)});
+            links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.72f, static_cast<float>(rec.outer_idx)});
+        }
     }
     GLuint link_vao = 0, link_vbo = 0;
     glGenVertexArrays(1, &link_vao);
@@ -632,17 +663,57 @@ int main(int argc, char** argv) {
     glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(LinkVert), reinterpret_cast<void*>(28));
     glBindVertexArray(0);
 
-    // --- VBO 4: Operational Manifold Deformed-Sphere Envelopes (translucent glass + geodesic wireframe) ---
+    // --- VBO 4: Operational Manifold Envelopes (exact 3D Bounding Boxes for mode=1, deformed sphere for mode=0) ---
     struct ManVert { float x, y, z, r, g, b, a; };
     std::vector<ManVert> man_tris, man_wires;
     {
         const auto& geo = gllm::unit_geodesic_sphere();
         for (const auto& m : model.manifolds) {
             if (m.max_radius <= 1e-6f) continue;
-            float ph = m.manifold_id * 2.1f;
-            float cr = (m.manifold_id == 0u) ? 0.22f : (0.55f + 0.40f * std::cos(ph));
-            float cg = (m.manifold_id == 0u) ? 0.86f : (0.55f + 0.40f * std::cos(ph + 2.094f));
-            float cb = (m.manifold_id == 0u) ? 1.00f : (0.55f + 0.40f * std::cos(ph + 4.188f));
+            float cr, cg, cb;
+            if (m.outer_idx != gllm::kInvalidId) {
+                float ph = m.outer_idx * 2.4f;
+                cr = 0.55f + 0.45f * std::cos(ph);
+                cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
+                cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
+            } else {
+                float ph = m.manifold_id * 2.1f;
+                cr = (m.manifold_id == 0u) ? 0.22f : (0.55f + 0.40f * std::cos(ph));
+                cg = (m.manifold_id == 0u) ? 0.86f : (0.55f + 0.40f * std::cos(ph + 2.094f));
+                cb = (m.manifold_id == 0u) ? 1.00f : (0.55f + 0.40f * std::cos(ph + 4.188f));
+            }
+
+            if (m.envelope_mode == 1u) {
+                // Exact 3D Axis-Aligned Bounding Box (8 corners, 12 crisp edges, 6 subtle glass faces)
+                float c[8][3] = {
+                    {m.min_x, m.min_y, m.min_z}, {m.max_x, m.min_y, m.min_z},
+                    {m.max_x, m.max_y, m.min_z}, {m.min_x, m.max_y, m.min_z},
+                    {m.min_x, m.min_y, m.max_z}, {m.max_x, m.min_y, m.max_z},
+                    {m.max_x, m.max_y, m.max_z}, {m.min_x, m.max_y, m.max_z}
+                };
+                static const int kBoxEdges[24] = {
+                    0,1, 1,2, 2,3, 3,0,
+                    4,5, 5,6, 6,7, 7,4,
+                    0,4, 1,5, 2,6, 3,7
+                };
+                static const int kBoxTris[36] = {
+                    0,1,2, 0,2,3,  4,6,5, 4,7,6,
+                    0,4,5, 0,5,1,  3,2,6, 3,6,7,
+                    0,3,7, 0,7,4,  1,5,6, 1,6,2
+                };
+                float wire_a = (m.depth == 0u) ? 0.52f : ((m.depth == 1u) ? 0.68f : ((m.depth == 2u) ? 0.84f : 0.98f));
+                float face_a = (m.depth == 0u) ? 0.015f : ((m.depth == 1u) ? 0.022f : ((m.depth == 2u) ? 0.032f : 0.050f));
+                for (int e = 0; e < 24; ++e) {
+                    int vi = kBoxEdges[e];
+                    man_wires.push_back({c[vi][0], c[vi][1], c[vi][2], cr, cg, cb, wire_a});
+                }
+                for (int t = 0; t < 36; ++t) {
+                    int vi = kBoxTris[t];
+                    man_tris.push_back({c[vi][0], c[vi][1], c[vi][2], cr, cg, cb, face_a});
+                }
+                continue;
+            }
+
             auto vpos = [&](uint32_t vi, float alpha) -> ManVert {
                 float rad = m.deformed_radii[vi];
                 return {
@@ -1237,7 +1308,7 @@ int main(int argc, char** argv) {
             uint32_t g = model.lattice_grid;
             uint32_t total_work = num_regions * max_reg_pix;
             void* p[] = {
-                &d_lat, &d_counter, &d_regions, &d_shadow,
+                &d_lat, &d_counter, &d_regions, &d_shadow, &d_shadow_rgb,
                 &num_regions, &max_reg_pix, &g, &max_vbo_pts,
                 &focus_cls, &heatmap_mode
             };
@@ -1375,6 +1446,7 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_regions));
     CU_CHECK(cuMemFree_v2(d_outer));
     CU_CHECK(cuMemFree_v2(d_shadow));
+    CU_CHECK(cuMemFree_v2(d_shadow_rgb));
     CU_CHECK(cuMemFree_v2(d_counter));
     CU_CHECK(cuMemFree_v2(d_masks));
     CU_CHECK(cuMemFree_v2(d_log_odds));
