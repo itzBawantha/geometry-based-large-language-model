@@ -6,29 +6,44 @@ Intelligence is not represented by anything else other than a geometric shape, s
 
 ## Modular CUDA Architecture
 
-GLLM separates a **1-billion-point implicit 3D sphere lattice** (`1241³`, **0 bytes** for unallocated coordinates) and a **1.2M-point outer shell** into three standalone GPU CLI tools that share a self-describing binary checkpoint format (`.gllm`):
+GLLM separates a **1-billion-point implicit 3D sphere lattice** (`1241³`, **0 bytes** for unallocated coordinates) and a **1.2M-point outer shell** into four standalone GPU CLI tools that share a self-describing binary checkpoint format (`.gllm`):
 
-- **`bin/gllm_train`** — Dynamically allocates guaranteed non-overlapping `W×H` spaces inside the 3D sphere lattice and binds each class to a unique neighboring outer-shell point (`R = 1.0`). Accumulates overlapping image shadows on GPU via CUDA (`atom.global.add.f32`). **Incremental by design:** run once on digits (`0–9`), then run again on English letters (`A–Z`) or custom image folders into the *same* `.gllm` model—prior spaces and shadows remain untouched with zero overlap.
-- **`bin/gllm_eval`** — Scores unseen test images against every trained class's geometric shadow map directly on the GPU via cosine-overlap matching.
-- **`bin/gllm_inspect`** — Pulls up or exports (`--json` / `--csv` / `--value` / `--label`) the complete lookup table serialized inside any `.gllm` model (outer-shell scalar ID ↔ class label ↔ outer `(x, y, z)` ↔ unique 3D lattice coordinates).
-- **`bin/gllm_viz`** — Zero-copy CUDA–OpenGL 4.6 3D visualizer rendering **only** allocated shadow spaces, their assigned outer-shell points, and 1-to-1 binding lines at 60 FPS (even on a 1-billion-point lattice).
+- **`bin/gllm_train`** — Dynamically allocates guaranteed non-overlapping `W×H` spaces inside the 3D sphere lattice and binds each class to a unique neighboring outer-shell point (`R = 1.0`). Accumulates overlapping image shadows on GPU via CUDA (`atom.global.add.f32`). **Incremental by design:** train on digits (`0–9`), append English letters (`A–Z`, `a–z`), or add your own custom image folders into the *same* `.gllm` model—prior spaces and shadows remain untouched with **0 overlaps**.
+- **`bin/gllm_eval`** — Evaluates unseen test datasets against every trained class's geometric shadow map directly on the GPU.
+- **`bin/gllm_inspect`** — Inspects or exports (`--json` / `--csv` / `--value` / `--label`) the complete lookup table serialized inside any `.gllm` checkpoint (outer-shell scalar ID ↔ class label ↔ outer `(x, y, z)` ↔ unique 3D lattice coordinates).
+- **`bin/gllm_viz`** — Zero-copy CUDA–OpenGL 4.6 3D visualizer + **Interactive Sketch Inference Canvas** with:
+  - **224×224 live drawing canvas** & canonical **22×22-in-28×28** CUDA preview.
+  - **Stage-1 Hardware 64-bit Bitmask Pruning** (`and.b64` + `popc.b64`) to drop structurally impossible classes in 2 clock cycles.
+  - **Stage-2 Multi-Shift Full-Feature Geometric Confirmation** (`dx, dy ∈ {-1, 0, +1}`) combining Centered Cosine, Soft-Dice, an **Extra-Ink-in-Void penalty** (`max(0, x − t) · (1 − t)²`), and a **Missing-Core penalty** (`max(0, t − x) · t²`) so extra or missing strokes (e.g., `B` vs. `3`) are strictly distinguished.
+  - **Open-World Unknown Detection** (`< 35%` overlap), clickable **Top-10 Overlap & Relative Probability bars**, and **Stage-1 Pruned class readout**.
+
+### Prerequisites
+- Linux with an **NVIDIA GPU** and standard NVIDIA driver (`libcuda.so` — **no `nvcc` / CUDA Toolkit required**, PTX is JIT-compiled by the driver at runtime)
+- `g++` (C++17), `SDL2`, `OpenGL 4.6`, `zlib`
+- Optional for custom PNG/JPG conversion: `python3` + `pillow` (or `ImageMagick` / `ffmpeg`)
 
 ### Repository Layout
 ```text
 include/
-  cuda_driver_min.hpp     # Minimal CUDA Driver API bindings (libcuda.so, no nvcc required)
-  gllm_model.hpp          # .gllm model format, non-overlapping 3D allocator, IDX & folder loaders
+  cuda_driver_min.hpp            # Minimal CUDA Driver API bindings (libcuda.so, no nvcc)
+  gllm_model.hpp                 # .gllm format, non-overlapping 3D allocator, IDX & folder loaders
+  hud_canvas.hpp                 # Interactive 224x224 sketch canvas, canonicalizer, HUD renderer
 kernels/
-  gllm_kernels.ptx        # JIT-compiled CUDA PTX kernels (train, eval, outer shell, O(alloc) viz)
-  gllm_kernels.cu         # Readable CUDA C++ reference mirror
+  gllm_kernels.ptx               # JIT-compiled CUDA PTX kernels (shell, train, eval, emit, matcher)
+  gllm_kernels.cu                # Readable CUDA C++ reference mirror
 src/
-  gllm_train.cpp          # Standalone CLI CUDA shadow trainer
-  gllm_eval.cpp           # Standalone CLI CUDA evaluator
-  gllm_viz.cpp            # Standalone 3D CUDA-OpenGL visualizer
+  gllm_train.cpp                 # Standalone CLI CUDA shadow trainer
+  gllm_eval.cpp                  # Standalone CLI CUDA batch evaluator
+  gllm_inspect.cpp               # Standalone .gllm outer-point lookup table inspector
+  gllm_viz.cpp                   # Interactive 3D CUDA-OpenGL visualizer + sketch inference UI
 scripts/
-  build.sh                # Compiles gllm_train, gllm_eval, gllm_viz
-  run_viz.sh              # NVIDIA PRIME offload launcher for gllm_viz
-  download_mnist.sh       # Downloads MNIST IDX .gz dataset into data/mnist/
+  build.sh                       # Compiles all 4 CLIs into bin/
+  run_viz.sh                     # NVIDIA PRIME offload launcher for gllm_viz
+  download_mnist.sh              # Downloads MNIST (0-9) into data/mnist/
+  download_emnist_byclass.sh     # Downloads EMNIST ByClass (A-Z, a-z) into data/emnist_byclass/
+  train_digits_and_letters.sh    # One-command 62-class (0-9, A-Z, a-z) 1B-sphere training pipeline
+  prepare_custom_dataset.py      # Converts custom PNG/JPG/BMP folders (or generates a demo) to PGM
+  train_custom.sh                # One-command custom dataset converter + GPU trainer + inspector
 ```
 
 ---
@@ -40,41 +55,87 @@ scripts/
 ./scripts/build.sh
 ```
 
-### 2. Download MNIST & Train Digits `0–9` into a 1-Billion-Point Sphere
+### 2. Train the 62-Class Model (MNIST `0–9` + EMNIST `A–Z`, `a–z`)
+Run the full pipeline in one command (~412,897 shadows trained in `< 20 ms` of GPU kernel time):
 ```bash
-./scripts/download_mnist.sh
-
-./bin/gllm_train \
-  --model models/sphere.gllm \
-  --idx-images data/mnist/train-images-idx3-ubyte.gz \
-  --idx-labels data/mnist/train-labels-idx1-ubyte.gz
+./scripts/train_digits_and_letters.sh
+```
+Then launch the interactive 3D visualizer & sketch canvas:
+```bash
+./scripts/run_viz.sh --model models/sphere_1b.gllm
 ```
 
-### 3. Incrementally Add New Datasets (e.g., EMNIST English Letters `A–Z` or Custom Folders)
-Running `gllm_train` against the **same** `--model models/sphere.gllm` preserves all existing classes and allocates brand-new non-overlapping `W×H` regions + outer-shell points:
-```bash
-# Example: EMNIST Letters (1..26 -> A..Z, transposed IDX)
-./bin/gllm_train \
-  --model models/sphere.gllm \
-  --idx-images data/emnist/emnist-letters-train-images-idx3-ubyte.gz \
-  --idx-labels data/emnist/emnist-letters-train-labels-idx1-ubyte.gz \
-  --label-offset 1 --transpose \
-  --label-names A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z
+---
 
-# Example: Custom folder dataset (data/custom/<class_name>/*.pgm or *.ppm)
-./bin/gllm_train --model models/sphere.gllm --folder data/custom
+## Train Your Own Custom Dataset
+
+GLLM is completely dynamic—nothing is hardcoded to 10 or 62 classes. You can train **any custom image dataset** (handwritten symbols, custom alphabets, icons, medical tiles, geometric shapes, etc.) either into a brand-new `.gllm` sphere or **appended incrementally** into an existing `.gllm` model.
+
+### Option A: Quick Zero-Dependency Demo (30 Seconds)
+Generate a synthetic 3-class geometric dataset (`circle`, `square`, `triangle`), train it on your GPU, inspect the allocated 3D coordinates, and visualize it:
+```bash
+./scripts/train_custom.sh --model models/demo_shapes.gllm --demo
+./scripts/run_viz.sh --model models/demo_shapes.gllm
 ```
 
-### 4. Evaluate on Unseen Test Images
+### Option B: Train From Your Own PNG / JPG / BMP / PGM Folders
+1. Organize your images into **one subfolder per class label** (the subfolder name becomes the class label stored in `.gllm` and bound to its outer-shell point):
+   ```text
+   my_dataset/
+     star/
+       001.png
+       002.png
+     arrow/
+       001.jpg
+       002.jpg
+     heart/
+       001.png
+   ```
+2. Run the one-command trainer:
+   ```bash
+   # Standard bright-on-dark images (like MNIST/EMNIST):
+   ./scripts/train_custom.sh --model models/my_model.gllm --input my_dataset --center
+
+   # Dark drawings/scans on white paper (automatically inverts white background -> black):
+   ./scripts/train_custom.sh --model models/my_model.gllm --input my_dataset --auto-invert --center
+   ```
+   > **Tip — Continual Learning:** Point `--model` at an *existing* checkpoint (e.g., `--model models/sphere_1b.gllm`) to append your new custom classes right alongside existing digits & letters in brand-new, non-overlapping 3D spaces!
+   >
+   > **Custom Resolutions:** Use `--size 32` or `--size 64` for non-28×28 image grids (`gllm_train`, `gllm_eval`, `gllm_inspect`, and 3D `gllm_viz` support arbitrary `W×H`; `28×28` is required for the live interactive sketch matcher).
+
+### Option C: Train Any Custom IDX `.gz` Dataset (Fashion-MNIST, Kuzushiji-MNIST, EMNIST, etc.)
 ```bash
+./bin/gllm_train \
+  --model models/custom_idx.gllm \
+  --idx-images path/to/train-images-idx3-ubyte.gz \
+  --idx-labels path/to/train-labels-idx1-ubyte.gz \
+  --label-names T-shirt,Trouser,Pullover,Dress,Coat,Sandal,Shirt,Sneaker,Bag,AnkleBoot
+```
+Optional flags for subsetting/orienting IDX datasets:
+- `--min-raw-label <N> --max-raw-label <M>` — Filter to a specific raw label range.
+- `--label-offset <K>` — Offset raw label indices before indexing into `--label-names`.
+- `--transpose` — Transpose row/column layout (required for EMNIST datasets).
+- `--grid <G>` — Implicit sphere lattice grid size (default `1241` → ~1,000,723,196 implicit points).
+
+---
+
+## Inspect & Evaluate Models
+
+```bash
+# Print full serialized outer-point <-> 3D lattice lookup table (or export --json / --csv)
+./bin/gllm_inspect --model models/sphere_1b.gllm
+./bin/gllm_inspect --model models/sphere_1b.gllm --label B
+./bin/gllm_inspect --model models/sphere_1b.gllm --json > lookup_table.json
+
+# Evaluate on unseen test images on GPU (IDX or folder of PGM/PPM)
 ./bin/gllm_eval \
-  --model models/sphere.gllm \
+  --model models/sphere_1b.gllm \
   --idx-images data/mnist/t10k-images-idx3-ubyte.gz \
   --idx-labels data/mnist/t10k-labels-idx1-ubyte.gz
 ```
 
-### 5. Visualize in 3D (CUDA + OpenGL 4.6)
-```bash
-./scripts/run_viz.sh --model models/sphere.gllm
-```
-**Visualizer Controls:** `Left-drag / Scroll` orbit & zoom • `Z` toggle core close-up vs. full 1B sphere • `Left / Right / Space` focus class • `H` thermal shadow heatmap • `L` binding lines • `Up / Down` ghost-reveal unassigned outer-shell points • `Q` quit.
+---
+
+## Interactive Visualizer Controls (`gllm_viz`)
+- **Left Sidebar Canvas:** `Left-drag` to draw • `[CAPTURE]` or `Enter` to run 2-stage CUDA match • `[CLEAR]` / `Right-click` / `C` to clear • Click any **Top-10 row** to spotlight that class in 3D.
+- **3D Viewport:** `Left-drag / Scroll` orbit & zoom • `Z` toggle core close-up vs. full 1B sphere • `Left / Right / Space` cycle class focus • `H` thermal shadow heatmap • `L` binding lines • `Up / Down` ghost-reveal unassigned outer-shell points • `R` reset view • `Q / Esc` quit.
