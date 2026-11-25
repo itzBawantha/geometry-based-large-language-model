@@ -452,13 +452,11 @@ EMIT_DONE:
 // Kernel 5: 2-Stage Hardware-Pruned Non-Linear Bernoulli Log-Likelihood Matcher
 //   Stage 1: 64-bit coarse 8x8 occupancy bitmask (and.b64 + popc.b64)
 //            Deterministically prunes impossible classes in 2 clock cycles!
-//   Stage 2: Multi-shift (dx, dy in {-1, 0, +1}) non-linear probability match:
-//            Each pixel is weighted non-linearly by true shadow probability p:
+//   Stage 2: Multi-shift (dx, dy in {-1, 0, +1}) bias-free symmetric Bernoulli
+//            log-likelihood (ideal-template normalized):
 //              LL(x, c) = sum[ x*log(p) + (1-x)*log(1-p) ]
-//                       = bias[c] + sum[ x * log_odds[c, p] ]   (1 FMA/pixel!)
-//            Low-shadow fringe hits receive harsh logarithmic penalties while
-//            high-probability core strokes match cleanly -> KL similarity:
-//              overlap = exp(min(0, LL - self_entropy(x)) / T)  in [0..1]
+//              bias[c]  = sum[ log(1-p) ] - 0.5 * L_max(p_c)   (cancels sparse bias!)
+//              score    = exp(min(0, LL - 0.5*L_max(p_c) - 0.5*H(x)) / T)  (1 FMA/pix!)
 // -----------------------------------------------------------------------------
 .visible .entry match_sketch_pruned(
     .param .u64 param_sketch_raw,      // const float[num_shifts * pixels_img] in [0..1]

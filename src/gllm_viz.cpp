@@ -379,10 +379,8 @@ int main(int argc, char** argv) {
 
         float inv = rec.train_count > 0 ? (1.0f / static_cast<float>(rec.train_count)) : 0.0f;
         std::vector<float> avg(pix, 0.0f);
-        float raw_peak = 0.0f;
         for (uint32_t p = 0; p < pix; ++p) {
             avg[p] = rec.shadow_sum[p] * inv;
-            raw_peak = std::max(raw_peak, avg[p]);
             h_shadow_avg.push_back(avg[p]);
         }
 
@@ -394,16 +392,19 @@ int main(int argc, char** argv) {
             // Stage-1 64-bit coarse footprint mask in canonical space (core shadow support > 0.22)
             h_class_masks[c] = gllm::compute_coarse_mask64(pnorm, 0.22f);
 
-            // Stage-2 Non-Linear Bernoulli Log-Likelihood tables preserving true shadow probability p:
-            //   LL(x, c) = sum[ x*log(p) + (1-x)*log(1-p) ] = bias[c] + sum[ x * log(p/(1-p)) ]
+            // Stage-2 Bias-Free Symmetric Bernoulli Log-Likelihood tables:
+            //   Normalize class peak to 0.90 and subtract 0.5 * L_max(p_c) (ideal-template ceiling)
+            //   paired with 0.5 * H(x) on the query -> cancels sparse-shadow AND dense-shadow bias!
             float* lo_dst = &h_log_odds[static_cast<size_t>(c) * match_pix];
             double bias_sum = 0.0;
+            double l_max    = 0.0;
             for (uint32_t p = 0; p < match_pix; ++p) {
-                double prob = std::clamp(static_cast<double>(pnorm[p]) * static_cast<double>(raw_peak), 0.015, 0.96);
+                double prob = std::clamp(static_cast<double>(pnorm[p]) * 0.90, 0.015, 0.96);
                 lo_dst[p] = static_cast<float>(std::log(prob / (1.0 - prob)));
                 bias_sum += std::log(1.0 - prob);
+                l_max    += std::log(std::max(prob, 1.0 - prob));
             }
-            h_class_bias[c] = static_cast<float>(bias_sum);
+            h_class_bias[c] = static_cast<float>(bias_sum - 0.5 * l_max);
         }
         total_alloc_pix += pix;
 
@@ -630,7 +631,7 @@ int main(int argc, char** argv) {
                     double xc = std::clamp(static_cast<double>(raw_dst[p]), 1e-5, 1.0 - 1e-5);
                     ent += xc * std::log(xc) + (1.0 - xc) * std::log(1.0 - xc);
                 }
-                h_sk_ent[s_idx] = static_cast<float>(ent);
+                h_sk_ent[s_idx] = static_cast<float>(0.5 * ent);
                 s_idx++;
             }
         }

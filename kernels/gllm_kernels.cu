@@ -100,8 +100,9 @@ extern "C" __global__ void match_sketch_pruned(
         return;
     }
 
-    // Stage 2: Multi-shift non-linear Bernoulli log-likelihood / KL similarity
-    //   LL(x, c) = sum[ x*log(p) + (1-x)*log(1-p) ] = bias[c] + sum[ x * log_odds[c, p] ]
+    // Stage 2: Multi-shift bias-free symmetric Bernoulli log-likelihood
+    //   bias[c] = sum[ log(1-p) ] - 0.5 * L_max(p_c);  sketch_self_ent[s] = 0.5 * H(x)
+    //   Eliminates sparse-shadow & dense-shadow bias in 1 FMA/pixel!
     const float* log_odds = class_log_odds + static_cast<size_t>(c) * pixels_img;
     float bias = class_bias[c];
     float best_score = 0.0f;
