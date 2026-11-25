@@ -39,6 +39,8 @@ int main(int argc, char** argv) {
     std::string model_path, idx_images, idx_labels, folder_dir;
     std::vector<std::string> label_names;
     int label_offset = 0;
+    int min_raw_label = -1;
+    int max_raw_label = -1;
     bool transpose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -49,6 +51,8 @@ int main(int argc, char** argv) {
         else if (a == "--folder" && i + 1 < argc) folder_dir = argv[++i];
         else if (a == "--label-names" && i + 1 < argc) label_names = split_csv(argv[++i]);
         else if (a == "--label-offset" && i + 1 < argc) label_offset = std::atoi(argv[++i]);
+        else if (a == "--min-raw-label" && i + 1 < argc) min_raw_label = std::atoi(argv[++i]);
+        else if (a == "--max-raw-label" && i + 1 < argc) max_raw_label = std::atoi(argv[++i]);
         else if (a == "--transpose") transpose = true;
         else if (a == "--help" || a == "-h") { print_usage(); return 0; }
     }
@@ -66,7 +70,7 @@ int main(int argc, char** argv) {
 
     gllm::LabeledImageBatch ds = !folder_dir.empty()
         ? gllm::load_folder_dataset(folder_dir)
-        : gllm::load_idx_dataset(idx_images, idx_labels, label_names, label_offset, transpose);
+        : gllm::load_idx_dataset(idx_images, idx_labels, label_names, label_offset, transpose, min_raw_label, max_raw_label);
 
     // Collect all trained classes in the model that match the test image dimensions
     std::vector<size_t> eval_class_indices;

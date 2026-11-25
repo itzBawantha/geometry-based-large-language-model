@@ -291,13 +291,15 @@ inline uint32_t read_gz_be32(gzFile f) {
 }
 
 // Load any MNIST / EMNIST / Fashion-MNIST IDX gzipped dataset
-// Optional label_names (e.g. "A,B,C,...,Z" or "0,1,...,9") and label_offset (e.g. 1 for EMNIST Letters 1..26)
-// Optional transpose=true for EMNIST (EMNIST stores images column-major transposed!)
+// Optional label_names (e.g. "A,B,C,...,Z,a,b,...,z"), label_offset,
+// min_raw_label / max_raw_label filter, and transpose=true for EMNIST!
 inline LabeledImageBatch load_idx_dataset(const std::string& img_path,
                                           const std::string& lbl_path,
                                           const std::vector<std::string>& label_names = {},
                                           int label_offset = 0,
-                                          bool transpose = false) {
+                                          bool transpose = false,
+                                          int min_raw_label = -1,
+                                          int max_raw_label = -1) {
     gzFile f_img = gzopen(img_path.c_str(), "rb");
     gzFile f_lbl = gzopen(lbl_path.c_str(), "rb");
     if (!f_img || !f_lbl) {
@@ -313,54 +315,70 @@ inline LabeledImageBatch load_idx_dataset(const std::string& img_path,
         std::exit(1);
     }
 
-    LabeledImageBatch out;
-    out.width  = cols;
-    out.height = rows;
-    out.count  = n_i;
-    out.pixels.resize(static_cast<size_t>(n_i) * rows * cols);
-
     std::vector<uint8_t> raw_lbls(n_l);
     gzread(f_lbl, raw_lbls.data(), n_l);
+    gzclose(f_lbl);
 
-    size_t total = out.pixels.size();
+    const size_t img_bytes = static_cast<size_t>(rows) * cols;
+    std::vector<uint8_t> raw_pixels(static_cast<size_t>(n_i) * img_bytes);
+    size_t total = raw_pixels.size();
     size_t off = 0;
     while (off < total) {
         int chunk = static_cast<int>(std::min<size_t>(1 << 22, total - off));
-        int got = gzread(f_img, out.pixels.data() + off, chunk);
+        int got = gzread(f_img, raw_pixels.data() + off, chunk);
         if (got <= 0) break;
         off += static_cast<size_t>(got);
     }
     gzclose(f_img);
-    gzclose(f_lbl);
 
-    if (transpose && rows == cols) {
-        std::vector<uint8_t> tmp(rows * cols);
-        for (uint32_t i = 0; i < n_i; ++i) {
-            uint8_t* ptr = &out.pixels[static_cast<size_t>(i) * rows * cols];
+    LabeledImageBatch out;
+    out.width  = cols;
+    out.height = rows;
+
+    // Count matching images first to reserve cleanly
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n_i; ++i) {
+        int r = static_cast<int>(raw_lbls[i]);
+        if (min_raw_label >= 0 && r < min_raw_label) continue;
+        if (max_raw_label >= 0 && r > max_raw_label) continue;
+        kept++;
+    }
+    out.count = kept;
+    out.pixels.resize(static_cast<size_t>(kept) * img_bytes);
+    out.labels.resize(kept);
+
+    // Preserve numeric raw-label order for unique_labels (e.g. A..Z then a..z)
+    std::map<int, std::string> ordered_unique;
+    uint32_t dst_i = 0;
+    for (uint32_t i = 0; i < n_i; ++i) {
+        int r = static_cast<int>(raw_lbls[i]);
+        if (min_raw_label >= 0 && r < min_raw_label) continue;
+        if (max_raw_label >= 0 && r > max_raw_label) continue;
+
+        const uint8_t* src = &raw_pixels[static_cast<size_t>(i) * img_bytes];
+        uint8_t*       dst = &out.pixels[static_cast<size_t>(dst_i) * img_bytes];
+        if (transpose && rows == cols) {
             for (uint32_t y = 0; y < rows; ++y)
                 for (uint32_t x = 0; x < cols; ++x)
-                    tmp[y * cols + x] = ptr[x * rows + y];
-            std::memcpy(ptr, tmp.data(), rows * cols);
+                    dst[y * cols + x] = src[x * rows + y];
+        } else {
+            std::memcpy(dst, src, img_bytes);
         }
-    }
 
-    std::map<std::string, bool> seen;
-    out.labels.resize(n_i);
-    for (uint32_t i = 0; i < n_i; ++i) {
-        int idx = static_cast<int>(raw_lbls[i]) - label_offset;
+        int idx = r - label_offset;
         std::string name;
         if (!label_names.empty() && idx >= 0 && idx < static_cast<int>(label_names.size())) {
             name = label_names[static_cast<size_t>(idx)];
         } else {
             name = std::to_string(idx);
         }
-        out.labels[i] = name;
-        if (!seen[name]) {
-            seen[name] = true;
-            out.unique_labels.push_back(name);
-        }
+        out.labels[dst_i] = name;
+        ordered_unique[r] = name;
+        dst_i++;
     }
-    std::sort(out.unique_labels.begin(), out.unique_labels.end());
+    for (const auto& kv : ordered_unique) {
+        out.unique_labels.push_back(kv.second);
+    }
     return out;
 }
 

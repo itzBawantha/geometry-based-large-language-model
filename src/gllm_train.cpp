@@ -41,6 +41,8 @@ int main(int argc, char** argv) {
     std::string idx_images, idx_labels, folder_dir;
     std::vector<std::string> label_names;
     int label_offset = 0;
+    int min_raw_label = -1;
+    int max_raw_label = -1;
     bool transpose = false;
     uint32_t grid_dim = 1241; // ~1,000,722,000 implicit points inside the unit sphere
 
@@ -52,6 +54,8 @@ int main(int argc, char** argv) {
         else if (a == "--folder" && i + 1 < argc) folder_dir = argv[++i];
         else if (a == "--label-names" && i + 1 < argc) label_names = split_csv(argv[++i]);
         else if (a == "--label-offset" && i + 1 < argc) label_offset = std::atoi(argv[++i]);
+        else if (a == "--min-raw-label" && i + 1 < argc) min_raw_label = std::atoi(argv[++i]);
+        else if (a == "--max-raw-label" && i + 1 < argc) max_raw_label = std::atoi(argv[++i]);
         else if (a == "--grid" && i + 1 < argc) grid_dim = static_cast<uint32_t>(std::atoi(argv[++i]));
         else if (a == "--transpose") transpose = true;
         else if (a == "--help" || a == "-h") { print_usage(); return 0; }
@@ -80,7 +84,7 @@ int main(int argc, char** argv) {
     // 2. Load dataset (IDX .gz or folder-of-PGM/PPM)
     gllm::LabeledImageBatch ds = !folder_dir.empty()
         ? gllm::load_folder_dataset(folder_dir)
-        : gllm::load_idx_dataset(idx_images, idx_labels, label_names, label_offset, transpose);
+        : gllm::load_idx_dataset(idx_images, idx_labels, label_names, label_offset, transpose, min_raw_label, max_raw_label);
 
     if (ds.count == 0) {
         std::cerr << "[ERROR] Dataset contains 0 images.\n";
@@ -139,20 +143,24 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemsetD32_v2(d_sum, 0u, static_cast<size_t>(num_local_classes) * pix_per_img));
     CU_CHECK(cuMemsetD32_v2(d_cnt, 0u, num_local_classes));
 
-    uint32_t start = 0, batch = ds.count;
-    uint32_t total_work = batch * pix_per_img;
-    void* params[] = {
-        &d_imgs, &d_cids, &d_sum, &d_cnt,
-        &pix_per_img, &num_local_classes, &start, &batch
-    };
-
-    CU_CHECK(cuEventRecord(ev_s, nullptr));
-    CU_CHECK(cuLaunchKernel(fn_train, (total_work + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr));
-    CU_CHECK(cuEventRecord(ev_e, nullptr));
-    CU_CHECK(cuEventSynchronize(ev_e));
-
+    // Chunk GPU launches at 65,536 images per kernel call so datasets of 1M+ images never overflow 32-bit tid
     float gpu_ms = 0.0f;
-    CU_CHECK(cuEventElapsedTime(&gpu_ms, ev_s, ev_e));
+    constexpr uint32_t kMaxBatch = 65536u;
+    for (uint32_t start = 0; start < ds.count; start += kMaxBatch) {
+        uint32_t batch = std::min(kMaxBatch, ds.count - start);
+        uint32_t total_work = batch * pix_per_img;
+        void* params[] = {
+            &d_imgs, &d_cids, &d_sum, &d_cnt,
+            &pix_per_img, &num_local_classes, &start, &batch
+        };
+        CU_CHECK(cuEventRecord(ev_s, nullptr));
+        CU_CHECK(cuLaunchKernel(fn_train, (total_work + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr));
+        CU_CHECK(cuEventRecord(ev_e, nullptr));
+        CU_CHECK(cuEventSynchronize(ev_e));
+        float chunk_ms = 0.0f;
+        CU_CHECK(cuEventElapsedTime(&chunk_ms, ev_s, ev_e));
+        gpu_ms += chunk_ms;
+    }
 
     std::vector<float> h_sum(static_cast<size_t>(num_local_classes) * pix_per_img);
     std::vector<uint32_t> h_cnt(num_local_classes);
