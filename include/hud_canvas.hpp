@@ -305,8 +305,10 @@ public:
         dirty_tex = true;
     }
 
-    // Canonical geometric preprocessing: crop tight ink bbox -> fit into 22x22 inside 28x28
-    // -> EMNIST-matching Gaussian smoothing (sigma=0.80) -> peak normalize to [0..1]
+    // Raw-proportion canvas downsampling (NO auto-zoom!):
+    //   Maps the actual 224x224 canvas space directly at fixed 8:1 scale (1 canvas block = 1 pixel)
+    //   with translation-only centering so tiny dots/partial strokes keep their true small footprint
+    //   while full drawings align cleanly with the 28x28 geometric shadows.
     bool update_normalized_28x28() {
         int minx = kCanvasS, miny = kCanvasS, maxx = -1, maxy = -1;
         for (int y = 0; y < kCanvasS; ++y) {
@@ -320,38 +322,39 @@ public:
         norm28.fill(0.0f);
         if (maxx < minx || maxy < miny) return false;
 
-        int bw = maxx - minx + 1;
-        int bh = maxy - miny + 1;
-        float scale = 22.0f / static_cast<float>(std::max(bw, bh));
-        float new_w = bw * scale;
-        float new_h = bh * scale;
-        float ox = (28.0f - new_w) * 0.5f;
-        float oy = (28.0f - new_h) * 0.5f;
+        // Strictly fixed 1:8 scale (224 -> 28) — zero zoom!
+        constexpr float kScale = 28.0f / static_cast<float>(kCanvasS); // 0.125
+        float cx_can  = 0.5f * static_cast<float>(minx + maxx + 1);
+        float cy_can  = 0.5f * static_cast<float>(miny + maxy + 1);
+        float shift_x = 14.0f - cx_can * kScale;
+        float shift_y = 14.0f - cy_can * kScale;
+        shift_x = std::clamp(shift_x, -minx * kScale, 28.0f - (maxx + 1) * kScale);
+        shift_y = std::clamp(shift_y, -miny * kScale, 28.0f - (maxy + 1) * kScale);
 
         std::array<float, 784> tmp{};
         for (int ty = 0; ty < 28; ++ty) {
             for (int tx = 0; tx < 28; ++tx) {
-                float sx = (tx + 0.5f - ox) / scale + minx;
-                float sy = (ty + 0.5f - oy) / scale + miny;
-                if (sx < 0 || sx >= kCanvasS - 1 || sy < 0 || sy >= kCanvasS - 1) continue;
-                // 3x3 super-sampled box average for crisp anti-aliased strokes
+                float sx0 = (static_cast<float>(tx) - shift_x) / kScale;
+                float sy0 = (static_cast<float>(ty) - shift_y) / kScale;
+                int ix0 = static_cast<int>(std::floor(sx0));
+                int iy0 = static_cast<int>(std::floor(sy0));
+                // Exact 8x8 canvas-block area average (preserves true canvas-space occupancy)
                 float acc = 0.0f;
-                int cnt = 0;
-                float step = std::max(1.0f, 0.5f / scale);
-                for (int ky = -1; ky <= 1; ++ky) {
-                    for (int kx = -1; kx <= 1; ++kx) {
-                        int ix = std::clamp(static_cast<int>(sx + kx * step), 0, kCanvasS - 1);
-                        int iy = std::clamp(static_cast<int>(sy + ky * step), 0, kCanvasS - 1);
-                        acc += canvas[iy * kCanvasS + ix];
-                        cnt++;
+                for (int ky = 0; ky < 8; ++ky) {
+                    int iy = iy0 + ky;
+                    if (iy < 0 || iy >= kCanvasS) continue;
+                    const float* row = &canvas[iy * kCanvasS];
+                    for (int kx = 0; kx < 8; ++kx) {
+                        int ix = ix0 + kx;
+                        if (ix >= 0 && ix < kCanvasS) acc += row[ix];
                     }
                 }
-                tmp[ty * 28 + tx] = acc / cnt;
+                tmp[ty * 28 + tx] = acc * (1.0f / 64.0f);
             }
         }
 
-        // Smooth slightly (sigma=0.80) and peak-normalize to 1.0 to match canonical class shadows
-        gaussian_blur_28(tmp.data(), norm28.data(), 0.80f);
+        // Light anti-aliasing smoothing (sigma=0.65) + peak normalize to [0..1]
+        gaussian_blur_28(tmp.data(), norm28.data(), 0.65f);
         float mx = 0.0f;
         for (int i = 0; i < 784; ++i) mx = std::max(mx, norm28[i]);
         if (mx > 1e-6f) {
@@ -406,8 +409,9 @@ public:
 
         draw_text(20, 16, "GLLM SKETCH INFERENCE", 2, 125, 220, 255);
 
-        // 1. Drawing canvas (224x224)
+        // 1. Drawing canvas (224x224) + subtle 22x22 canonical scale guide frame (176x176)
         fill_rect(canvas_rect.x, canvas_rect.y, canvas_rect.w, canvas_rect.h, 8, 12, 22, 255);
+        stroke_rect(canvas_rect.x + 24, canvas_rect.y + 24, 176, 176, 22, 38, 62, 255);
         for (int y = 0; y < kCanvasS; ++y) {
             for (int x = 0; x < kCanvasS; ++x) {
                 float v = canvas[y * kCanvasS + x];
@@ -464,7 +468,7 @@ public:
             if (ms.is_unknown || ms.ranked.empty()) {
                 draw_text(28, 342, "UNKNOWN / UNTRAINED", 2, 255, 120, 90);
                 float top_ov = ms.ranked.empty() ? 0.0f : ms.ranked[0].overlap_pct;
-                std::snprintf(sub1, sizeof(sub1), "MAX OVERLAP: %.1f%% (<35%%)", top_ov);
+                std::snprintf(sub1, sizeof(sub1), "MAX OVERLAP: %.1f%% (<28%%)", top_ov);
                 draw_text(28, 368, sub1, 1, 240, 180, 140);
             } else {
                 const auto& w = ms.ranked[0];

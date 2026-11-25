@@ -360,6 +360,7 @@ int main(int argc, char** argv) {
     std::vector<float>    h_shadow_avg;
     std::vector<uint64_t> h_class_masks(num_regions, 0ULL);
     std::vector<float>    h_log_odds;
+    std::vector<float>    h_class_prob;
     std::vector<float>    h_class_bias(num_regions, 0.0f);
 
     std::map<uint32_t, std::string> outer_to_label;
@@ -372,6 +373,7 @@ int main(int argc, char** argv) {
     constexpr uint32_t kNumShifts = 9u; // dx, dy in {-1, 0, +1}
 
     h_log_odds.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
+    h_class_prob.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
 
     for (uint32_t r = 0; r < num_regions; ++r) {
         const auto& rec = model.classes[r];
@@ -401,17 +403,19 @@ int main(int argc, char** argv) {
             // Stage-1 64-bit coarse footprint mask in canonical space (core shadow support > 0.22)
             h_class_masks[r] = gllm::compute_coarse_mask64(pnorm, 0.22f);
 
-            // Stage-2 Bias-Free Symmetric Bernoulli Log-Likelihood tables:
-            //   Normalize sub-shadow peak to 0.90 and subtract 0.5 * L_max(p_r) (ideal-template ceiling)
-            //   paired with 0.5 * H(x) on the query -> cancels sparse-shadow AND dense-shadow bias!
+            // Stage-2 Bias-Free Symmetric Bernoulli Log-Likelihood + Continuous Soft-IoU tables:
+            //   - pnorm[p] in [0..1] feeds Soft-IoU density completeness (missing-mass + void check)
+            //   - prob in [0.015..0.96] feeds symmetric Bernoulli log-odds + exact entropy ceiling
             float* lo_dst = &h_log_odds[static_cast<size_t>(r) * match_pix];
+            float* pr_dst = &h_class_prob[static_cast<size_t>(r) * match_pix];
             double bias_sum = 0.0;
             double l_max    = 0.0;
             for (uint32_t p = 0; p < match_pix; ++p) {
+                pr_dst[p] = std::clamp(pnorm[p], 0.0f, 1.0f);
                 double prob = std::clamp(static_cast<double>(pnorm[p]) * 0.90, 0.015, 0.96);
                 lo_dst[p] = static_cast<float>(std::log(prob / (1.0 - prob)));
                 bias_sum += std::log(1.0 - prob);
-                l_max    += std::log(std::max(prob, 1.0 - prob));
+                l_max    += prob * std::log(prob) + (1.0 - prob) * std::log(1.0 - prob);
             }
             h_class_bias[r] = static_cast<float>(bias_sum - 0.5 * l_max);
         }
@@ -462,7 +466,7 @@ int main(int argc, char** argv) {
 
     // Upload GPU model & matcher buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_counter = 0;
-    CUdeviceptr d_masks = 0, d_log_odds = 0, d_bias = 0, d_sketch_raw = 0, d_sketch_ent = 0;
+    CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0, d_sketch_raw = 0, d_sketch_ent = 0;
     CUdeviceptr d_out_ov = 0, d_out_st = 0;
     CU_CHECK(cuMemAlloc_v2(&d_regions, h_regions.size() * sizeof(gllm::GpuRegionDesc)));
     CU_CHECK(cuMemcpyHtoD_v2(d_regions, h_regions.data(), h_regions.size() * sizeof(gllm::GpuRegionDesc)));
@@ -472,12 +476,14 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemcpyHtoD_v2(d_shadow, h_shadow_avg.data(), h_shadow_avg.size() * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_counter, sizeof(uint32_t)));
 
-    CU_CHECK(cuMemAlloc_v2(&d_masks,    h_class_masks.size() * sizeof(uint64_t)));
-    CU_CHECK(cuMemcpyHtoD_v2(d_masks,   h_class_masks.data(), h_class_masks.size() * sizeof(uint64_t)));
-    CU_CHECK(cuMemAlloc_v2(&d_log_odds, h_log_odds.size() * sizeof(float)));
-    CU_CHECK(cuMemcpyHtoD_v2(d_log_odds, h_log_odds.data(), h_log_odds.size() * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_bias,     h_class_bias.size() * sizeof(float)));
-    CU_CHECK(cuMemcpyHtoD_v2(d_bias,    h_class_bias.data(), h_class_bias.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_masks,      h_class_masks.size() * sizeof(uint64_t)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_masks,     h_class_masks.data(), h_class_masks.size() * sizeof(uint64_t)));
+    CU_CHECK(cuMemAlloc_v2(&d_log_odds,   h_log_odds.size() * sizeof(float)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_log_odds,  h_log_odds.data(), h_log_odds.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_class_prob, h_class_prob.size() * sizeof(float)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_class_prob, h_class_prob.data(), h_class_prob.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_bias,       h_class_bias.size() * sizeof(float)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_bias,      h_class_bias.data(), h_class_bias.size() * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_sketch_raw, static_cast<size_t>(kNumShifts) * match_pix * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_sketch_ent, static_cast<size_t>(kNumShifts) * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_regions * sizeof(float)));
@@ -656,7 +662,7 @@ int main(int argc, char** argv) {
         CU_CHECK(cuMemcpyHtoD_v2(d_sketch_ent, h_sk_ent.data(), h_sk_ent.size() * sizeof(float)));
 
         void* m_params[] = {
-            &d_sketch_raw, &d_sketch_ent, &q_mask, &d_masks, &d_log_odds, &d_bias,
+            &d_sketch_raw, &d_sketch_ent, &q_mask, &d_masks, &d_log_odds, &d_class_prob, &d_bias,
             &d_out_ov, &d_out_st, &match_pix, &num_regions, &num_shifts, &prune_ratio, &inv_t_ln2
         };
         CU_CHECK(cuEventRecord(ev_s, nullptr));
@@ -721,7 +727,7 @@ int main(int argc, char** argv) {
             for (auto& r : match_summary.ranked) {
                 r.rel_prob_pct = static_cast<float>(100.0 * std::exp((r.overlap_pct / 100.0f - max_ov) * 10.0) / sum_exp);
             }
-            match_summary.is_unknown = (match_summary.ranked[0].overlap_pct < 35.0f);
+            match_summary.is_unknown = (match_summary.ranked[0].overlap_pct < 28.0f);
             focus_cls = match_summary.is_unknown ? no_focus : match_summary.ranked[0].outer_idx;
         } else {
             match_summary.is_unknown = true;
@@ -734,7 +740,7 @@ int main(int argc, char** argv) {
         std::printf("\n[CAPTURE] CUDA 2-Stage Match: %.3f ms | Classes: %u/%u | Sub-Shadows: %u/%u survived (%u pruned)\n",
                     ms, match_summary.survived_count, num_classes, reg_survived, num_regions, reg_pruned);
         if (match_summary.is_unknown) {
-            std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 35.0%% threshold)\n",
+            std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 28.0%% threshold)\n",
                         match_summary.ranked.empty() ? 0.0f : match_summary.ranked[0].overlap_pct);
         } else {
             const auto& w = match_summary.ranked[0];
@@ -1032,6 +1038,7 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_counter));
     CU_CHECK(cuMemFree_v2(d_masks));
     CU_CHECK(cuMemFree_v2(d_log_odds));
+    CU_CHECK(cuMemFree_v2(d_class_prob));
     CU_CHECK(cuMemFree_v2(d_bias));
     CU_CHECK(cuMemFree_v2(d_sketch_raw));
     CU_CHECK(cuMemFree_v2(d_sketch_ent));

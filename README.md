@@ -12,10 +12,10 @@ GLLM separates a **1-billion-point implicit 3D sphere lattice** (`1241³`, **0 b
 - **`bin/gllm_eval`** — Evaluates unseen test datasets against every trained class (max-pooling across all sub-shadow regions per class) directly on the GPU.
 - **`bin/gllm_inspect`** — Inspects or exports (`--json` / `--csv` / `--value` / `--label`) the complete lookup table serialized inside any `.gllm` checkpoint (outer-shell scalar ID ↔ class label ↔ outer `(x, y, z)` ↔ unique 3D lattice coordinates).
 - **`bin/gllm_viz`** — Zero-copy CUDA–OpenGL 4.6 3D visualizer + **Interactive Sketch Inference Canvas** with:
-  - **224×224 live drawing canvas** & canonical **22×22-in-28×28** CUDA preview.
+  - **224×224 live drawing canvas** with direct fixed 8:1 raw-proportion downsampling (no auto-zoom) & `28×28` CUDA preview.
   - **Stage-1 Hardware 64-bit Bitmask Pruning** (`and.b64` + `popc.b64`) to drop structurally impossible sub-shadows in 2 clock cycles.
-  - **Stage-2 Multi-Shift Bias-Free Symmetric Bernoulli Log-Likelihood** (`dx, dy ∈ {-1, 0, +1}`) across all surviving sub-shadows, eliminating both sparse-shadow and dense-shadow bias in 1 FMA/pixel and max-pooling per class onto its single outer-shell node.
-  - **Open-World Unknown Detection** (`< 35%` overlap), clickable **Top-10 Overlap & Relative Probability bars**, and **Stage-1 Pruned class readout**.
+  - **Stage-2 Multi-Shift Symmetric Bernoulli × Continuous Soft-IoU Completeness** (`dx, dy ∈ {-1, 0, +1}`) across all surviving sub-shadows, strictly penalizing both missing shadow density (dots / partial strokes) and void overflow while eliminating sparse/dense-shadow bias.
+  - **Open-World Unknown Detection** (`< 28%` combined overlap), clickable **Top-10 Overlap & Relative Probability bars**, and **Stage-1 Pruned class readout**.
 
 ### Prerequisites
 - Linux with an **NVIDIA GPU** and standard NVIDIA driver (`libcuda.so` — **no `nvcc` / CUDA Toolkit required**, PTX is JIT-compiled by the driver at runtime)

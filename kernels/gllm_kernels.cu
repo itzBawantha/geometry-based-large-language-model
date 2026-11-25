@@ -79,6 +79,7 @@ extern "C" __global__ void match_sketch_pruned(
     uint64_t sketch_mask,
     const uint64_t* __restrict__ class_masks,
     const float* __restrict__ class_log_odds,
+    const float* __restrict__ class_prob,
     const float* __restrict__ class_bias,
     float* __restrict__ out_overlap,
     uint32_t* __restrict__ out_status,
@@ -100,19 +101,27 @@ extern "C" __global__ void match_sketch_pruned(
         return;
     }
 
-    // Stage 2: Multi-shift bias-free symmetric Bernoulli log-likelihood
-    //   bias[c] = sum[ log(1-p) ] - 0.5 * L_max(p_c);  sketch_self_ent[s] = 0.5 * H(x)
-    //   Eliminates sparse-shadow & dense-shadow bias in 1 FMA/pixel!
+    // Stage 2: Multi-shift symmetric Bernoulli likelihood x continuous Soft-IoU completeness
+    //   - Bernoulli log-odds strictly separates core vs void strokes
+    //   - Soft-IoU = sum min(x, p) / sum max(x, p) strictly penalizes missing shadow mass & void overflow
     const float* log_odds = class_log_odds + static_cast<size_t>(c) * pixels_img;
+    const float* prob     = class_prob     + static_cast<size_t>(c) * pixels_img;
     float bias = class_bias[c];
     float best_score = 0.0f;
     for (uint32_t s = 0; s < num_shifts; ++s) {
         const float* sraw = sketch_raw + static_cast<size_t>(s) * pixels_img;
-        float ll = bias;
-        for (uint32_t p = 0; p < pixels_img; ++p) ll += sraw[p] * log_odds[p];
-        float dkl = fminf(ll - sketch_self_ent[s], 0.0f);
-        float sc  = fminf(fmaxf(exp2f(dkl * inv_t_ln2), 0.0f), 1.0f);
-        best_score = fmaxf(best_score, sc);
+        float ll = bias, inter = 0.0f, uni = 0.0f;
+        for (uint32_t p = 0; p < pixels_img; ++p) {
+            float x  = sraw[p];
+            float pv = prob[p];
+            ll    += x * log_odds[p];
+            inter += fminf(x, pv);
+            uni   += fmaxf(x, pv);
+        }
+        float dkl  = fminf(ll - sketch_self_ent[s], 0.0f);
+        float bern = fminf(fmaxf(exp2f(dkl * inv_t_ln2), 0.0f), 1.0f);
+        float iou  = inter / (uni + 1e-6f);
+        best_score = fmaxf(best_score, bern * iou);
     }
     out_overlap[c] = best_score;
     out_status[c]  = 1u;

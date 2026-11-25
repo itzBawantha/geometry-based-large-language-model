@@ -460,11 +460,12 @@ EMIT_DONE:
 // -----------------------------------------------------------------------------
 .visible .entry match_sketch_pruned(
     .param .u64 param_sketch_raw,      // const float[num_shifts * pixels_img] in [0..1]
-    .param .u64 param_sketch_self_ent, // const float[num_shifts] self-entropy H(x)
+    .param .u64 param_sketch_self_ent, // const float[num_shifts] self-entropy 0.5*H(x)
     .param .u64 param_sketch_mask,     // uint64_t 8x8 coarse occupancy mask Q
     .param .u64 param_class_masks,     // const uint64_t[num_classes]
     .param .u64 param_class_log_odds,  // const float[num_classes * pixels_img]: log(p/(1-p))
-    .param .u64 param_class_bias,      // const float[num_classes]: sum log(1-p)
+    .param .u64 param_class_prob,      // const float[num_classes * pixels_img]: canonical shadow density in [0..1]
+    .param .u64 param_class_bias,      // const float[num_classes]: sum log(1-p) - 0.5*L_max(p)
     .param .u64 param_out_overlap,     // float[num_classes] in [0.0 .. 1.0]
     .param .u64 param_out_status,      // uint32_t[num_classes]: 0=PRUNED, 1=CONFIRMED
     .param .u32 param_pixels_img,
@@ -476,22 +477,23 @@ EMIT_DONE:
 {
     .reg .pred %p<6>;
     .reg .u32  %r<14>;
-    .reg .u64  %rd<20>;
-    .reg .f32  %f<14>;
+    .reg .u64  %rd<22>;
+    .reg .f32  %f<20>;
 
-    ld.param.u64 %rd0, [param_sketch_raw];
-    ld.param.u64 %rd1, [param_sketch_self_ent];
-    ld.param.u64 %rd2, [param_sketch_mask];
-    ld.param.u64 %rd3, [param_class_masks];
-    ld.param.u64 %rd4, [param_class_log_odds];
-    ld.param.u64 %rd5, [param_class_bias];
-    ld.param.u64 %rd6, [param_out_overlap];
-    ld.param.u64 %rd7, [param_out_status];
-    ld.param.u32 %r0,  [param_pixels_img];
-    ld.param.u32 %r1,  [param_num_classes];
-    ld.param.u32 %r2,  [param_num_shifts];
-    ld.param.f32 %f0,  [param_prune_ratio];
-    ld.param.f32 %f1,  [param_inv_t_ln2];
+    ld.param.u64 %rd0,  [param_sketch_raw];
+    ld.param.u64 %rd1,  [param_sketch_self_ent];
+    ld.param.u64 %rd2,  [param_sketch_mask];
+    ld.param.u64 %rd3,  [param_class_masks];
+    ld.param.u64 %rd4,  [param_class_log_odds];
+    ld.param.u64 %rd20, [param_class_prob];
+    ld.param.u64 %rd5,  [param_class_bias];
+    ld.param.u64 %rd6,  [param_out_overlap];
+    ld.param.u64 %rd7,  [param_out_status];
+    ld.param.u32 %r0,   [param_pixels_img];
+    ld.param.u32 %r1,   [param_num_classes];
+    ld.param.u32 %r2,   [param_num_shifts];
+    ld.param.f32 %f0,   [param_prune_ratio];
+    ld.param.f32 %f1,   [param_inv_t_ln2];
 
     mov.u32    %r3, %ctaid.x;
     mov.u32    %r4, %ntid.x;
@@ -520,14 +522,15 @@ EMIT_DONE:
     setp.lt.f32 %p3, %f4, %f0;          // hit_ratio < prune_ratio -> PRUNE!
     @%p3 bra PRUNE_OUT;
 
-    // --- Stage 2: Multi-Shift Non-Linear Bernoulli Log-Likelihood (1 FMA/pix!) ---
+    // --- Stage 2: Multi-Shift Symmetric Bernoulli x Continuous Soft-IoU Completeness ---
     mul.wide.u32  %rd12, %r6, 4;
     add.u64       %rd13, %rd5, %rd12;
-    ld.global.f32 %f5,   [%rd13];       // class_bias = sum log(1 - p)
+    ld.global.f32 %f5,   [%rd13];       // class_bias
 
     mul.wide.u32 %rd12, %r6, %r0;
     shl.b64      %rd12, %rd12, 2;
-    add.u64      %rd14, %rd4, %rd12;    // class_log_odds ptr
+    add.u64      %rd14, %rd4,  %rd12;   // class_log_odds ptr
+    add.u64      %rd21, %rd20, %rd12;   // class_prob ptr
 
     mov.f32 %f6, 0f00000000;            // best_score = 0.0
     mov.u32 %r9, 0;                     // shift_idx s = 0
@@ -538,13 +541,15 @@ SHIFT_LOOP:
 
     mul.wide.u32  %rd15, %r9, 4;
     add.u64       %rd16, %rd1, %rd15;
-    ld.global.f32 %f7,   [%rd16];       // self_entropy H(x) for shift s
+    ld.global.f32 %f7,   [%rd16];       // self_entropy 0.5*H(x) for shift s
 
     mul.wide.u32 %rd15, %r9, %r0;
     shl.b64      %rd15, %rd15, 2;
     add.u64      %rd16, %rd0, %rd15;    // sketch_raw ptr for shift s
 
     mov.f32 %f8,  %f5;                  // ll = class_bias
+    mov.f32 %f13, 0f00000000;           // inter = 0.0 (sum min(x, p))
+    mov.f32 %f14, 0f00000000;           // union = 0.0 (sum max(x, p))
     mov.u32 %r10, 0;                    // p = 0
 
 PIX_LOOP:
@@ -558,17 +563,30 @@ PIX_LOOP:
     ld.global.f32 %f10,  [%rd18];       // log_odds[c, p]
     fma.rn.f32    %f8,   %f9, %f10, %f8;// ll += x[p] * log_odds[c, p]
 
+    add.u64       %rd18, %rd21, %rd17;
+    ld.global.f32 %f15,  [%rd18];       // p[c, p]
+    min.f32       %f16,  %f9, %f15;
+    max.f32       %f17,  %f9, %f15;
+    add.f32       %f13,  %f13, %f16;    // inter += min(x, p)
+    add.f32       %f14,  %f14, %f17;    // union += max(x, p)
+
     add.u32 %r10, %r10, 1;
     bra PIX_LOOP;
 
 SHIFT_EVAL:
-    // KL-normalized similarity = exp(min(0, ll - H(x)) / T) = 2^(min(0, ll - H(x)) / (T*ln2))
+    // 1) Symmetric Bernoulli similarity = exp(min(0, ll - 0.5*H(x)) / T)
     sub.f32        %f11, %f8,  %f7;
     min.f32        %f11, %f11, 0f00000000;
     mul.f32        %f11, %f11, %f1;
     ex2.approx.f32 %f12, %f11;
     max.f32        %f12, %f12, 0f00000000;
     min.f32        %f12, %f12, 0f3f800000;
+
+    // 2) Continuous Soft-IoU density completeness = sum min(x,p) / (sum max(x,p) + 1e-6)
+    //    Strictly penalizes missing shadow mass (e.g. dots/partial strokes) & void overflow!
+    add.f32        %f14, %f14, 0f358637bd;
+    div.approx.f32 %f18, %f13, %f14;
+    mul.f32        %f12, %f12, %f18;
 
     max.f32 %f6, %f6, %f12;             // best_score = max(best_score, score)
     add.u32 %r9, %r9, 1;
