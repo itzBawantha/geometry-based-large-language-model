@@ -52,6 +52,26 @@ struct GeometricModel {
         return -1;
     }
 
+    int find_outer_idx_for_label(const std::string& label) const {
+        for (const auto& c : classes) {
+            if (c.label == label) return static_cast<int>(c.outer_idx);
+        }
+        return -1;
+    }
+
+    uint32_t next_outer_idx() const {
+        if (classes.empty()) return 0u;
+        uint32_t mx = 0u;
+        for (const auto& c : classes) mx = std::max(mx, c.outer_idx);
+        return mx + 1u;
+    }
+
+    uint32_t unique_class_count() const {
+        std::map<uint32_t, bool> seen;
+        for (const auto& c : classes) seen[c.outer_idx] = true;
+        return static_cast<uint32_t>(seen.size());
+    }
+
     uint64_t approx_sphere_lattice_points() const {
         double g = static_cast<double>(lattice_grid);
         return static_cast<uint64_t>((3.14159265358979323846 / 6.0) * g * g * g);
@@ -125,20 +145,9 @@ struct GeometricModel {
         oz = std::sqrt(std::max(0.0f, 1.0f - xy2));
     }
 
-    // Dynamically allocate a guaranteed non-overlapping W x H x 1 space inside the sphere
-    // and bind it to the next available neighboring outer-shell point!
-    int register_or_get_class(const std::string& label, uint32_t w, uint32_t h) {
-        int existing = find_class(label);
-        if (existing >= 0) {
-            if (classes[existing].width != w || classes[existing].height != h) {
-                std::cerr << "[ERROR] Class '" << label << "' already exists with size "
-                          << classes[existing].width << "x" << classes[existing].height
-                          << " (cannot mix with " << w << "x" << h << ")\n";
-                std::exit(1);
-            }
-            return existing;
-        }
-
+    // Find a guaranteed non-overlapping W x H x 1 origin inside the 3D sphere lattice
+    bool find_free_lattice_slot(uint32_t w, uint32_t h,
+                                uint32_t& best_ox, uint32_t& best_oy, uint32_t& best_oz) const {
         uint32_t pad_xy = std::max<uint32_t>(4u, w / 4u);
         uint32_t pad_z  = std::max<uint32_t>(4u, std::min<uint32_t>(14u, lattice_grid / 80u));
         uint32_t stride_x = w + pad_xy;
@@ -146,20 +155,18 @@ struct GeometricModel {
         uint32_t stride_z = pad_z + 1u;
 
         int64_t mid = static_cast<int64_t>(lattice_grid / 2);
-        bool placed = false;
-        uint32_t best_ox = 0, best_oy = 0, best_oz = 0;
 
-        // Expanding 3D shell search around sphere center -> naturally packs classes
+        // Expanding 3D shell search around sphere center -> naturally packs spaces
         // tightly near the core first without ever overlapping prior allocations!
-        for (int shell = 0; shell <= 64 && !placed; ++shell) {
-            int max_dz = std::min(shell, 16);
-            for (int dz = 0; dz <= max_dz && !placed; ++dz) {
+        for (int shell = 0; shell <= 64; ++shell) {
+            int max_dz = std::min(shell, 24);
+            for (int dz = 0; dz <= max_dz; ++dz) {
                 int z_signs[2] = {dz, -dz};
                 int z_cnt = (dz == 0) ? 1 : 2;
-                for (int zs = 0; zs < z_cnt && !placed; ++zs) {
+                for (int zs = 0; zs < z_cnt; ++zs) {
                     int64_t oz = mid + static_cast<int64_t>(z_signs[zs]) * stride_z;
-                    for (int dy = shell; dy >= -shell && !placed; --dy) {
-                        for (int dx = -shell; dx <= shell && !placed; ++dx) {
+                    for (int dy = shell; dy >= -shell; --dy) {
+                        for (int dx = -shell; dx <= shell; ++dx) {
                             if (std::max({std::abs(dx), std::abs(dy), dz}) != shell) continue;
                             int64_t ox = mid + static_cast<int64_t>(dx) * stride_x - static_cast<int64_t>(w / 2);
                             int64_t oy = mid + static_cast<int64_t>(dy) * stride_y - static_cast<int64_t>(h / 2);
@@ -171,19 +178,28 @@ struct GeometricModel {
                                 best_ox = static_cast<uint32_t>(ox);
                                 best_oy = static_cast<uint32_t>(oy);
                                 best_oz = static_cast<uint32_t>(oz);
-                                placed = true;
+                                return true;
                             }
                         }
                     }
                 }
             }
         }
+        return false;
+    }
 
-        if (!placed) {
+    // Allocate a brand-new guaranteed non-overlapping sub-shadow W x H x 1 space inside the
+    // sphere while sharing the class's single outer-shell point (multi-shadow clustering!)
+    int allocate_subshadow(const std::string& label, uint32_t w, uint32_t h) {
+        uint32_t best_ox = 0, best_oy = 0, best_oz = 0;
+        if (!find_free_lattice_slot(w, h, best_ox, best_oy, best_oz)) {
             std::cerr << "[ERROR] Sphere lattice (grid=" << lattice_grid
                       << ") has no remaining non-overlapping space for " << w << "x" << h << "\n";
             std::exit(1);
         }
+
+        int existing_outer = find_outer_idx_for_label(label);
+        uint32_t oidx = (existing_outer >= 0) ? static_cast<uint32_t>(existing_outer) : next_outer_idx();
 
         ClassRecord rec;
         rec.label     = label;
@@ -192,12 +208,28 @@ struct GeometricModel {
         rec.oz        = best_oz;
         rec.width     = w;
         rec.height    = h;
-        rec.outer_idx = static_cast<uint32_t>(classes.size());
+        rec.outer_idx = oidx;
         assign_outer_point(rec.outer_idx, rec.outer_x, rec.outer_y, rec.outer_z);
         rec.train_count = 0;
         rec.shadow_sum.assign(static_cast<size_t>(w) * h, 0.0f);
         classes.push_back(std::move(rec));
         return static_cast<int>(classes.size()) - 1;
+    }
+
+    // Dynamically allocate a guaranteed non-overlapping W x H x 1 space inside the sphere
+    // and bind it to the next available neighboring outer-shell point (single-shadow mode)
+    int register_or_get_class(const std::string& label, uint32_t w, uint32_t h) {
+        int existing = find_class(label);
+        if (existing >= 0) {
+            if (classes[existing].width != w || classes[existing].height != h) {
+                std::cerr << "[ERROR] Class '" << label << "' already exists with size "
+                          << classes[existing].width << "x" << classes[existing].height
+                          << " (cannot mix with " << w << "x" << h << ")\n";
+                std::exit(1);
+            }
+            return existing;
+        }
+        return allocate_subshadow(label, w, h);
     }
 
     bool save(const std::string& path) const {

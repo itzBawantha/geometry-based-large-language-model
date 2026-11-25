@@ -399,7 +399,7 @@ public:
         }
     }
 
-    void rebuild_texture(const MatchSummary& ms, uint32_t focused_class, uint32_t num_classes) {
+    void rebuild_texture(const MatchSummary& ms, uint32_t focused_class, uint32_t num_classes, uint32_t num_regions = 0) {
         // Semi-transparent dark glass sidebar background
         fill_rect(0, 0, kPanelW, kPanelH, 10, 15, 28, 228);
         fill_rect(kPanelW - 2, 0, 2, kPanelH, 42, 96, 148, 200);
@@ -453,7 +453,11 @@ public:
             draw_text(30, 348, "DRAW ANY DIGIT OR LETTER", 1, 175, 205, 235);
             draw_text(30, 366, "THEN CLICK CAPTURE (ENTER)", 1, 125, 195, 245);
             char buf[64];
-            std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES IN 1B SPHERE", num_classes);
+            if (num_regions > num_classes) {
+                std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES (%u SHADOWS)", num_classes, num_regions);
+            } else {
+                std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES IN 1B SPHERE", num_classes);
+            }
             draw_text(30, 392, buf, 1, 135, 160, 195);
         } else {
             char hdr[64], sub1[64], sub2[64];

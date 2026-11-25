@@ -17,6 +17,7 @@ MODEL=""
 INPUT_DIR=""
 SIZE="28"
 GRID="1241"
+CLUSTERS="1"
 EXTRA_PREP_ARGS=()
 DEMO_MODE="0"
 
@@ -31,6 +32,7 @@ Options:
   --input <dir>         Folder containing one subfolder per class label (<dir>/<label>/*.*)
   --size <N>            Resize images to N x N grayscale (default: 28; 28 enables interactive sketch match)
   --grid <G>            3D sphere lattice grid dimension (default: 1241 -> ~1B implicit lattice points)
+  --clusters <K>        GPU spherical K-means sub-shadows per class (default: 1; e.g. 8 isolates variants)
   --invert              Force intensity inversion (for dark drawings on white paper)
   --auto-invert         Automatically detect & invert light-background images
   --center              Tight-bbox center & scale-normalize ink before training
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --input)       INPUT_DIR="$2"; shift 2 ;;
         --size)        SIZE="$2"; shift 2 ;;
         --grid)        GRID="$2"; shift 2 ;;
+        --clusters)    CLUSTERS="$2"; shift 2 ;;
         --invert)      EXTRA_PREP_ARGS+=("--invert"); shift ;;
         --auto-invert) EXTRA_PREP_ARGS+=("--auto-invert"); shift ;;
         --center)      EXTRA_PREP_ARGS+=("--center"); shift ;;
@@ -93,8 +96,8 @@ else
 fi
 
 echo ""
-echo "[TRAIN]  Accumulating geometric shadows into ${MODEL} on CUDA GPU..."
-"${ROOT}/bin/gllm_train" --model "${MODEL}" --folder "${TRAIN_DIR}" --grid "${GRID}"
+echo "[TRAIN]  Accumulating geometric shadows into ${MODEL} on CUDA GPU (clusters=${CLUSTERS})..."
+"${ROOT}/bin/gllm_train" --model "${MODEL}" --folder "${TRAIN_DIR}" --grid "${GRID}" --clusters "${CLUSTERS}"
 
 echo ""
 echo "[INSPECT] Serialized Outer-Shell Lookup Table:"

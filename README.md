@@ -8,13 +8,13 @@ Intelligence is not represented by anything else other than a geometric shape, s
 
 GLLM separates a **1-billion-point implicit 3D sphere lattice** (`1241³`, **0 bytes** for unallocated coordinates) and a **1.2M-point outer shell** into four standalone GPU CLI tools that share a self-describing binary checkpoint format (`.gllm`):
 
-- **`bin/gllm_train`** — Dynamically allocates guaranteed non-overlapping `W×H` spaces inside the 3D sphere lattice and binds each class to a unique neighboring outer-shell point (`R = 1.0`). Accumulates overlapping image shadows on GPU via CUDA (`atom.global.add.f32`). **Incremental by design:** train on digits (`0–9`), append English letters (`A–Z`, `a–z`), or add your own custom image folders into the *same* `.gllm` model—prior spaces and shadows remain untouched with **0 overlaps**.
-- **`bin/gllm_eval`** — Evaluates unseen test datasets against every trained class's geometric shadow map directly on the GPU.
+- **`bin/gllm_train`** — Dynamically allocates guaranteed non-overlapping `W×H` spaces inside the 3D sphere lattice and binds each class to a unique neighboring outer-shell point (`R = 1.0`). Accumulates overlapping image shadows on GPU via CUDA (`atom.global.add.f32`). Supports universal **GPU Spherical K-Means Multi-Shadow Clustering (`--clusters K`)** to separate distinct structural variants of any class into crisp, non-overlapping sub-shadow regions that all converge onto the class's single outer-shell point. **Incremental by design:** train on digits (`0–9`), append English letters (`A–Z`, `a–z`), or add your own custom image folders into the *same* `.gllm` model—prior spaces and shadows remain untouched with **0 overlaps**.
+- **`bin/gllm_eval`** — Evaluates unseen test datasets against every trained class (max-pooling across all sub-shadow regions per class) directly on the GPU.
 - **`bin/gllm_inspect`** — Inspects or exports (`--json` / `--csv` / `--value` / `--label`) the complete lookup table serialized inside any `.gllm` checkpoint (outer-shell scalar ID ↔ class label ↔ outer `(x, y, z)` ↔ unique 3D lattice coordinates).
 - **`bin/gllm_viz`** — Zero-copy CUDA–OpenGL 4.6 3D visualizer + **Interactive Sketch Inference Canvas** with:
   - **224×224 live drawing canvas** & canonical **22×22-in-28×28** CUDA preview.
-  - **Stage-1 Hardware 64-bit Bitmask Pruning** (`and.b64` + `popc.b64`) to drop structurally impossible classes in 2 clock cycles.
-  - **Stage-2 Multi-Shift Full-Feature Geometric Confirmation** (`dx, dy ∈ {-1, 0, +1}`) combining Centered Cosine, Soft-Dice, an **Extra-Ink-in-Void penalty** (`max(0, x − t) · (1 − t)²`), and a **Missing-Core penalty** (`max(0, t − x) · t²`) so extra or missing strokes (e.g., `B` vs. `3`) are strictly distinguished.
+  - **Stage-1 Hardware 64-bit Bitmask Pruning** (`and.b64` + `popc.b64`) to drop structurally impossible sub-shadows in 2 clock cycles.
+  - **Stage-2 Multi-Shift Bias-Free Symmetric Bernoulli Log-Likelihood** (`dx, dy ∈ {-1, 0, +1}`) across all surviving sub-shadows, eliminating both sparse-shadow and dense-shadow bias in 1 FMA/pixel and max-pooling per class onto its single outer-shell node.
   - **Open-World Unknown Detection** (`< 35%` overlap), clickable **Top-10 Overlap & Relative Probability bars**, and **Stage-1 Pruned class readout**.
 
 ### Prerequisites
@@ -115,6 +115,8 @@ Optional flags for subsetting/orienting IDX datasets:
 - `--min-raw-label <N> --max-raw-label <M>` — Filter to a specific raw label range.
 - `--label-offset <K>` — Offset raw label indices before indexing into `--label-names`.
 - `--transpose` — Transpose row/column layout (required for EMNIST datasets).
+- `--clusters <K>` — GPU Spherical K-Means sub-shadows per class (default `1`; e.g., `--clusters 8` separates multi-modal shape variants into distinct non-overlapping subspaces bound to the class's single outer-shell point).
+- `--cluster-iters <I>` — Number of GPU Spherical K-Means iterations (default `10`).
 - `--grid <G>` — Implicit sphere lattice grid size (default `1241` → ~1,000,723,196 implicit points).
 
 ---

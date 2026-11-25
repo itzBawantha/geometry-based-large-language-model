@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -347,19 +348,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    uint32_t num_classes = static_cast<uint32_t>(model.classes.size());
-    if (num_classes == 0) {
-        std::cerr << "[ERROR] Model has 0 allocated classes.\n";
+    uint32_t num_regions = static_cast<uint32_t>(model.classes.size());
+    if (num_regions == 0) {
+        std::cerr << "[ERROR] Model has 0 allocated regions.\n";
         return 1;
     }
 
-    // Build GPU tables dynamically from .gllm (zero hardcoding to 62!)
+    // Build GPU tables dynamically from .gllm (supports both single-shadow AND multi-shadow clustering!)
     std::vector<gllm::GpuRegionDesc> h_regions;
     std::vector<gllm::GpuOuterPoint> h_outer;
     std::vector<float>    h_shadow_avg;
-    std::vector<uint64_t> h_class_masks(num_classes, 0ULL);
+    std::vector<uint64_t> h_class_masks(num_regions, 0ULL);
     std::vector<float>    h_log_odds;
-    std::vector<float>    h_class_bias(num_classes, 0.0f);
+    std::vector<float>    h_class_bias(num_regions, 0.0f);
+
+    std::map<uint32_t, std::string> outer_to_label;
+    std::vector<uint32_t> unique_outer_ids;
 
     uint32_t max_reg_pix = 0, total_alloc_pix = 0;
     float max_alloc_radius = 0.05f;
@@ -367,15 +371,20 @@ int main(int argc, char** argv) {
     uint32_t match_pix = 784u; // 28x28
     constexpr uint32_t kNumShifts = 9u; // dx, dy in {-1, 0, +1}
 
-    h_log_odds.resize(static_cast<size_t>(num_classes) * match_pix, 0.0f);
+    h_log_odds.resize(static_cast<size_t>(num_regions) * match_pix, 0.0f);
 
-    for (uint32_t c = 0; c < num_classes; ++c) {
-        const auto& rec = model.classes[c];
+    for (uint32_t r = 0; r < num_regions; ++r) {
+        const auto& rec = model.classes[r];
         uint32_t pix = rec.width * rec.height;
         max_reg_pix = std::max(max_reg_pix, pix);
 
-        h_regions.push_back({rec.ox, rec.oy, rec.oz, rec.width, rec.height, rec.outer_idx, total_alloc_pix, c});
-        h_outer.push_back({rec.outer_x, rec.outer_y, rec.outer_z, static_cast<float>(c)});
+        // Bind every sub-shadow region to its class's shared outer_idx so all K variants focus together!
+        h_regions.push_back({rec.ox, rec.oy, rec.oz, rec.width, rec.height, rec.outer_idx, total_alloc_pix, rec.outer_idx});
+        if (outer_to_label.find(rec.outer_idx) == outer_to_label.end()) {
+            outer_to_label[rec.outer_idx] = rec.label;
+            unique_outer_ids.push_back(rec.outer_idx);
+            h_outer.push_back({rec.outer_x, rec.outer_y, rec.outer_z, static_cast<float>(rec.outer_idx)});
+        }
 
         float inv = rec.train_count > 0 ? (1.0f / static_cast<float>(rec.train_count)) : 0.0f;
         std::vector<float> avg(pix, 0.0f);
@@ -385,17 +394,17 @@ int main(int argc, char** argv) {
         }
 
         if (pix == match_pix) {
-            // Canonicalize class shadow into unified 22x22 frame (removes MNIST 20px vs EMNIST 24px scale bias)
+            // Canonicalize sub-shadow into unified 22x22 frame (removes MNIST 20px vs EMNIST 24px scale bias)
             float pnorm[784] = {};
             gllm::canonicalize_28(avg.data(), pnorm, 22.0f, 0.22f);
 
             // Stage-1 64-bit coarse footprint mask in canonical space (core shadow support > 0.22)
-            h_class_masks[c] = gllm::compute_coarse_mask64(pnorm, 0.22f);
+            h_class_masks[r] = gllm::compute_coarse_mask64(pnorm, 0.22f);
 
             // Stage-2 Bias-Free Symmetric Bernoulli Log-Likelihood tables:
-            //   Normalize class peak to 0.90 and subtract 0.5 * L_max(p_c) (ideal-template ceiling)
+            //   Normalize sub-shadow peak to 0.90 and subtract 0.5 * L_max(p_r) (ideal-template ceiling)
             //   paired with 0.5 * H(x) on the query -> cancels sparse-shadow AND dense-shadow bias!
-            float* lo_dst = &h_log_odds[static_cast<size_t>(c) * match_pix];
+            float* lo_dst = &h_log_odds[static_cast<size_t>(r) * match_pix];
             double bias_sum = 0.0;
             double l_max    = 0.0;
             for (uint32_t p = 0; p < match_pix; ++p) {
@@ -404,7 +413,7 @@ int main(int argc, char** argv) {
                 bias_sum += std::log(1.0 - prob);
                 l_max    += std::log(std::max(prob, 1.0 - prob));
             }
-            h_class_bias[c] = static_cast<float>(bias_sum - 0.5 * l_max);
+            h_class_bias[r] = static_cast<float>(bias_sum - 0.5 * l_max);
         }
         total_alloc_pix += pix;
 
@@ -413,6 +422,10 @@ int main(int argc, char** argv) {
         float cz = (rec.oz + 0.5f) * step - 1.0f;
         max_alloc_radius = std::max(max_alloc_radius, std::sqrt(cx * cx + cy * cy + cz * cz) + rec.width * step);
     }
+    uint32_t num_classes = static_cast<uint32_t>(h_outer.size()); // unique outer-shell classes
+    uint32_t max_outer_id = 0u;
+    for (uint32_t oid : unique_outer_ids) max_outer_id = std::max(max_outer_id, oid);
+    uint32_t no_focus = std::max(num_regions, max_outer_id + 1u);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
@@ -467,8 +480,8 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemcpyHtoD_v2(d_bias,    h_class_bias.data(), h_class_bias.size() * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_sketch_raw, static_cast<size_t>(kNumShifts) * match_pix * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_sketch_ent, static_cast<size_t>(kNumShifts) * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_classes * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_out_st, num_classes * sizeof(uint32_t)));
+    CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_regions * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_out_st, num_regions * sizeof(uint32_t)));
 
     // --- VBO 1: Permanent 1,200,000-point outer sphere ---
     uint32_t total_outer = model.outer_shell_pts;
@@ -513,11 +526,11 @@ int main(int argc, char** argv) {
     CUgraphicsResource cu_lat_res = nullptr;
     CU_CHECK(cuGraphicsGLRegisterBuffer(&cu_lat_res, lat_vbo, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD));
 
-    // --- VBO 3: 1-to-1 Binding lines ---
+    // --- VBO 3: 1-to-1 / K-to-1 Binding lines (all sub-shadows converge to their class outer point!) ---
     struct LinkVert { float x, y, z, r, g, b, a, cid; };
     std::vector<LinkVert> links;
-    for (uint32_t c = 0; c < num_classes; ++c) {
-        const auto& rec = model.classes[c];
+    for (uint32_t r = 0; r < num_regions; ++r) {
+        const auto& rec = model.classes[r];
         float ix = (rec.ox + rec.width * 0.5f) * step - 1.0f;
         float iy = (rec.oy + rec.height * 0.5f) * step - 1.0f;
         float iz = (rec.oz + 0.5f) * step - 1.0f;
@@ -525,8 +538,8 @@ int main(int argc, char** argv) {
         float cr = 0.55f + 0.45f * std::cos(ph);
         float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
         float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
-        links.push_back({ix, iy, iz, cr, cg, cb, 0.35f, static_cast<float>(c)});
-        links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.85f, static_cast<float>(c)});
+        links.push_back({ix, iy, iz, cr, cg, cb, 0.25f, static_cast<float>(rec.outer_idx)});
+        links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.72f, static_cast<float>(rec.outer_idx)});
     }
     GLuint link_vao = 0, link_vbo = 0;
     glGenVertexArrays(1, &link_vao);
@@ -589,9 +602,9 @@ int main(int argc, char** argv) {
     float cam_pitch   = 0.16f;
     float pt_size     = 2.1f;
     float shell_alpha = 0.0f;
-    uint32_t focus_cls = (forced_focus >= 0 && forced_focus < static_cast<int>(num_classes))
+    uint32_t focus_cls = (forced_focus >= 0 && forced_focus <= static_cast<int>(max_outer_id))
                              ? static_cast<uint32_t>(forced_focus)
-                             : num_classes;
+                             : no_focus;
     bool orbit_dragging  = false;
     bool canvas_drawing  = false;
     float prev_cx = 0.0f, prev_cy = 0.0f;
@@ -644,34 +657,52 @@ int main(int argc, char** argv) {
 
         void* m_params[] = {
             &d_sketch_raw, &d_sketch_ent, &q_mask, &d_masks, &d_log_odds, &d_bias,
-            &d_out_ov, &d_out_st, &match_pix, &num_classes, &num_shifts, &prune_ratio, &inv_t_ln2
+            &d_out_ov, &d_out_st, &match_pix, &num_regions, &num_shifts, &prune_ratio, &inv_t_ln2
         };
         CU_CHECK(cuEventRecord(ev_s, nullptr));
-        CU_CHECK(cuLaunchKernel(fn_match, (num_classes + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, m_params, nullptr));
+        CU_CHECK(cuLaunchKernel(fn_match, (num_regions + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, m_params, nullptr));
         CU_CHECK(cuEventRecord(ev_e, nullptr));
         CU_CHECK(cuEventSynchronize(ev_e));
 
         float ms = 0.0f;
         CU_CHECK(cuEventElapsedTime(&ms, ev_s, ev_e));
 
-        std::vector<float>    h_ov(num_classes);
-        std::vector<uint32_t> h_st(num_classes);
-        CU_CHECK(cuMemcpyDtoH_v2(h_ov.data(), d_out_ov, num_classes * sizeof(float)));
-        CU_CHECK(cuMemcpyDtoH_v2(h_st.data(), d_out_st, num_classes * sizeof(uint32_t)));
+        std::vector<float>    h_ov(num_regions);
+        std::vector<uint32_t> h_st(num_regions);
+        CU_CHECK(cuMemcpyDtoH_v2(h_ov.data(), d_out_ov, num_regions * sizeof(float)));
+        CU_CHECK(cuMemcpyDtoH_v2(h_st.data(), d_out_st, num_regions * sizeof(uint32_t)));
+
+        // Aggregate sub-shadow variant scores per unique class (max-pool across each class's K clusters!)
+        struct ClsAgg { float best_ov = -1.0f; uint32_t survived = 0; uint32_t total = 0; };
+        std::map<uint32_t, ClsAgg> agg;
+        uint32_t reg_survived = 0, reg_pruned = 0;
+        for (uint32_t r = 0; r < num_regions; ++r) {
+            uint32_t oid = model.classes[r].outer_idx;
+            auto& a = agg[oid];
+            a.total++;
+            if (h_st[r] != 0u) {
+                a.survived++;
+                reg_survived++;
+                if (h_ov[r] > a.best_ov) a.best_ov = h_ov[r];
+            } else {
+                reg_pruned++;
+            }
+        }
 
         match_summary = gllm::MatchSummary{};
         match_summary.has_result    = true;
         match_summary.cuda_ms       = ms;
         match_summary.total_classes = num_classes;
 
-        for (uint32_t c = 0; c < num_classes; ++c) {
-            const auto& rec = model.classes[c];
-            if (h_st[c] == 0u) {
+        for (uint32_t oid : unique_outer_ids) {
+            const auto& a = agg[oid];
+            const std::string& lbl = outer_to_label[oid];
+            if (a.survived == 0u) {
                 match_summary.pruned_count++;
-                match_summary.pruned_labels.push_back(rec.label);
+                match_summary.pruned_labels.push_back(lbl);
             } else {
                 match_summary.survived_count++;
-                match_summary.ranked.push_back({c, rec.outer_idx, rec.label, h_ov[c] * 100.0f, 0.0f, false});
+                match_summary.ranked.push_back({oid, oid, lbl, a.best_ov * 100.0f, 0.0f, false});
             }
         }
 
@@ -691,17 +722,17 @@ int main(int argc, char** argv) {
                 r.rel_prob_pct = static_cast<float>(100.0 * std::exp((r.overlap_pct / 100.0f - max_ov) * 10.0) / sum_exp);
             }
             match_summary.is_unknown = (match_summary.ranked[0].overlap_pct < 35.0f);
-            focus_cls = match_summary.is_unknown ? num_classes : match_summary.ranked[0].class_id;
+            focus_cls = match_summary.is_unknown ? no_focus : match_summary.ranked[0].outer_idx;
         } else {
             match_summary.is_unknown = true;
-            focus_cls = num_classes;
+            focus_cls = no_focus;
         }
         dirty_lat = true;
         hud.dirty_tex = true;
 
         // Print crisp diagnostic table to terminal
-        std::printf("\n[CAPTURE] CUDA 2-Stage Match: %.3f ms | Survived: %u / %u | Pruned (Stage 1): %u / %u\n",
-                    ms, match_summary.survived_count, num_classes, match_summary.pruned_count, num_classes);
+        std::printf("\n[CAPTURE] CUDA 2-Stage Match: %.3f ms | Classes: %u/%u | Sub-Shadows: %u/%u survived (%u pruned)\n",
+                    ms, match_summary.survived_count, num_classes, reg_survived, num_regions, reg_pruned);
         if (match_summary.is_unknown) {
             std::printf("  -> RESULT: UNKNOWN / UNTRAINED SHAPE (top overlap %.1f%% < 35.0%% threshold)\n",
                         match_summary.ranked.empty() ? 0.0f : match_summary.ranked[0].overlap_pct);
@@ -749,7 +780,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "[VIZ]    Loaded " << model_path << " (" << num_classes << " classes inside "
+    std::cout << "[VIZ]    Loaded " << model_path << " (" << num_classes << " unique classes / "
+              << num_regions << " sub-shadow regions inside "
               << model.approx_sphere_lattice_points() << "-pt sphere)\n"
               << "[UI]     Draw on the left canvas -> click [CAPTURE] (or Enter) to run 2-stage CUDA match!\n";
 
@@ -784,7 +816,7 @@ int main(int argc, char** argv) {
                     if (ev.button.button == SDL_BUTTON_RIGHT && hud.canvas_rect.contains(hx, hy)) {
                         hud.clear();
                         match_summary = gllm::MatchSummary{};
-                        focus_cls = num_classes;
+                        focus_cls = no_focus;
                         dirty_lat = true;
                     } else if (ev.button.button == SDL_BUTTON_LEFT) {
                         if (hud.canvas_rect.contains(hx, hy)) {
@@ -797,12 +829,12 @@ int main(int argc, char** argv) {
                         } else if (hud.btn_clear.contains(hx, hy)) {
                             hud.clear();
                             match_summary = gllm::MatchSummary{};
-                            focus_cls = num_classes;
+                            focus_cls = no_focus;
                             dirty_lat = true;
                         } else if (match_summary.has_result) {
                             for (int r = 0; r < 10 && r < static_cast<int>(match_summary.ranked.size()); ++r) {
                                 if (hud.row_rects[r].contains(hx, hy)) {
-                                    focus_cls = match_summary.ranked[r].class_id;
+                                    focus_cls = match_summary.ranked[r].outer_idx;
                                     dirty_lat = true;
                                     hud.dirty_tex = true;
                                 }
@@ -843,10 +875,10 @@ int main(int argc, char** argv) {
                 if (k == SDLK_ESCAPE || k == SDLK_q) running = false;
                 else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) run_cuda_capture();
                 else if (k == SDLK_c || k == SDLK_BACKSPACE) {
-                    hud.clear(); match_summary = gllm::MatchSummary{}; focus_cls = num_classes; dirty_lat = true;
-                } else if (k == SDLK_SPACE) { focus_cls = num_classes; dirty_lat = true; hud.dirty_tex = true; }
-                else if (k == SDLK_RIGHT) { focus_cls = (focus_cls >= num_classes) ? 0u : ((focus_cls + 1u) % num_classes); dirty_lat = true; hud.dirty_tex = true; }
-                else if (k == SDLK_LEFT)  { focus_cls = (focus_cls >= num_classes) ? (num_classes - 1u) : ((focus_cls + num_classes - 1u) % num_classes); dirty_lat = true; hud.dirty_tex = true; }
+                    hud.clear(); match_summary = gllm::MatchSummary{}; focus_cls = no_focus; dirty_lat = true;
+                } else if (k == SDLK_SPACE) { focus_cls = no_focus; dirty_lat = true; hud.dirty_tex = true; }
+                else if (k == SDLK_RIGHT) { focus_cls = (focus_cls >= no_focus) ? 0u : ((focus_cls + 1u) % (max_outer_id + 1u)); dirty_lat = true; hud.dirty_tex = true; }
+                else if (k == SDLK_LEFT)  { focus_cls = (focus_cls >= no_focus) ? max_outer_id : ((focus_cls + max_outer_id) % (max_outer_id + 1u)); dirty_lat = true; hud.dirty_tex = true; }
                 else if (k == SDLK_h) { heatmap_mode = 1u - heatmap_mode; dirty_lat = true; }
                 else if (k == SDLK_l) show_links = !show_links;
                 else if (k == SDLK_a) auto_rot = !auto_rot;
@@ -855,7 +887,7 @@ int main(int argc, char** argv) {
                 else if (k == SDLK_DOWN) shell_alpha = std::max(0.0f, shell_alpha - 0.08f);
                 else if (k == SDLK_LEFTBRACKET)  pt_size = std::max(0.8f, pt_size - 0.25f);
                 else if (k == SDLK_RIGHTBRACKET) pt_size = std::min(6.0f, pt_size + 0.25f);
-                else if (k == SDLK_r) { cam_yaw = 0.28f; cam_pitch = 0.16f; cam_dist = close_dist; shell_alpha = 0.0f; focus_cls = num_classes; dirty_lat = true; hud.dirty_tex = true; }
+                else if (k == SDLK_r) { cam_yaw = 0.28f; cam_pitch = 0.16f; cam_dist = close_dist; shell_alpha = 0.0f; focus_cls = no_focus; dirty_lat = true; hud.dirty_tex = true; }
             }
         }
 
@@ -869,10 +901,10 @@ int main(int argc, char** argv) {
             CU_CHECK(cuGraphicsResourceGetMappedPointer_v2(&d_lat, &sz, cu_lat_res));
 
             uint32_t g = model.lattice_grid;
-            uint32_t total_work = num_classes * max_reg_pix;
+            uint32_t total_work = num_regions * max_reg_pix;
             void* p[] = {
                 &d_lat, &d_counter, &d_regions, &d_shadow,
-                &num_classes, &max_reg_pix, &g, &max_vbo_pts,
+                &num_regions, &max_reg_pix, &g, &max_vbo_pts,
                 &focus_cls, &heatmap_mode
             };
             CU_CHECK(cuEventRecord(ev_s, nullptr));
@@ -887,7 +919,7 @@ int main(int argc, char** argv) {
         }
 
         if (hud.dirty_tex) {
-            hud.rebuild_texture(match_summary, focus_cls, num_classes);
+            hud.rebuild_texture(match_summary, focus_cls, num_classes, num_regions);
             glBindTexture(GL_TEXTURE_2D, sidebar_tex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gllm::SketchSidebarHUD::kPanelW, gllm::SketchSidebarHUD::kPanelH,
                             GL_RGBA, GL_UNSIGNED_BYTE, hud.rgba.data());
@@ -930,7 +962,7 @@ int main(int argc, char** argv) {
             glUseProgram(link_prog);
             glUniformMatrix4fv(u_lk_mvp, 1, GL_FALSE, mvp.m);
             glUniform1i(u_lk_foc, static_cast<int>(focus_cls));
-            glUniform1i(u_lk_num, static_cast<int>(num_classes));
+            glUniform1i(u_lk_num, static_cast<int>(no_focus));
             glBindVertexArray(link_vao);
             glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(links.size()));
         }
@@ -949,7 +981,7 @@ int main(int argc, char** argv) {
         glUniform1f(u_sh_vh, static_cast<float>(win_h));
         glUniform1f(u_sh_alpha, shell_alpha);
         glUniform1i(u_sh_foc, static_cast<int>(focus_cls));
-        glUniform1i(u_sh_num, static_cast<int>(num_classes));
+        glUniform1i(u_sh_num, static_cast<int>(no_focus));
         glBindVertexArray(shell_vao);
         glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(total_outer));
         glBindVertexArray(0);
@@ -983,8 +1015,8 @@ int main(int argc, char** argv) {
             char title[256];
             std::snprintf(
                 title, sizeof(title),
-                "GLLM 1B-Sphere Sketch Inference | %u Classes | Outer %u/1.2M | Emit %.3f ms | %.1f FPS",
-                num_classes, num_classes, last_emit_ms, fps
+                "GLLM 1B-Sphere Sketch Inference | %u Classes (%u Sub-Shadows) | Outer %u/1.2M | Emit %.3f ms | %.1f FPS",
+                num_classes, num_regions, num_classes, last_emit_ms, fps
             );
             SDL_SetWindowTitle(window, title);
             fps_timer = 0.0;

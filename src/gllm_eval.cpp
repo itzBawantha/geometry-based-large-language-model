@@ -86,12 +86,13 @@ int main(int argc, char** argv) {
     }
 
     uint32_t pix = ds.width * ds.height;
-    uint32_t C   = static_cast<uint32_t>(eval_class_indices.size());
+    uint32_t R   = static_cast<uint32_t>(eval_class_indices.size()); // total sub-shadow regions
+    uint32_t U   = model.unique_class_count();
 
-    // Build L2-normalized shadow templates for GPU cosine-similarity scoring
-    std::vector<float> h_templates(static_cast<size_t>(C) * pix, 0.0f);
-    for (uint32_t c = 0; c < C; ++c) {
-        const auto& rec = model.classes[eval_class_indices[c]];
+    // Build L2-normalized shadow templates for GPU cosine-similarity scoring across ALL sub-shadows
+    std::vector<float> h_templates(static_cast<size_t>(R) * pix, 0.0f);
+    for (uint32_t r = 0; r < R; ++r) {
+        const auto& rec = model.classes[eval_class_indices[r]];
         double norm2 = 0.0;
         for (uint32_t p = 0; p < pix; ++p) {
             double v = static_cast<double>(rec.shadow_sum[p]) / static_cast<double>(rec.train_count);
@@ -100,11 +101,11 @@ int main(int argc, char** argv) {
         float inv_norm = static_cast<float>(1.0 / std::sqrt(norm2 + 1e-12));
         for (uint32_t p = 0; p < pix; ++p) {
             float avg = rec.shadow_sum[p] / static_cast<float>(rec.train_count);
-            h_templates[static_cast<size_t>(c) * pix + p] = avg * inv_norm;
+            h_templates[static_cast<size_t>(r) * pix + p] = avg * inv_norm;
         }
     }
 
-    // Run CUDA Evaluation Kernel on RTX A3000
+    // Run CUDA Evaluation Kernel on GPU (chunked over test images so N * R fits cleanly in VRAM!)
     CU_CHECK(cuInit(0));
     CUdevice dev = 0;
     CU_CHECK(cuDeviceGet(&dev, 0));
@@ -121,50 +122,58 @@ int main(int argc, char** argv) {
     CU_CHECK(cuEventCreate(&ev_s, 0));
     CU_CHECK(cuEventCreate(&ev_e, 0));
 
+    uint32_t N = ds.count;
+    uint32_t chunk_imgs = std::max<uint32_t>(1u, std::min<uint32_t>(N, 16384u));
+
     CUdeviceptr d_imgs = 0, d_tmpls = 0, d_scores = 0;
-    CU_CHECK(cuMemAlloc_v2(&d_imgs,   ds.pixels.size()));
-    CU_CHECK(cuMemcpyHtoD_v2(d_imgs,  ds.pixels.data(), ds.pixels.size()));
+    CU_CHECK(cuMemAlloc_v2(&d_imgs,   static_cast<size_t>(chunk_imgs) * pix));
     CU_CHECK(cuMemAlloc_v2(&d_tmpls,  h_templates.size() * sizeof(float)));
     CU_CHECK(cuMemcpyHtoD_v2(d_tmpls, h_templates.data(), h_templates.size() * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_scores, static_cast<size_t>(ds.count) * C * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_scores, static_cast<size_t>(chunk_imgs) * R * sizeof(float)));
 
-    uint32_t N = ds.count;
-    uint32_t total_pairs = N * C;
-    void* params[] = {&d_imgs, &d_tmpls, &d_scores, &pix, &C, &N};
-
-    CU_CHECK(cuEventRecord(ev_s, nullptr));
-    CU_CHECK(cuLaunchKernel(fn_eval, (total_pairs + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr));
-    CU_CHECK(cuEventRecord(ev_e, nullptr));
-    CU_CHECK(cuEventSynchronize(ev_e));
-
+    std::vector<float> h_scores(static_cast<size_t>(chunk_imgs) * R);
     float gpu_ms = 0.0f;
-    CU_CHECK(cuEventElapsedTime(&gpu_ms, ev_s, ev_e));
-
-    std::vector<float> h_scores(static_cast<size_t>(N) * C);
-    CU_CHECK(cuMemcpyDtoH_v2(h_scores.data(), d_scores, h_scores.size() * sizeof(float)));
-
-    // Compute exact accuracy against ground-truth labels
     uint32_t correct = 0;
     std::map<std::string, uint32_t> cls_total, cls_ok;
-    for (uint32_t i = 0; i < N; ++i) {
-        uint32_t best_c = 0;
-        float best_s = -1e9f;
-        for (uint32_t c = 0; c < C; ++c) {
-            float s = h_scores[static_cast<size_t>(i) * C + c];
-            if (s > best_s) { best_s = s; best_c = c; }
-        }
-        const std::string& pred = model.classes[eval_class_indices[best_c]].label;
-        const std::string& gt   = ds.labels[i];
-        cls_total[gt]++;
-        if (pred == gt) {
-            correct++;
-            cls_ok[gt]++;
+
+    for (uint32_t start = 0; start < N; start += chunk_imgs) {
+        uint32_t batch = std::min(chunk_imgs, N - start);
+        CU_CHECK(cuMemcpyHtoD_v2(d_imgs, &ds.pixels[static_cast<size_t>(start) * pix], static_cast<size_t>(batch) * pix));
+
+        uint32_t total_pairs = batch * R;
+        void* params[] = {&d_imgs, &d_tmpls, &d_scores, &pix, &R, &batch};
+
+        CU_CHECK(cuEventRecord(ev_s, nullptr));
+        CU_CHECK(cuLaunchKernel(fn_eval, (total_pairs + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, params, nullptr));
+        CU_CHECK(cuEventRecord(ev_e, nullptr));
+        CU_CHECK(cuEventSynchronize(ev_e));
+        float cms = 0.0f;
+        CU_CHECK(cuEventElapsedTime(&cms, ev_s, ev_e));
+        gpu_ms += cms;
+
+        CU_CHECK(cuMemcpyDtoH_v2(h_scores.data(), d_scores, static_cast<size_t>(batch) * R * sizeof(float)));
+
+        // Max-pool over sub-shadow variants: winning sub-shadow votes for its class label!
+        for (uint32_t i = 0; i < batch; ++i) {
+            uint32_t best_r = 0;
+            float best_s = -1e9f;
+            for (uint32_t r = 0; r < R; ++r) {
+                float s = h_scores[static_cast<size_t>(i) * R + r];
+                if (s > best_s) { best_s = s; best_r = r; }
+            }
+            const std::string& pred = model.classes[eval_class_indices[best_r]].label;
+            const std::string& gt   = ds.labels[start + i];
+            cls_total[gt]++;
+            if (pred == gt) {
+                correct++;
+                cls_ok[gt]++;
+            }
         }
     }
 
     double acc = 100.0 * static_cast<double>(correct) / static_cast<double>(N);
-    std::printf("[EVAL]   Model: %s (%u classes evaluated against %u test images)\n",
-                model_path.c_str(), C, N);
+    std::printf("[EVAL]   Model: %s (%u unique classes / %u sub-shadow regions evaluated against %u test images)\n",
+                model_path.c_str(), U, R, N);
     std::printf("[CUDA]   GPU Inference: %.3f ms on %s (%.0f imgs/sec)\n",
                 gpu_ms, gpu_name, N / (gpu_ms / 1000.0));
     std::printf("[RESULT] Overall Pure Shadow-Overlap Accuracy: %u / %u (%.2f%%)\n",

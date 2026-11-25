@@ -128,10 +128,10 @@ int main(int argc, char** argv) {
 
     // Crisp human-readable lookup table
     std::printf("GLLM Lookup Table | %s\n", model_path.c_str());
-    std::printf("Sphere Lattice: %u^3 (~%llu implicit pts) | Outer Shell: %zu / %u assigned\n\n",
+    std::printf("Sphere Lattice: %u^3 (~%llu implicit pts) | Outer Shell: %u unique classes (%zu sub-shadow regions) / %u pts\n\n",
                 model.lattice_grid,
                 static_cast<unsigned long long>(model.approx_sphere_lattice_points()),
-                model.classes.size(), model.outer_shell_pts);
+                model.unique_class_count(), model.classes.size(), model.outer_shell_pts);
 
     std::printf("%-8s | %-10s | %-25s | %-28s | %-7s | %-10s | %-8s\n",
                 "Scalar", "Label", "Outer Point (x, y, z)", "Lattice Space [x, y, z]",
