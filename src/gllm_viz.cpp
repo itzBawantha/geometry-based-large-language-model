@@ -318,10 +318,11 @@ static void save_ppm(const std::string& path, int w, int h) {
 int main(int argc, char** argv) {
     std::string model_path, screenshot_path, test_idx_img;
     int test_idx_pos = -1;
+    bool test_transpose = false;
     uint32_t heatmap_mode = 0;
     int forced_focus = -1;
     float init_dist = -1.0f;
-    float prune_ratio = 0.72f; // Stage-1 64-bit mask overlap ratio threshold
+    float prune_ratio = 0.68f; // Stage-1 64-bit canonical mask overlap ratio threshold
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -332,6 +333,7 @@ int main(int argc, char** argv) {
         else if (a == "--dist" && i + 1 < argc) init_dist = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--prune-ratio" && i + 1 < argc) prune_ratio = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--test-img" && i + 2 < argc) { test_idx_img = argv[++i]; test_idx_pos = std::atoi(argv[++i]); }
+        else if (a == "--test-transpose") test_transpose = true;
     }
 
     if (model_path.empty()) {
@@ -356,14 +358,17 @@ int main(int argc, char** argv) {
     std::vector<gllm::GpuOuterPoint> h_outer;
     std::vector<float>    h_shadow_avg;
     std::vector<uint64_t> h_class_masks(num_classes, 0ULL);
-    std::vector<float>    h_centered_tmpls;
+    std::vector<float>    h_pnorm_tmpls;
+    std::vector<float>    h_cnorm_tmpls;
 
     uint32_t max_reg_pix = 0, total_alloc_pix = 0;
     float max_alloc_radius = 0.05f;
     float step = 2.0f / static_cast<float>(model.lattice_grid);
     uint32_t match_pix = 784u; // 28x28
+    constexpr uint32_t kNumShifts = 9u; // dx, dy in {-1, 0, +1}
 
-    h_centered_tmpls.resize(static_cast<size_t>(num_classes) * match_pix, 0.0f);
+    h_pnorm_tmpls.resize(static_cast<size_t>(num_classes) * match_pix, 0.0f);
+    h_cnorm_tmpls.resize(static_cast<size_t>(num_classes) * match_pix, 0.0f);
 
     for (uint32_t c = 0; c < num_classes; ++c) {
         const auto& rec = model.classes[c];
@@ -375,26 +380,32 @@ int main(int argc, char** argv) {
 
         float inv = rec.train_count > 0 ? (1.0f / static_cast<float>(rec.train_count)) : 0.0f;
         std::vector<float> avg(pix, 0.0f);
-        double mean = 0.0;
         for (uint32_t p = 0; p < pix; ++p) {
             avg[p] = rec.shadow_sum[p] * inv;
             h_shadow_avg.push_back(avg[p]);
-            mean += avg[p];
         }
-        mean /= std::max(1u, pix);
 
         if (pix == match_pix) {
-            // Precompute 64-bit coarse footprint mask (cell peak > 0.24 = core shadow support)
-            h_class_masks[c] = gllm::compute_coarse_mask64(avg.data(), 0.24f);
-            // Precompute zero-mean L2-normalized template for centered cosine correlation
+            // Canonicalize class shadow into unified 22x22 frame (removes MNIST 20px vs EMNIST 24px scale bias!)
+            float* pnorm = &h_pnorm_tmpls[static_cast<size_t>(c) * match_pix];
+            float* cnorm = &h_cnorm_tmpls[static_cast<size_t>(c) * match_pix];
+            gllm::canonicalize_28(avg.data(), pnorm, 22.0f, 0.22f);
+
+            // Stage-1 64-bit coarse footprint mask in canonical space (core shadow support > 0.22)
+            h_class_masks[c] = gllm::compute_coarse_mask64(pnorm, 0.22f);
+
+            // Precompute zero-mean L2-normalized canonical template for centered cosine
+            double mean = 0.0;
+            for (uint32_t p = 0; p < match_pix; ++p) mean += pnorm[p];
+            mean /= match_pix;
             double norm2 = 0.0;
             for (uint32_t p = 0; p < match_pix; ++p) {
-                double z = avg[p] - mean;
+                double z = pnorm[p] - mean;
                 norm2 += z * z;
             }
             float inv_n = static_cast<float>(1.0 / std::sqrt(norm2 + 1e-12));
             for (uint32_t p = 0; p < match_pix; ++p) {
-                h_centered_tmpls[static_cast<size_t>(c) * match_pix + p] = static_cast<float>(avg[p] - mean) * inv_n;
+                cnorm[p] = static_cast<float>(pnorm[p] - mean) * inv_n;
             }
         }
         total_alloc_pix += pix;
@@ -440,7 +451,8 @@ int main(int argc, char** argv) {
 
     // Upload GPU model & matcher buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_counter = 0;
-    CUdeviceptr d_masks = 0, d_tmpls = 0, d_sketch = 0, d_out_ov = 0, d_out_st = 0;
+    CUdeviceptr d_masks = 0, d_pnorm = 0, d_cnorm = 0, d_sketch_raw = 0, d_sketch_cen = 0;
+    CUdeviceptr d_out_ov = 0, d_out_st = 0;
     CU_CHECK(cuMemAlloc_v2(&d_regions, h_regions.size() * sizeof(gllm::GpuRegionDesc)));
     CU_CHECK(cuMemcpyHtoD_v2(d_regions, h_regions.data(), h_regions.size() * sizeof(gllm::GpuRegionDesc)));
     CU_CHECK(cuMemAlloc_v2(&d_outer, h_outer.size() * sizeof(gllm::GpuOuterPoint)));
@@ -451,9 +463,12 @@ int main(int argc, char** argv) {
 
     CU_CHECK(cuMemAlloc_v2(&d_masks,  h_class_masks.size() * sizeof(uint64_t)));
     CU_CHECK(cuMemcpyHtoD_v2(d_masks, h_class_masks.data(), h_class_masks.size() * sizeof(uint64_t)));
-    CU_CHECK(cuMemAlloc_v2(&d_tmpls,  h_centered_tmpls.size() * sizeof(float)));
-    CU_CHECK(cuMemcpyHtoD_v2(d_tmpls, h_centered_tmpls.data(), h_centered_tmpls.size() * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_sketch, match_pix * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_pnorm,  h_pnorm_tmpls.size() * sizeof(float)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_pnorm, h_pnorm_tmpls.data(), h_pnorm_tmpls.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_cnorm,  h_cnorm_tmpls.size() * sizeof(float)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_cnorm, h_cnorm_tmpls.data(), h_cnorm_tmpls.size() * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_sketch_raw, static_cast<size_t>(kNumShifts) * match_pix * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_sketch_cen, static_cast<size_t>(kNumShifts) * match_pix * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_classes * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_st, num_classes * sizeof(uint32_t)));
 
@@ -587,34 +602,60 @@ int main(int argc, char** argv) {
     bool dirty_lat  = true;
 
     // -------------------------------------------------------------------------
-    // Run 2-Stage CUDA Pruned Inference on the Captured 28x28 Sketch!
+    // Run 2-Stage CUDA Pruned Full-Feature Geometric Inference on 28x28 Sketch!
     // -------------------------------------------------------------------------
     auto run_cuda_capture = [&]() {
-        // Compute zero-mean L2-normalized sketch vector + 64-bit coarse mask Q
-        double mean = 0.0;
-        for (uint32_t p = 0; p < match_pix; ++p) mean += hud.norm28[p];
-        mean /= match_pix;
-        if (mean < 1e-4) {
+        double base_mean = 0.0;
+        for (uint32_t p = 0; p < match_pix; ++p) base_mean += hud.norm28[p];
+        base_mean /= match_pix;
+        if (base_mean < 1e-4) {
             std::cout << "[CAPTURE] Canvas is empty — draw a digit or letter first.\n";
             return;
         }
-        double norm2 = 0.0;
-        for (uint32_t p = 0; p < match_pix; ++p) {
-            double z = hud.norm28[p] - mean;
-            norm2 += z * z;
-        }
-        float inv_n = static_cast<float>(1.0 / std::sqrt(norm2 + 1e-12));
-        std::vector<float> h_centered(match_pix);
-        for (uint32_t p = 0; p < match_pix; ++p) {
-            h_centered[p] = static_cast<float>(hud.norm28[p] - mean) * inv_n;
-        }
-        uint64_t q_mask = gllm::compute_coarse_mask64(hud.norm28.data(), 0.20f);
 
-        CU_CHECK(cuMemcpyHtoD_v2(d_sketch, h_centered.data(), match_pix * sizeof(float)));
+        // Build 9 micro-shifted variants (dx, dy in {-1, 0, +1}) in canonical 22x22 space
+        std::vector<float> h_sk_raw(static_cast<size_t>(kNumShifts) * match_pix, 0.0f);
+        std::vector<float> h_sk_cen(static_cast<size_t>(kNumShifts) * match_pix, 0.0f);
+        uint32_t s_idx = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                float* raw_dst = &h_sk_raw[static_cast<size_t>(s_idx) * match_pix];
+                float* cen_dst = &h_sk_cen[static_cast<size_t>(s_idx) * match_pix];
+                double mean = 0.0;
+                for (int y = 0; y < 28; ++y) {
+                    int sy = y - dy;
+                    if (sy < 0 || sy >= 28) continue;
+                    for (int x = 0; x < 28; ++x) {
+                        int sx = x - dx;
+                        if (sx >= 0 && sx < 28) {
+                            float v = hud.norm28[sy * 28 + sx];
+                            raw_dst[y * 28 + x] = v;
+                            mean += v;
+                        }
+                    }
+                }
+                mean /= match_pix;
+                double norm2 = 0.0;
+                for (uint32_t p = 0; p < match_pix; ++p) {
+                    double z = raw_dst[p] - mean;
+                    norm2 += z * z;
+                }
+                float inv_n = static_cast<float>(1.0 / std::sqrt(norm2 + 1e-12));
+                for (uint32_t p = 0; p < match_pix; ++p) {
+                    cen_dst[p] = static_cast<float>(raw_dst[p] - mean) * inv_n;
+                }
+                s_idx++;
+            }
+        }
+        uint64_t q_mask = gllm::compute_coarse_mask64(hud.norm28.data(), 0.24f);
+        uint32_t num_shifts = kNumShifts;
+
+        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_raw, h_sk_raw.data(), h_sk_raw.size() * sizeof(float)));
+        CU_CHECK(cuMemcpyHtoD_v2(d_sketch_cen, h_sk_cen.data(), h_sk_cen.size() * sizeof(float)));
 
         void* m_params[] = {
-            &d_sketch, &q_mask, &d_masks, &d_tmpls,
-            &d_out_ov, &d_out_st, &match_pix, &num_classes, &prune_ratio
+            &d_sketch_raw, &d_sketch_cen, &q_mask, &d_masks, &d_pnorm, &d_cnorm,
+            &d_out_ov, &d_out_st, &match_pix, &num_classes, &num_shifts, &prune_ratio
         };
         CU_CHECK(cuEventRecord(ev_s, nullptr));
         CU_CHECK(cuLaunchKernel(fn_match, (num_classes + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, m_params, nullptr));
@@ -705,6 +746,13 @@ int main(int argc, char** argv) {
             if (static_cast<uint32_t>(test_idx_pos) < cnt) {
                 std::vector<uint8_t> tmp(784);
                 for (int k = 0; k <= test_idx_pos; ++k) gzread(f, tmp.data(), 784);
+                if (test_transpose) {
+                    std::vector<uint8_t> tr(784);
+                    for (int y = 0; y < 28; ++y)
+                        for (int x = 0; x < 28; ++x)
+                            tr[y * 28 + x] = tmp[x * 28 + y];
+                    tmp.swap(tr);
+                }
                 hud.load_raw_28x28(tmp.data());
                 run_cuda_capture();
             }
@@ -962,8 +1010,10 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_shadow));
     CU_CHECK(cuMemFree_v2(d_counter));
     CU_CHECK(cuMemFree_v2(d_masks));
-    CU_CHECK(cuMemFree_v2(d_tmpls));
-    CU_CHECK(cuMemFree_v2(d_sketch));
+    CU_CHECK(cuMemFree_v2(d_pnorm));
+    CU_CHECK(cuMemFree_v2(d_cnorm));
+    CU_CHECK(cuMemFree_v2(d_sketch_raw));
+    CU_CHECK(cuMemFree_v2(d_sketch_cen));
     CU_CHECK(cuMemFree_v2(d_out_ov));
     CU_CHECK(cuMemFree_v2(d_out_st));
     CU_CHECK(cuEventDestroy_v2(ev_s));

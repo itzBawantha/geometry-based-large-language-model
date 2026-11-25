@@ -449,104 +449,178 @@ EMIT_DONE:
 }
 
 // -----------------------------------------------------------------------------
-// Kernel 5: 2-Stage Hardware-Pruned Sketch Matcher (Dynamic num_classes!)
+// Kernel 5: 2-Stage Hardware-Pruned Full-Feature Geometric Sketch Matcher
 //   Stage 1: 64-bit coarse 8x8 occupancy bitmask (and.b64 + popc.b64)
 //            Deterministically prunes impossible classes in 2 clock cycles!
-//   Stage 2: Centered cosine correlation across WxH shadow template for
-//            surviving finalists -> independent overlap [0..1] + status flag.
+//   Stage 2: Multi-shift (dx, dy in {-1, 0, +1}) full-feature geometric shadow
+//            confirmation across canonical WxH shadow maps:
+//              score = clamp(0.55*cos + 0.45*dice - 0.30*void_pen - 0.12*core_pen)
+//            Strictly penalizes BOTH extra ink in empty void zones (e.g., B's
+//            left stem on '3') AND missing core strokes ('3' missing B's stem)!
 // -----------------------------------------------------------------------------
 .visible .entry match_sketch_pruned(
-    .param .u64 param_sketch_centered, // const float[pixels_img], zero-mean L2-normalized
+    .param .u64 param_sketch_raw,      // const float[num_shifts * pixels_img] in [0..1]
+    .param .u64 param_sketch_cen,      // const float[num_shifts * pixels_img], zero-mean L2-norm
     .param .u64 param_sketch_mask,     // uint64_t 8x8 coarse occupancy mask Q
     .param .u64 param_class_masks,     // const uint64_t[num_classes]
-    .param .u64 param_class_templates, // const float[num_classes * pixels_img], zero-mean L2-norm
+    .param .u64 param_class_pnorm,     // const float[num_classes * pixels_img], canonical [0..1]
+    .param .u64 param_class_cnorm,     // const float[num_classes * pixels_img], zero-mean L2-norm
     .param .u64 param_out_overlap,     // float[num_classes] in [0.0 .. 1.0]
     .param .u64 param_out_status,      // uint32_t[num_classes]: 0=PRUNED, 1=CONFIRMED
     .param .u32 param_pixels_img,
     .param .u32 param_num_classes,
+    .param .u32 param_num_shifts,
     .param .f32 param_prune_ratio      // min fraction of Q bits overlapping class mask
 )
 {
-    .reg .pred %p<6>;
-    .reg .u32  %r<14>;
-    .reg .u64  %rd<14>;
-    .reg .f32  %f<10>;
+    .reg .pred %p<8>;
+    .reg .u32  %r<16>;
+    .reg .u64  %rd<22>;
+    .reg .f32  %f<26>;
 
-    ld.param.u64 %rd0, [param_sketch_centered];
-    ld.param.u64 %rd1, [param_sketch_mask];
-    ld.param.u64 %rd2, [param_class_masks];
-    ld.param.u64 %rd3, [param_class_templates];
-    ld.param.u64 %rd4, [param_out_overlap];
-    ld.param.u64 %rd5, [param_out_status];
+    ld.param.u64 %rd0, [param_sketch_raw];
+    ld.param.u64 %rd1, [param_sketch_cen];
+    ld.param.u64 %rd2, [param_sketch_mask];
+    ld.param.u64 %rd3, [param_class_masks];
+    ld.param.u64 %rd4, [param_class_pnorm];
+    ld.param.u64 %rd5, [param_class_cnorm];
+    ld.param.u64 %rd6, [param_out_overlap];
+    ld.param.u64 %rd7, [param_out_status];
     ld.param.u32 %r0,  [param_pixels_img];
     ld.param.u32 %r1,  [param_num_classes];
+    ld.param.u32 %r2,  [param_num_shifts];
     ld.param.f32 %f0,  [param_prune_ratio];
 
-    mov.u32    %r2, %ctaid.x;
-    mov.u32    %r3, %ntid.x;
-    mov.u32    %r4, %tid.x;
-    mad.lo.u32 %r5, %r2, %r3, %r4;      // cls_idx
-    setp.ge.u32 %p0, %r5, %r1;
+    mov.u32    %r3, %ctaid.x;
+    mov.u32    %r4, %ntid.x;
+    mov.u32    %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;      // cls_idx
+    setp.ge.u32 %p0, %r6, %r1;
     @%p0 bra MATCH_DONE;
 
     // --- Stage 1: Hardware 64-bit Coarse Bitmask Pruning (2 clock cycles!) ---
-    mul.wide.u32  %rd6, %r5, 8;
-    add.u64       %rd7, %rd2, %rd6;
-    ld.global.u64 %rd8, [%rd7];         // class_mask M
+    mul.wide.u32  %rd8,  %r6, 8;
+    add.u64       %rd9,  %rd3, %rd8;
+    ld.global.u64 %rd10, [%rd9];        // class_mask M
 
-    and.b64  %rd9,  %rd1, %rd8;         // Q & M
-    popc.b64 %r6,   %rd1;               // popc(Q)
-    popc.b64 %r7,   %rd9;               // popc(Q & M)
+    and.b64  %rd11, %rd2, %rd10;        // Q & M
+    popc.b64 %r7,   %rd2;               // popc(Q)
+    popc.b64 %r8,   %rd11;              // popc(Q & M)
 
-    setp.eq.u32 %p1, %r6, 0;
+    setp.eq.u32 %p1, %r7, 0;
     @%p1 bra PRUNE_OUT;
-    setp.eq.u32 %p2, %r7, 0;
+    setp.eq.u32 %p2, %r8, 0;
     @%p2 bra PRUNE_OUT;
 
-    cvt.rn.f32.u32 %f1, %r7;
-    cvt.rn.f32.u32 %f2, %r6;
+    cvt.rn.f32.u32 %f1, %r8;
+    cvt.rn.f32.u32 %f2, %r7;
     div.approx.f32 %f3, %f1, %f2;       // hit_ratio = popc(Q & M) / popc(Q)
     setp.lt.f32 %p3, %f3, %f0;          // hit_ratio < prune_ratio -> PRUNE!
     @%p3 bra PRUNE_OUT;
 
-    // --- Stage 2: Exact WxH Centered Cosine Overlap Confirmation ---
-    mul.wide.u32 %rd10, %r5, %r0;
-    shl.b64      %rd10, %rd10, 2;
-    add.u64      %rd10, %rd3, %rd10;    // tmpl_ptr
+    // --- Stage 2: Multi-Shift Full-Feature Geometric Shadow Confirmation ---
+    mul.wide.u32 %rd12, %r6, %r0;
+    shl.b64      %rd12, %rd12, 2;
+    add.u64      %rd13, %rd4, %rd12;    // class_pnorm ptr
+    add.u64      %rd14, %rd5, %rd12;    // class_cnorm ptr
 
-    mov.f32 %f4, 0f00000000;            // dot = 0.0
-    mov.u32 %r8, 0;                     // p = 0
+    mov.f32 %f4, 0f00000000;            // best_score = 0.0
+    mov.u32 %r9, 0;                     // shift_idx s = 0
 
-MATCH_LOOP:
-    setp.ge.u32 %p4, %r8, %r0;
+SHIFT_LOOP:
+    setp.ge.u32 %p4, %r9, %r2;
     @%p4 bra MATCH_CONFIRM;
 
-    mul.wide.u32  %rd11, %r8, 4;
-    add.u64       %rd12, %rd0, %rd11;
-    ld.global.f32 %f5,   [%rd12];       // sketch_centered[p]
-    add.u64       %rd13, %rd10, %rd11;
-    ld.global.f32 %f6,   [%rd13];       // class_tmpl[p]
-    fma.rn.f32    %f4,   %f5, %f6, %f4;
-    add.u32       %r8,   %r8, 1;
-    bra MATCH_LOOP;
+    mul.wide.u32 %rd15, %r9, %r0;
+    shl.b64      %rd15, %rd15, 2;
+    add.u64      %rd16, %rd0, %rd15;    // sketch_raw ptr for shift s
+    add.u64      %rd17, %rd1, %rd15;    // sketch_cen ptr for shift s
+
+    mov.f32 %f5,  0f00000000;           // dot_c
+    mov.f32 %f6,  0f00000000;           // dot_xs
+    mov.f32 %f7,  0f00000000;           // sum_x2
+    mov.f32 %f8,  0f00000000;           // sum_t2
+    mov.f32 %f9,  0f00000000;           // sum_x
+    mov.f32 %f10, 0f00000000;           // extra_void
+    mov.f32 %f11, 0f00000000;           // miss_core
+    mov.u32 %r10, 0;                    // p = 0
+
+PIX_LOOP:
+    setp.ge.u32 %p5, %r10, %r0;
+    @%p5 bra SHIFT_EVAL;
+
+    mul.wide.u32  %rd18, %r10, 4;
+    add.u64       %rd19, %rd16, %rd18;
+    ld.global.f32 %f12,  [%rd19];       // x
+    add.u64       %rd19, %rd17, %rd18;
+    ld.global.f32 %f13,  [%rd19];       // xc
+    add.u64       %rd19, %rd13, %rd18;
+    ld.global.f32 %f14,  [%rd19];       // t
+    add.u64       %rd19, %rd14, %rd18;
+    ld.global.f32 %f15,  [%rd19];       // tc
+
+    fma.rn.f32 %f5, %f13, %f15, %f5;    // dot_c  += xc * tc
+    fma.rn.f32 %f6, %f12, %f14, %f6;    // dot_xs += x * t
+    fma.rn.f32 %f7, %f12, %f12, %f7;    // sum_x2 += x * x
+    fma.rn.f32 %f8, %f14, %f14, %f8;    // sum_t2 += t * t
+    add.f32    %f9, %f9,  %f12;         // sum_x  += x
+
+    // Branchless Extra-Ink-in-Void penalty: max(0, x - t) * (1 - t)^2
+    sub.f32    %f16, %f12, %f14;
+    max.f32    %f17, %f16, 0f00000000;
+    sub.f32    %f18, 0f3f800000, %f14;
+    mul.f32    %f18, %f18, %f18;
+    fma.rn.f32 %f10, %f17, %f18, %f10;
+
+    // Branchless Missing-Core-Stroke penalty: max(0, t - x) * t^2
+    sub.f32    %f19, %f14, %f12;
+    max.f32    %f19, %f19, 0f00000000;
+    mul.f32    %f20, %f14, %f14;
+    fma.rn.f32 %f11, %f19, %f20, %f11;
+
+    add.u32 %r10, %r10, 1;
+    bra PIX_LOOP;
+
+SHIFT_EVAL:
+    max.f32        %f5,  %f5,  0f00000000;   // cos_v = max(0, dot_c)
+    mul.f32        %f21, %f6,  0f40000000;   // 2.0 * dot_xs
+    add.f32        %f22, %f7,  %f8;
+    add.f32        %f22, %f22, 0f358637bd;   // sum_x2 + sum_t2 + 1e-6
+    div.approx.f32 %f21, %f21, %f22;         // dice
+
+    add.f32        %f22, %f9,  0f358637bd;
+    div.approx.f32 %f22, %f10, %f22;         // vpen = extra_void / (sum_x + 1e-6)
+    add.f32        %f23, %f8,  0f358637bd;
+    div.approx.f32 %f23, %f11, %f23;         // mpen = miss_core / (sum_t2 + 1e-6)
+
+    // score = clamp(0.55*cos_v + 0.45*dice - 0.30*vpen - 0.12*mpen, 0, 1)
+    mul.f32    %f24, %f5,  0f3f0ccccd;       // 0.55 * cos_v
+    fma.rn.f32 %f24, %f21, 0f3ee66666, %f24; // + 0.45 * dice
+    mul.f32    %f22, %f22, 0f3e99999a;       // 0.30 * vpen
+    sub.f32    %f24, %f24, %f22;
+    mul.f32    %f23, %f23, 0f3df5c28f;       // 0.12 * mpen
+    sub.f32    %f24, %f24, %f23;
+    max.f32    %f24, %f24, 0f00000000;
+    min.f32    %f24, %f24, 0f3f800000;
+
+    max.f32 %f4, %f4, %f24;                  // best_score = max(best_score, score)
+    add.u32 %r9, %r9, 1;
+    bra SHIFT_LOOP;
 
 MATCH_CONFIRM:
-    max.f32 %f4, %f4, 0f00000000;
-    min.f32 %f4, %f4, 0f3f800000;
-
-    mul.wide.u32  %rd11, %r5, 4;
-    add.u64       %rd12, %rd4, %rd11;
-    st.global.f32 [%rd12], %f4;
-    add.u64       %rd13, %rd5, %rd11;
-    st.global.u32 [%rd13], 1;           // CONFIRMED
+    mul.wide.u32  %rd20, %r6, 4;
+    add.u64       %rd21, %rd6, %rd20;
+    st.global.f32 [%rd21], %f4;
+    add.u64       %rd21, %rd7, %rd20;
+    st.global.u32 [%rd21], 1;                // CONFIRMED
     bra MATCH_DONE;
 
 PRUNE_OUT:
-    mul.wide.u32  %rd11, %r5, 4;
-    add.u64       %rd12, %rd4, %rd11;
-    st.global.f32 [%rd12], 0f00000000;
-    add.u64       %rd13, %rd5, %rd11;
-    st.global.u32 [%rd13], 0;           // PRUNED
+    mul.wide.u32  %rd20, %r6, 4;
+    add.u64       %rd21, %rd6, %rd20;
+    st.global.f32 [%rd21], 0f00000000;
+    add.u64       %rd21, %rd7, %rd20;
+    st.global.u32 [%rd21], 0;                // PRUNED
 
 MATCH_DONE:
     ret;

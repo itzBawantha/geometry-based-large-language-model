@@ -143,6 +143,93 @@ inline uint64_t compute_coarse_mask64(const float* img28, float threshold) {
     return mask;
 }
 
+// Separable 5-tap Gaussian blur on a 28x28 float grid (matches EMNIST stroke smoothing)
+inline void gaussian_blur_28(const float* src, float* dst, float sigma = 0.80f) {
+    if (sigma <= 0.01f) {
+        std::memcpy(dst, src, 784 * sizeof(float));
+        return;
+    }
+    float k[5], ks = 0.0f;
+    for (int i = -2; i <= 2; ++i) {
+        k[i + 2] = std::exp(-0.5f * (i / sigma) * (i / sigma));
+        ks += k[i + 2];
+    }
+    for (int i = 0; i < 5; ++i) k[i] /= ks;
+
+    float tmp[784] = {};
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            float s = 0.0f;
+            for (int dx = -2; dx <= 2; ++dx) {
+                int xx = x + dx;
+                if (xx >= 0 && xx < 28) s += src[y * 28 + xx] * k[dx + 2];
+            }
+            tmp[y * 28 + x] = s;
+        }
+    }
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            float s = 0.0f;
+            for (int dy = -2; dy <= 2; ++dy) {
+                int yy = y + dy;
+                if (yy >= 0 && yy < 28) s += tmp[yy * 28 + x] * k[dy + 2];
+            }
+            dst[y * 28 + x] = s;
+        }
+    }
+}
+
+// Canonical aspect-preserving tight-bbox normalizer into target_box x target_box inside 28x28
+// Eliminates scale bias between MNIST (20x20), EMNIST (24x24), and hand-drawn sketches!
+inline void canonicalize_28(const float* src, float* dst, float target_box = 22.0f, float thr_frac = 0.22f) {
+    std::fill(dst, dst + 784, 0.0f);
+    float mx = 0.0f;
+    for (int i = 0; i < 784; ++i) mx = std::max(mx, src[i]);
+    if (mx < 1e-6f) return;
+
+    float thr = mx * thr_frac;
+    int minx = 28, miny = 28, maxx = -1, maxy = -1;
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            if (src[y * 28 + x] > thr) {
+                minx = std::min(minx, x); maxx = std::max(maxx, x);
+                miny = std::min(miny, y); maxy = std::max(maxy, y);
+            }
+        }
+    }
+    if (maxx < minx || maxy < miny) return;
+
+    int bw = maxx - minx + 1;
+    int bh = maxy - miny + 1;
+    float scale = target_box / static_cast<float>(std::max(bw, bh));
+    float ox = (28.0f - bw * scale) * 0.5f;
+    float oy = (28.0f - bh * scale) * 0.5f;
+
+    auto sample = [&](int px, int py) {
+        return (px >= 0 && px < 28 && py >= 0 && py < 28) ? src[py * 28 + px] : 0.0f;
+    };
+
+    float omx = 0.0f;
+    for (int ty = 0; ty < 28; ++ty) {
+        for (int tx = 0; tx < 28; ++tx) {
+            float sx = (tx + 0.5f - ox) / scale + minx - 0.5f;
+            float sy = (ty + 0.5f - oy) / scale + miny - 0.5f;
+            int x0 = static_cast<int>(std::floor(sx));
+            int y0 = static_cast<int>(std::floor(sy));
+            float wx = sx - x0, wy = sy - y0;
+            float v = (sample(x0, y0) * (1.0f - wx) + sample(x0 + 1, y0) * wx) * (1.0f - wy)
+                    + (sample(x0, y0 + 1) * (1.0f - wx) + sample(x0 + 1, y0 + 1) * wx) * wy;
+            v = std::clamp(v, 0.0f, 1.0f);
+            dst[ty * 28 + tx] = v;
+            omx = std::max(omx, v);
+        }
+    }
+    if (omx > 1e-6f) {
+        float inv = 1.0f / omx;
+        for (int i = 0; i < 784; ++i) dst[i] *= inv;
+    }
+}
+
 class SketchSidebarHUD {
 public:
     static constexpr int kPanelW  = 336;
@@ -177,19 +264,21 @@ public:
 
     void load_raw_28x28(const uint8_t* px28) {
         clear();
+        std::array<float, 784> raw{};
+        for (int i = 0; i < 784; ++i) raw[i] = static_cast<float>(px28[i]) / 255.0f;
         for (int y = 0; y < kCanvasS; ++y) {
             int sy = (y * 28) / kCanvasS;
             for (int x = 0; x < kCanvasS; ++x) {
                 int sx = (x * 28) / kCanvasS;
-                canvas[y * kCanvasS + x] = static_cast<float>(px28[sy * 28 + sx]) / 255.0f;
+                canvas[y * kCanvasS + x] = raw[sy * 28 + sx];
             }
         }
-        for (int i = 0; i < 784; ++i) norm28[i] = static_cast<float>(px28[i]) / 255.0f;
+        canonicalize_28(raw.data(), norm28.data(), 22.0f, 0.10f);
         dirty_tex = true;
     }
 
     // Smooth soft-brush dab & stroke interpolation inside the 224x224 canvas
-    void draw_stroke(float x0, float y0, float x1, float y1, float radius = 9.5f) {
+    void draw_stroke(float x0, float y0, float x1, float y1, float radius = 10.5f) {
         float dx = x1 - x0, dy = y1 - y0;
         float dist = std::sqrt(dx * dx + dy * dy);
         int steps = std::max(1, static_cast<int>(dist / 2.0f));
@@ -216,7 +305,8 @@ public:
         dirty_tex = true;
     }
 
-    // NIST-style preprocessing: crop tight ink bbox -> fit into 20x20 -> center by center-of-mass in 28x28
+    // Canonical geometric preprocessing: crop tight ink bbox -> fit into 22x22 inside 28x28
+    // -> EMNIST-matching Gaussian smoothing (sigma=0.80) -> peak normalize to [0..1]
     bool update_normalized_28x28() {
         int minx = kCanvasS, miny = kCanvasS, maxx = -1, maxy = -1;
         for (int y = 0; y < kCanvasS; ++y) {
@@ -232,14 +322,13 @@ public:
 
         int bw = maxx - minx + 1;
         int bh = maxy - miny + 1;
-        float scale = 20.0f / static_cast<float>(std::max(bw, bh));
+        float scale = 22.0f / static_cast<float>(std::max(bw, bh));
         float new_w = bw * scale;
         float new_h = bh * scale;
         float ox = (28.0f - new_w) * 0.5f;
         float oy = (28.0f - new_h) * 0.5f;
 
         std::array<float, 784> tmp{};
-        double sum_m = 0.0, sum_x = 0.0, sum_y = 0.0;
         for (int ty = 0; ty < 28; ++ty) {
             for (int tx = 0; tx < 28; ++tx) {
                 float sx = (tx + 0.5f - ox) / scale + minx;
@@ -257,33 +346,17 @@ public:
                         cnt++;
                     }
                 }
-                float val = acc / cnt;
-                tmp[ty * 28 + tx] = val;
-                sum_m += val;
-                sum_x += val * tx;
-                sum_y += val * ty;
+                tmp[ty * 28 + tx] = acc / cnt;
             }
         }
-        // Shift center of mass cleanly to (13.5, 13.5)
-        float shift_x = sum_m > 1e-5 ? static_cast<float>(13.5 - sum_x / sum_m) : 0.0f;
-        float shift_y = sum_m > 1e-5 ? static_cast<float>(13.5 - sum_y / sum_m) : 0.0f;
-        shift_x = std::clamp(shift_x, -4.0f, 4.0f);
-        shift_y = std::clamp(shift_y, -4.0f, 4.0f);
 
-        for (int y = 0; y < 28; ++y) {
-            for (int x = 0; x < 28; ++x) {
-                float fx = x - shift_x;
-                float fy = y - shift_y;
-                int x0 = static_cast<int>(std::floor(fx));
-                int y0 = static_cast<int>(std::floor(fy));
-                float wx = fx - x0, wy = fy - y0;
-                auto sample = [&](int px, int py) {
-                    return (px >= 0 && px < 28 && py >= 0 && py < 28) ? tmp[py * 28 + px] : 0.0f;
-                };
-                float v = (sample(x0, y0) * (1 - wx) + sample(x0 + 1, y0) * wx) * (1 - wy)
-                        + (sample(x0, y0 + 1) * (1 - wx) + sample(x0 + 1, y0 + 1) * wx) * wy;
-                norm28[y * 28 + x] = std::clamp(v, 0.0f, 1.0f);
-            }
+        // Smooth slightly (sigma=0.80) and peak-normalize to 1.0 to match canonical class shadows
+        gaussian_blur_28(tmp.data(), norm28.data(), 0.80f);
+        float mx = 0.0f;
+        for (int i = 0; i < 784; ++i) mx = std::max(mx, norm28[i]);
+        if (mx > 1e-6f) {
+            float inv = 1.0f / mx;
+            for (int i = 0; i < 784; ++i) norm28[i] = std::clamp(norm28[i] * inv, 0.0f, 1.0f);
         }
         return true;
     }
