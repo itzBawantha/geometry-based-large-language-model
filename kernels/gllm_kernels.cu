@@ -75,17 +75,18 @@ extern "C" __global__ void eval_score_shadows(
 
 extern "C" __global__ void match_sketch_pruned(
     const float* __restrict__ sketch_raw,
-    const float* __restrict__ sketch_cen,
+    const float* __restrict__ sketch_self_ent,
     uint64_t sketch_mask,
     const uint64_t* __restrict__ class_masks,
-    const float* __restrict__ class_pnorm,
-    const float* __restrict__ class_cnorm,
+    const float* __restrict__ class_log_odds,
+    const float* __restrict__ class_bias,
     float* __restrict__ out_overlap,
     uint32_t* __restrict__ out_status,
     uint32_t pixels_img,
     uint32_t num_classes,
     uint32_t num_shifts,
-    float prune_ratio
+    float prune_ratio,
+    float inv_t_ln2
 ) {
     uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= num_classes) return;
@@ -99,33 +100,17 @@ extern "C" __global__ void match_sketch_pruned(
         return;
     }
 
-    // Stage 2: Multi-shift full-feature geometric shadow confirmation
-    const float* pnorm = class_pnorm + static_cast<size_t>(c) * pixels_img;
-    const float* cnorm = class_cnorm + static_cast<size_t>(c) * pixels_img;
+    // Stage 2: Multi-shift non-linear Bernoulli log-likelihood / KL similarity
+    //   LL(x, c) = sum[ x*log(p) + (1-x)*log(1-p) ] = bias[c] + sum[ x * log_odds[c, p] ]
+    const float* log_odds = class_log_odds + static_cast<size_t>(c) * pixels_img;
+    float bias = class_bias[c];
     float best_score = 0.0f;
     for (uint32_t s = 0; s < num_shifts; ++s) {
         const float* sraw = sketch_raw + static_cast<size_t>(s) * pixels_img;
-        const float* scen = sketch_cen + static_cast<size_t>(s) * pixels_img;
-        float dot_c = 0.0f, dot_xs = 0.0f, sum_x2 = 0.0f, sum_t2 = 0.0f;
-        float sum_x = 0.0f, extra_void = 0.0f, miss_core = 0.0f;
-        for (uint32_t p = 0; p < pixels_img; ++p) {
-            float x = sraw[p], xc = scen[p], t = pnorm[p], tc = cnorm[p];
-            dot_c  += xc * tc;
-            dot_xs += x * t;
-            sum_x2 += x * x;
-            sum_t2 += t * t;
-            sum_x  += x;
-            float dx_pos = fmaxf(x - t, 0.0f);
-            float om = 1.0f - t;
-            extra_void += dx_pos * om * om;
-            float dt_pos = fmaxf(t - x, 0.0f);
-            miss_core += dt_pos * t * t;
-        }
-        float cos_v = fmaxf(dot_c, 0.0f);
-        float dice  = (2.0f * dot_xs) / (sum_x2 + sum_t2 + 1e-6f);
-        float vpen  = extra_void / (sum_x + 1e-6f);
-        float mpen  = miss_core / (sum_t2 + 1e-6f);
-        float sc = fminf(fmaxf(0.55f * cos_v + 0.45f * dice - 0.30f * vpen - 0.12f * mpen, 0.0f), 1.0f);
+        float ll = bias;
+        for (uint32_t p = 0; p < pixels_img; ++p) ll += sraw[p] * log_odds[p];
+        float dkl = fminf(ll - sketch_self_ent[s], 0.0f);
+        float sc  = fminf(fmaxf(exp2f(dkl * inv_t_ln2), 0.0f), 1.0f);
         best_score = fmaxf(best_score, sc);
     }
     out_overlap[c] = best_score;
