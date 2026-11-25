@@ -1,15 +1,33 @@
-CXX := g++
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra
-LDFLAGS := -lcuda -lSDL2 -lGL -ldl -lpthread
+# Geometry-Based Large Language Model (GLLM)
+# Builds all 5 modular CUDA Driver API + OpenGL 4.6 CLIs (no nvcc required)
 
-TARGET := cuda_sphere
+MODEL ?= models/sphere_1b.gllm
+CLUSTERS ?= 8
 
-all: $(TARGET)
+.PHONY: all train benchmark demo viz inspect clean legacy
 
-$(TARGET): main.cpp sphere_kernel.ptx
-	$(CXX) $(CXXFLAGS) main.cpp -o $(TARGET) $(LDFLAGS)
+all:
+	@./scripts/build.sh
+
+train: all
+	@./scripts/train_digits_and_letters.sh $(MODEL) $(CLUSTERS)
+
+benchmark: all
+	@./scripts/benchmark.sh $(MODEL)
+
+demo: all
+	@./scripts/train_custom.sh --model models/demo_shapes.gllm --demo --clusters 4
+	@./scripts/run_viz.sh --model models/demo_shapes.gllm
+
+viz: all
+	@./scripts/run_viz.sh --model $(MODEL)
+
+inspect: all
+	@./bin/gllm_inspect --model $(MODEL)
 
 clean:
-	rm -f $(TARGET)
+	rm -rf bin cuda_sphere *.o
 
-.PHONY: all clean
+# Legacy v1 single-binary sphere prototype
+legacy: main.cpp sphere_kernel.ptx
+	g++ -std=c++17 -O3 -Wall -Wextra main.cpp -o cuda_sphere -lcuda -lSDL2 -lGL -ldl -lpthread
