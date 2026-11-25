@@ -119,6 +119,43 @@ int main(int argc, char** argv) {
                 overlaps == 0 ? "PASS" : "FAIL");
     if (overlaps > 0) return 2;
 
+    // Verify Operational Manifolds containment & CUDA semantic metadata table
+    auto gpu_manifolds = model.build_gpu_manifold_table();
+    const auto& geo = gllm::unit_geodesic_sphere();
+    float step_w = 2.0f / static_cast<float>(model.lattice_grid);
+    uint32_t total_corners = 0, enclosed_corners = 0;
+    for (const auto& c : model.classes) {
+        const auto* m = model.get_manifold(c.manifold_id);
+        if (!m) continue;
+        float wx[2] = {(c.ox + 0.5f) * step_w - 1.0f, (c.ox + c.width - 0.5f) * step_w - 1.0f};
+        float wy[2] = {(c.oy + 0.5f) * step_w - 1.0f, (c.oy + c.height - 0.5f) * step_w - 1.0f};
+        float wz    = (c.oz + 0.5f) * step_w - 1.0f;
+        for (int ix = 0; ix < 2; ++ix) {
+            for (int iy = 0; iy < 2; ++iy) {
+                total_corners++;
+                float dx = wx[ix] - m->center_x, dy = wy[iy] - m->center_y, dz = wz - m->center_z;
+                float r  = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (r <= m->max_radius + 1e-4f) {
+                    // Also check nearest geodesic vertex directional radius
+                    float inv_r = r > 1e-7f ? 1.0f / r : 0.0f;
+                    uint32_t best_v = 0; float bd = -2.0f;
+                    for (uint32_t v = 0; v < gllm::kManifoldVerts; ++v) {
+                        float dp = (dx * geo.dirs[v*3] + dy * geo.dirs[v*3+1] + dz * geo.dirs[v*3+2]) * inv_r;
+                        if (dp > bd) { bd = dp; best_v = v; }
+                    }
+                    if (r <= m->deformed_radii[best_v] + 1e-3f) enclosed_corners++;
+                }
+            }
+        }
+    }
+    std::printf("         Operational Manifolds: %zu | Deformed-Sphere Containment: %u/%u corners (%.1f%%)\n",
+                gpu_manifolds.size(), enclosed_corners, total_corners,
+                total_corners ? 100.0 * enclosed_corners / total_corners : 100.0);
+    for (const auto& d : gpu_manifolds) {
+        std::printf("         -> Manifold #%u '%s' | CUDA Semantic Label: '%s' | %u cls / %u regions | Vol: %.4f%% of 1B sphere\n",
+                    d.manifold_id, d.name, d.semantic_label, d.class_count, d.region_count, d.volume_fraction * 100.0f);
+    }
+
     // Initialize CUDA Driver API & load PTX kernels
     CU_CHECK(cuInit(0));
     CUdevice dev = 0;
@@ -128,10 +165,43 @@ int main(int argc, char** argv) {
     CUcontext ctx = nullptr;
     CU_CHECK(cuCtxCreate_v2(&ctx, 0, dev));
     CUmodule mod = gllm::load_gllm_ptx_module();
-    CUfunction fn_eval = nullptr, fn_match = nullptr;
+    CUfunction fn_eval = nullptr, fn_match = nullptr, fn_route = nullptr;
     CU_CHECK(cuModuleGetFunction(&fn_eval,  mod, "eval_score_shadows"));
     CU_CHECK(cuModuleGetFunction(&fn_match, mod, "match_sketch_pruned"));
+    CU_CHECK(cuModuleGetFunction(&fn_route, mod, "route_operational_manifolds"));
     std::printf("[CUDA]   Device: %s\n", dev_name);
+
+    // Verify CUDA-resident Operational Manifold Metadata Register round-trip on GPU!
+    if (!gpu_manifolds.empty()) {
+        CUdeviceptr d_man = 0, d_rm = 0, d_ov1 = 0, d_st1 = 0, d_mb = 0, d_mr = 0, d_ma = 0;
+        uint32_t M_cnt = static_cast<uint32_t>(gpu_manifolds.size());
+        std::vector<uint32_t> h_rm(R), h_st1(R, 1u);
+        std::vector<float> h_ov1(R, 0.5f);
+        for (uint32_t r = 0; r < R; ++r) h_rm[r] = model.classes[r].manifold_id;
+        CU_CHECK(cuMemAlloc_v2(&d_man, gpu_manifolds.size() * sizeof(gllm::GpuManifoldDesc)));
+        CU_CHECK(cuMemcpyHtoD_v2(d_man, gpu_manifolds.data(), gpu_manifolds.size() * sizeof(gllm::GpuManifoldDesc)));
+        CU_CHECK(cuMemAlloc_v2(&d_rm,  R * sizeof(uint32_t))); CU_CHECK(cuMemcpyHtoD_v2(d_rm,  h_rm.data(),  R * sizeof(uint32_t)));
+        CU_CHECK(cuMemAlloc_v2(&d_ov1, R * sizeof(float)));    CU_CHECK(cuMemcpyHtoD_v2(d_ov1, h_ov1.data(), R * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&d_st1, R * sizeof(uint32_t))); CU_CHECK(cuMemcpyHtoD_v2(d_st1, h_st1.data(), R * sizeof(uint32_t)));
+        CU_CHECK(cuMemAlloc_v2(&d_mb,  M_cnt * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&d_mr,  M_cnt * sizeof(uint32_t)));
+        CU_CHECK(cuMemAlloc_v2(&d_ma,  M_cnt * sizeof(uint32_t)));
+        uint32_t r_cnt = R;
+        void* r_args[] = {&d_man, &d_rm, &d_ov1, &d_st1, &d_mb, &d_mr, &d_ma, &M_cnt, &r_cnt};
+        CU_CHECK(cuLaunchKernel(fn_route, (M_cnt + 31u) / 32u, 1, 1, 32, 1, 1, 0, nullptr, r_args, nullptr));
+        CU_CHECK(cuCtxSynchronize());
+        std::vector<uint32_t> h_act(M_cnt);
+        std::vector<gllm::GpuManifoldDesc> h_readback(M_cnt);
+        CU_CHECK(cuMemcpyDtoH_v2(h_act.data(), d_ma, M_cnt * sizeof(uint32_t)));
+        CU_CHECK(cuMemcpyDtoH_v2(h_readback.data(), d_man, M_cnt * sizeof(gllm::GpuManifoldDesc)));
+        for (uint32_t m = 0; m < M_cnt; ++m) {
+            std::printf("[CUDA]   Verified GPU Manifold Register #%u: '%s' -> '%s' (%u active subspaces routed)\n",
+                        h_readback[m].manifold_id, h_readback[m].name, h_readback[m].semantic_label, h_act[m]);
+        }
+        CU_CHECK(cuMemFree_v2(d_man)); CU_CHECK(cuMemFree_v2(d_rm));
+        CU_CHECK(cuMemFree_v2(d_ov1)); CU_CHECK(cuMemFree_v2(d_st1));
+        CU_CHECK(cuMemFree_v2(d_mb));  CU_CHECK(cuMemFree_v2(d_mr)); CU_CHECK(cuMemFree_v2(d_ma));
+    }
 
     // Build lookup maps & L2-normalized shadow templates
     std::vector<float> h_tmpl(static_cast<size_t>(R) * P, 0.0f);

@@ -126,3 +126,44 @@ extern "C" __global__ void match_sketch_pruned(
     out_overlap[c] = best_score;
     out_status[c]  = 1u;
 }
+
+// 128-byte CUDA-resident Operational Manifold Metadata Register
+struct alignas(16) GpuManifoldDesc {
+    uint32_t manifold_id, class_count, region_count, reserved;
+    float    center_x, center_y, center_z, max_radius;
+    float    min_x, min_y, min_z, volume_fraction;
+    float    max_x, max_y, max_z, pad1;
+    char     name[32];           // e.g. "fundamental_text"
+    char     semantic_label[48]; // e.g. "handwritten_letters_and_numbers"
+};
+
+extern "C" __global__ void route_operational_manifolds(
+    const GpuManifoldDesc* __restrict__ manifolds,
+    const uint32_t* __restrict__ region_manifold,
+    const float* __restrict__ region_overlap,
+    const uint32_t* __restrict__ region_status,
+    float* __restrict__ out_best_score,
+    uint32_t* __restrict__ out_best_region,
+    uint32_t* __restrict__ out_active_cnt,
+    uint32_t num_manifolds,
+    uint32_t num_regions
+) {
+    uint32_t m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= num_manifolds) return;
+
+    uint32_t target_id = manifolds[m].manifold_id;
+    float best_score   = 0.0f;
+    uint32_t best_reg  = 0xFFFFFFFFu;
+    uint32_t active    = 0u;
+    for (uint32_t r = 0; r < num_regions; ++r) {
+        if (region_manifold[r] != target_id || region_status[r] == 0u) continue;
+        active++;
+        if (region_overlap[r] > best_score) {
+            best_score = region_overlap[r];
+            best_reg   = r;
+        }
+    }
+    out_best_score[m]  = best_score;
+    out_best_region[m] = best_reg;
+    out_active_cnt[m]  = active;
+}

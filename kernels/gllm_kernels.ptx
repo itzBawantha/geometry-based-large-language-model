@@ -610,3 +610,95 @@ PRUNE_OUT:
 MATCH_DONE:
     ret;
 }
+
+// -----------------------------------------------------------------------------
+// Kernel 6: Operational Manifold GPU Routing & Semantic Metadata Verification
+//   Operates directly on the 128-byte GpuManifoldDesc metadata register in VRAM
+//   (mapping each bounded subspace directly to its formal semantic label, e.g.
+//    fundamental_text / handwritten_letters_and_numbers) and aggregates peak
+//   sub-shadow match score + surviving subspace count per manifold on the GPU!
+// -----------------------------------------------------------------------------
+.visible .entry route_operational_manifolds(
+    .param .u64 param_manifolds,       // const GpuManifoldDesc[num_manifolds] (128 bytes each)
+    .param .u64 param_region_manifold, // const uint32_t[num_regions]
+    .param .u64 param_region_overlap,  // const float[num_regions]
+    .param .u64 param_region_status,   // const uint32_t[num_regions]
+    .param .u64 param_out_best_score,  // float[num_manifolds]
+    .param .u64 param_out_best_region, // uint32_t[num_manifolds] (0xFFFFFFFF if none)
+    .param .u64 param_out_active_cnt,  // uint32_t[num_manifolds]
+    .param .u32 param_num_manifolds,
+    .param .u32 param_num_regions
+)
+{
+    .reg .pred %p<5>;
+    .reg .u32  %r<16>;
+    .reg .u64  %rd<16>;
+    .reg .f32  %f<4>;
+
+    ld.param.u64 %rd0, [param_manifolds];
+    ld.param.u64 %rd1, [param_region_manifold];
+    ld.param.u64 %rd2, [param_region_overlap];
+    ld.param.u64 %rd3, [param_region_status];
+    ld.param.u64 %rd4, [param_out_best_score];
+    ld.param.u64 %rd5, [param_out_best_region];
+    ld.param.u64 %rd6, [param_out_active_cnt];
+    ld.param.u32 %r0,  [param_num_manifolds];
+    ld.param.u32 %r1,  [param_num_regions];
+
+    mov.u32    %r2, %ctaid.x;
+    mov.u32    %r3, %ntid.x;
+    mov.u32    %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;      // m_idx
+    setp.ge.u32 %p0, %r5, %r0;
+    @%p0 bra MAN_DONE;
+
+    // Load manifold_id from 144-byte GpuManifoldDesc metadata register at offset 0
+    mul.wide.u32  %rd7, %r5, 144;
+    add.u64       %rd8, %rd0, %rd7;
+    ld.global.u32 %r6,  [%rd8];         // target_manifold_id
+
+    mov.f32 %f0, 0f00000000;            // best_score = 0.0
+    mov.u32 %r7, 0xffffffff;            // best_region = 0xFFFFFFFF
+    mov.u32 %r8, 0;                     // active_cnt = 0
+    mov.u32 %r9, 0;                     // r = 0
+
+MAN_LOOP:
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra MAN_STORE;
+
+    mul.wide.u32  %rd9,  %r9, 4;
+    add.u64       %rd10, %rd1, %rd9;
+    ld.global.u32 %r10,  [%rd10];       // region_manifold[r]
+    setp.ne.u32   %p2,   %r10, %r6;
+    @%p2 bra MAN_NEXT;
+
+    add.u64       %rd11, %rd3, %rd9;
+    ld.global.u32 %r11,  [%rd11];       // region_status[r]
+    setp.eq.u32   %p3,   %r11, 0;
+    @%p3 bra MAN_NEXT;
+
+    add.u32       %r8,   %r8, 1;        // active_cnt++
+    add.u64       %rd12, %rd2, %rd9;
+    ld.global.f32 %f1,   [%rd12];       // overlap[r]
+    setp.le.f32   %p4,   %f1, %f0;
+    @%p4 bra MAN_NEXT;
+
+    mov.f32 %f0, %f1;
+    mov.u32 %r7, %r9;
+
+MAN_NEXT:
+    add.u32 %r9, %r9, 1;
+    bra MAN_LOOP;
+
+MAN_STORE:
+    mul.wide.u32  %rd13, %r5, 4;
+    add.u64       %rd14, %rd4, %rd13;
+    st.global.f32 [%rd14], %f0;
+    add.u64       %rd14, %rd5, %rd13;
+    st.global.u32 [%rd14], %r7;
+    add.u64       %rd14, %rd6, %rd13;
+    st.global.u32 [%rd14], %r8;
+
+MAN_DONE:
+    ret;
+}

@@ -18,6 +18,8 @@ INPUT_DIR=""
 SIZE="28"
 GRID="1241"
 CLUSTERS="1"
+MANIFOLD="custom_manifold"
+MANIFOLD_LABEL="custom_geometric_domain"
 EXTRA_PREP_ARGS=()
 DEMO_MODE="0"
 
@@ -28,26 +30,30 @@ Usage:
   ./scripts/train_custom.sh --model <out.gllm> --demo
 
 Options:
-  --model <path.gllm>   Target checkpoint (creates new or incrementally appends to existing!)
-  --input <dir>         Folder containing one subfolder per class label (<dir>/<label>/*.*)
-  --size <N>            Resize images to N x N grayscale (default: 28; 28 enables interactive sketch match)
-  --grid <G>            3D sphere lattice grid dimension (default: 1241 -> ~1B implicit lattice points)
-  --clusters <K>        GPU spherical K-means sub-shadows per class (default: 1; e.g. 8 isolates variants)
-  --invert              Force intensity inversion (for dark drawings on white paper)
-  --auto-invert         Automatically detect & invert light-background images
-  --center              Tight-bbox center & scale-normalize ink before training
-  --demo                Generate & train a zero-dependency 3-class demo (circle, square, triangle)
+  --model <path.gllm>      Target checkpoint (creates new or incrementally appends to existing!)
+  --input <dir>            Folder containing one subfolder per class label (<dir>/<label>/*.*)
+  --size <N>               Resize images to N x N grayscale (default: 28; 28 enables interactive sketch match)
+  --grid <G>               3D sphere lattice grid dimension (default: 1241 -> ~1B implicit lattice points)
+  --clusters <K>           GPU spherical K-means sub-shadows per class (default: 1; e.g. 8 isolates variants)
+  --manifold <name>        Operational Manifold name (default: custom_manifold; demo: geometric_shapes)
+  --manifold-label <tag>   CUDA semantic metadata label for the manifold
+  --invert                 Force intensity inversion (for dark drawings on white paper)
+  --auto-invert            Automatically detect & invert light-background images
+  --center                 Tight-bbox center & scale-normalize ink before training
+  --demo                   Generate & train a zero-dependency 3-class demo (circle, square, triangle)
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)       MODEL="$2"; shift 2 ;;
-        --input)       INPUT_DIR="$2"; shift 2 ;;
-        --size)        SIZE="$2"; shift 2 ;;
-        --grid)        GRID="$2"; shift 2 ;;
-        --clusters)    CLUSTERS="$2"; shift 2 ;;
-        --invert)      EXTRA_PREP_ARGS+=("--invert"); shift ;;
+        --model)          MODEL="$2"; shift 2 ;;
+        --input)          INPUT_DIR="$2"; shift 2 ;;
+        --size)           SIZE="$2"; shift 2 ;;
+        --grid)           GRID="$2"; shift 2 ;;
+        --clusters)       CLUSTERS="$2"; shift 2 ;;
+        --manifold)       MANIFOLD="$2"; shift 2 ;;
+        --manifold-label) MANIFOLD_LABEL="$2"; shift 2 ;;
+        --invert)         EXTRA_PREP_ARGS+=("--invert"); shift ;;
         --auto-invert) EXTRA_PREP_ARGS+=("--auto-invert"); shift ;;
         --center)      EXTRA_PREP_ARGS+=("--center"); shift ;;
         --demo)        DEMO_MODE="1"; shift ;;
@@ -71,6 +77,10 @@ TMP_PGM="$(mktemp -d "${TMPDIR:-/tmp}/gllm_custom_XXXXXX")"
 trap 'rm -rf "${TMP_PGM}"' EXIT
 
 if [[ "${DEMO_MODE}" == "1" ]]; then
+    if [[ "${MANIFOLD}" == "custom_manifold" ]]; then
+        MANIFOLD="geometric_shapes"
+        MANIFOLD_LABEL="basic_2d_geometric_primitives"
+    fi
     python3 "${ROOT}/scripts/prepare_custom_dataset.py" --generate-demo "${TMP_PGM}" --size "${SIZE}"
     TRAIN_DIR="${TMP_PGM}"
 else
@@ -96,8 +106,9 @@ else
 fi
 
 echo ""
-echo "[TRAIN]  Accumulating geometric shadows into ${MODEL} on CUDA GPU (clusters=${CLUSTERS})..."
-"${ROOT}/bin/gllm_train" --model "${MODEL}" --folder "${TRAIN_DIR}" --grid "${GRID}" --clusters "${CLUSTERS}"
+echo "[TRAIN]  Accumulating geometric shadows into ${MODEL} on CUDA GPU (manifold=${MANIFOLD}, clusters=${CLUSTERS})..."
+"${ROOT}/bin/gllm_train" --model "${MODEL}" --folder "${TRAIN_DIR}" --grid "${GRID}" --clusters "${CLUSTERS}" \
+    --manifold "${MANIFOLD}" --manifold-label "${MANIFOLD_LABEL}"
 
 echo ""
 echo "[INSPECT] Serialized Outer-Shell Lookup Table:"

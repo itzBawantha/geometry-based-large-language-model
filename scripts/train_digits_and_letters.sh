@@ -25,27 +25,31 @@ rm -f "${MODEL}"
 export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
 
 echo ""
-echo "[STEP 1/3] Training MNIST digits (0-9) into ${MODEL} (K=${CLUSTERS} sub-shadows/class)..."
+echo "[STEP 1/3] Training MNIST digits (0-9) into Operational Manifold 'fundamental_text' (${MODEL}, K=${CLUSTERS})..."
 "${ROOT}/bin/gllm_train" \
     --model "${MODEL}" \
     --idx-images "${ROOT}/data/mnist/train-images-idx3-ubyte.gz" \
     --idx-labels "${ROOT}/data/mnist/train-labels-idx1-ubyte.gz" \
     --grid 1241 \
-    --clusters "${CLUSTERS}"
+    --clusters "${CLUSTERS}" \
+    --manifold fundamental_text \
+    --manifold-label handwritten_letters_and_numbers
 
 echo ""
-echo "[STEP 2/3] Incrementally appending EMNIST ByClass letters (A-Z, a-z) into ${MODEL} (K=${CLUSTERS} sub-shadows/class)..."
+echo "[STEP 2/3] Appending EMNIST ByClass letters (A-Z, a-z) into Operational Manifold 'fundamental_text' (K=${CLUSTERS})..."
 "${ROOT}/bin/gllm_train" \
     --model "${MODEL}" \
     --idx-images "${ROOT}/data/emnist_byclass/emnist-byclass-train-images-idx3-ubyte.gz" \
     --idx-labels "${ROOT}/data/emnist_byclass/emnist-byclass-train-labels-idx1-ubyte.gz" \
     --min-raw-label 10 --max-raw-label 61 --label-offset 10 --transpose \
     --clusters "${CLUSTERS}" \
+    --manifold fundamental_text \
+    --manifold-label handwritten_letters_and_numbers \
     --label-names A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z
 
 echo ""
-echo "[STEP 3/3] Verifying serialized outer-shell lookup table (first 20 rows)..."
-"${ROOT}/bin/gllm_inspect" --model "${MODEL}" | head -n 25
+echo "[STEP 3/3] Verifying serialized Operational Manifold & outer-shell lookup table..."
+"${ROOT}/bin/gllm_inspect" --model "${MODEL}" | awk 'NR<=28'
 
 echo ""
 echo "[DONE]   Next steps:"

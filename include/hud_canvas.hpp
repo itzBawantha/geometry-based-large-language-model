@@ -27,6 +27,8 @@ struct MatchSummary {
     uint32_t total_classes  = 0;
     uint32_t pruned_count   = 0;
     uint32_t survived_count = 0;
+    std::string manifold_name;                 // Routed Operational Manifold (e.g. "fundamental_text")
+    std::string manifold_semantic;             // CUDA semantic register (e.g. "handwritten_letters_and_numbers")
     std::vector<MatchResultRow> ranked;        // Surviving classes sorted by overlap desc
     std::vector<std::string>    pruned_labels; // Labels eliminated at Stage 1
 };
@@ -118,6 +120,9 @@ inline void glyph_5x7(char ch, uint8_t out[7]) {
         case '!': { uint8_t g[7]={0x04,0x04,0x04,0x04,0x04,0x00,0x04}; std::memcpy(out,g,7); break; }
         case '?': { uint8_t g[7]={0x0E,0x11,0x01,0x02,0x04,0x00,0x04}; std::memcpy(out,g,7); break; }
         case '|': { uint8_t g[7]={0x04,0x04,0x04,0x04,0x04,0x04,0x04}; std::memcpy(out,g,7); break; }
+        case '_': { uint8_t g[7]={0x00,0x00,0x00,0x00,0x00,0x00,0x1F}; std::memcpy(out,g,7); break; }
+        case '<': { uint8_t g[7]={0x02,0x04,0x08,0x10,0x08,0x04,0x02}; std::memcpy(out,g,7); break; }
+        case '>': { uint8_t g[7]={0x08,0x04,0x02,0x01,0x02,0x04,0x08}; std::memcpy(out,g,7); break; }
         default: break;
     }
 }
@@ -402,7 +407,10 @@ public:
         }
     }
 
-    void rebuild_texture(const MatchSummary& ms, uint32_t focused_class, uint32_t num_classes, uint32_t num_regions = 0) {
+    void rebuild_texture(const MatchSummary& ms, uint32_t focused_class, uint32_t num_classes,
+                         uint32_t num_regions = 0,
+                         const std::string& default_manifold = "",
+                         const std::string& default_semantic = "") {
         // Semi-transparent dark glass sidebar background
         fill_rect(0, 0, kPanelW, kPanelH, 10, 15, 28, 228);
         fill_rect(kPanelW - 2, 0, 2, kPanelH, 42, 96, 148, 200);
@@ -454,17 +462,24 @@ public:
         stroke_rect(18, 330, 300, 96, 52, 92, 138, 255);
 
         if (!ms.has_result) {
-            draw_text(30, 348, "DRAW ANY DIGIT OR LETTER", 1, 175, 205, 235);
-            draw_text(30, 366, "THEN CLICK CAPTURE (ENTER)", 1, 125, 195, 245);
+            draw_text(30, 344, "DRAW INSIDE GUIDE -> CAPTURE", 1, 175, 205, 235);
             char buf[64];
             if (num_regions > num_classes) {
                 std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES (%u SHADOWS)", num_classes, num_regions);
             } else {
                 std::snprintf(buf, sizeof(buf), "MODEL: %u CLASSES IN 1B SPHERE", num_classes);
             }
-            draw_text(30, 392, buf, 1, 135, 160, 195);
+            draw_text(30, 364, buf, 1, 135, 165, 200);
+            if (!default_manifold.empty()) {
+                std::string mline = "MANIFOLD: " + default_manifold.substr(0, 32);
+                draw_text(30, 384, mline, 1, 100, 230, 255);
+            }
+            if (!default_semantic.empty()) {
+                std::string sline = "CUDA: " + default_semantic.substr(0, 36);
+                draw_text(30, 402, sline, 1, 140, 195, 220);
+            }
         } else {
-            char hdr[64], sub1[64], sub2[64];
+            char hdr[64], sub1[64];
             if (ms.is_unknown || ms.ranked.empty()) {
                 draw_text(28, 342, "UNKNOWN / UNTRAINED", 2, 255, 120, 90);
                 float top_ov = ms.ranked.empty() ? 0.0f : ms.ranked[0].overlap_pct;
@@ -473,23 +488,21 @@ public:
             } else {
                 const auto& w = ms.ranked[0];
                 std::snprintf(hdr, sizeof(hdr), "MATCH: '%s'  #%.1f", w.label.c_str(), static_cast<float>(w.outer_idx));
-                draw_text(28, 342, hdr, 2, 120, 255, 195);
-                std::snprintf(sub1, sizeof(sub1), "OVERLAP %.1f%% | PROB %.1f%% | %.3f ms",
+                draw_text(28, 340, hdr, 2, 120, 255, 195);
+                std::snprintf(sub1, sizeof(sub1), "OVERLAP %.1f%% | PROB %.1f%% | %.2fms",
                               w.overlap_pct, w.rel_prob_pct, ms.cuda_ms);
-                draw_text(28, 368, sub1, 1, 200, 235, 255);
+                draw_text(28, 364, sub1, 1, 200, 235, 255);
             }
-            std::snprintf(sub2, sizeof(sub2), "PRUNED (STAGE 1): %u / %u CLASSES",
-                          ms.pruned_count, ms.total_classes);
-            draw_text(28, 386, sub2, 1, 255, 185, 110);
-
-            // Compact preview of pruned labels
-            std::string plist = "DROPPED: ";
-            for (size_t i = 0; i < ms.pruned_labels.size() && plist.size() < 42; ++i) {
-                if (i > 0) plist += " ";
-                plist += ms.pruned_labels[i];
+            if (!ms.manifold_name.empty()) {
+                char mline[64];
+                std::snprintf(mline, sizeof(mline), "MANIFOLD: %s (%u/%u PRUNED)",
+                              ms.manifold_name.substr(0, 18).c_str(), ms.pruned_count, ms.total_classes);
+                draw_text(28, 382, mline, 1, 100, 230, 255);
             }
-            if (ms.pruned_labels.size() > 14) plist += "..";
-            draw_text(28, 404, plist, 1, 150, 165, 190);
+            if (!ms.manifold_semantic.empty()) {
+                std::string sline = "CUDA: " + ms.manifold_semantic.substr(0, 36);
+                draw_text(28, 400, sline, 1, 255, 195, 115);
+            }
         }
 
         // 5. Top-10 Ranked Overlap Bars
@@ -525,8 +538,8 @@ public:
         }
 
         // Footer hint
-        draw_text(20, 800, "DRAG RIGHT: ORBIT 3D | Z: ZOOM", 1, 115, 150, 185);
-        draw_text(20, 816, "H: HEATMAP | UP/DN: OUTER SHELL", 1, 115, 150, 185);
+        draw_text(20, 800, "DRAG RIGHT: ORBIT | M: MANIFOLD", 1, 115, 150, 185);
+        draw_text(20, 816, "H: HEATMAP | Z: ZOOM | UP/DN: SHELL", 1, 115, 150, 185);
         dirty_tex = false;
     }
 };

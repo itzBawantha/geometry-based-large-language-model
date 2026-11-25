@@ -248,6 +248,25 @@ out vec4 fragColor;
 void main() { fragColor = vColor; }
 )GLSL";
 
+static const char* kManifoldVertSrc = R"GLSL(
+#version 460 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aColor;
+uniform mat4 uMVP;
+out vec4 vColor;
+void main() {
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    vColor = aColor;
+}
+)GLSL";
+
+static const char* kManifoldFragSrc = R"GLSL(
+#version 460 core
+in vec4 vColor;
+out vec4 fragColor;
+void main() { fragColor = vColor; }
+)GLSL";
+
 static const char* kSidebarVertSrc = R"GLSL(
 #version 460 core
 uniform vec4 uRect; // x0, y0, x1, y1 in NDC
@@ -455,19 +474,31 @@ int main(int argc, char** argv) {
     CU_CHECK(cuCtxCreate_v2(&cu_ctx, 0, dev));
 
     CUmodule mod = gllm::load_gllm_ptx_module();
-    CUfunction fn_shell = nullptr, fn_emit = nullptr, fn_match = nullptr;
+    CUfunction fn_shell = nullptr, fn_emit = nullptr, fn_match = nullptr, fn_route = nullptr;
     CU_CHECK(cuModuleGetFunction(&fn_shell, mod, "init_outer_shell_dynamic"));
     CU_CHECK(cuModuleGetFunction(&fn_emit,  mod, "emit_allocated_regions"));
     CU_CHECK(cuModuleGetFunction(&fn_match, mod, "match_sketch_pruned"));
+    CU_CHECK(cuModuleGetFunction(&fn_route, mod, "route_operational_manifolds"));
 
     CUevent ev_s = nullptr, ev_e = nullptr;
     CU_CHECK(cuEventCreate(&ev_s, 0));
     CU_CHECK(cuEventCreate(&ev_e, 0));
 
-    // Upload GPU model & matcher buffers
+    // Build GPU-resident Operational Manifold Metadata Register table (128 bytes/manifold in VRAM)
+    auto h_manifolds = model.build_gpu_manifold_table();
+    if (h_manifolds.empty()) {
+        model.recompute_manifold_envelopes();
+        h_manifolds = model.build_gpu_manifold_table();
+    }
+    uint32_t num_manifolds = static_cast<uint32_t>(h_manifolds.size());
+    std::vector<uint32_t> h_reg_manifold(num_regions, 0u);
+    for (uint32_t r = 0; r < num_regions; ++r) h_reg_manifold[r] = model.classes[r].manifold_id;
+
+    // Upload GPU model, matcher & Operational Manifold metadata buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_counter = 0;
     CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0, d_sketch_raw = 0, d_sketch_ent = 0;
     CUdeviceptr d_out_ov = 0, d_out_st = 0;
+    CUdeviceptr d_manifolds = 0, d_reg_manifold = 0, d_man_score = 0, d_man_reg = 0, d_man_act = 0;
     CU_CHECK(cuMemAlloc_v2(&d_regions, h_regions.size() * sizeof(gllm::GpuRegionDesc)));
     CU_CHECK(cuMemcpyHtoD_v2(d_regions, h_regions.data(), h_regions.size() * sizeof(gllm::GpuRegionDesc)));
     CU_CHECK(cuMemAlloc_v2(&d_outer, h_outer.size() * sizeof(gllm::GpuOuterPoint)));
@@ -488,6 +519,16 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemAlloc_v2(&d_sketch_ent, static_cast<size_t>(kNumShifts) * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_ov, num_regions * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_out_st, num_regions * sizeof(uint32_t)));
+
+    CU_CHECK(cuMemAlloc_v2(&d_manifolds, std::max<size_t>(1, h_manifolds.size()) * sizeof(gllm::GpuManifoldDesc)));
+    if (!h_manifolds.empty()) {
+        CU_CHECK(cuMemcpyHtoD_v2(d_manifolds, h_manifolds.data(), h_manifolds.size() * sizeof(gllm::GpuManifoldDesc)));
+    }
+    CU_CHECK(cuMemAlloc_v2(&d_reg_manifold, num_regions * sizeof(uint32_t)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_reg_manifold, h_reg_manifold.data(), num_regions * sizeof(uint32_t)));
+    CU_CHECK(cuMemAlloc_v2(&d_man_score, std::max<uint32_t>(1u, num_manifolds) * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_man_reg,   std::max<uint32_t>(1u, num_manifolds) * sizeof(uint32_t)));
+    CU_CHECK(cuMemAlloc_v2(&d_man_act,   std::max<uint32_t>(1u, num_manifolds) * sizeof(uint32_t)));
 
     // --- VBO 1: Permanent 1,200,000-point outer sphere ---
     uint32_t total_outer = model.outer_shell_pts;
@@ -561,6 +602,50 @@ int main(int argc, char** argv) {
     glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(LinkVert), reinterpret_cast<void*>(28));
     glBindVertexArray(0);
 
+    // --- VBO 4: Operational Manifold Deformed-Sphere Envelopes (translucent glass + geodesic wireframe) ---
+    struct ManVert { float x, y, z, r, g, b, a; };
+    std::vector<ManVert> man_tris, man_wires;
+    {
+        const auto& geo = gllm::unit_geodesic_sphere();
+        for (const auto& m : model.manifolds) {
+            if (m.max_radius <= 1e-6f) continue;
+            float ph = m.manifold_id * 2.1f;
+            float cr = (m.manifold_id == 0u) ? 0.22f : (0.55f + 0.40f * std::cos(ph));
+            float cg = (m.manifold_id == 0u) ? 0.86f : (0.55f + 0.40f * std::cos(ph + 2.094f));
+            float cb = (m.manifold_id == 0u) ? 1.00f : (0.55f + 0.40f * std::cos(ph + 4.188f));
+            auto vpos = [&](uint32_t vi, float alpha) -> ManVert {
+                float rad = m.deformed_radii[vi];
+                return {
+                    m.center_x + geo.dirs[vi * 3 + 0] * rad,
+                    m.center_y + geo.dirs[vi * 3 + 1] * rad,
+                    m.center_z + geo.dirs[vi * 3 + 2] * rad,
+                    cr, cg, cb, alpha
+                };
+            };
+            for (size_t t = 0; t < geo.tris.size(); t += 3) {
+                man_tris.push_back(vpos(geo.tris[t + 0], 0.055f));
+                man_tris.push_back(vpos(geo.tris[t + 1], 0.055f));
+                man_tris.push_back(vpos(geo.tris[t + 2], 0.055f));
+            }
+            for (size_t e = 0; e < geo.edges.size(); e += 2) {
+                man_wires.push_back(vpos(geo.edges[e + 0], 0.28f));
+                man_wires.push_back(vpos(geo.edges[e + 1], 0.28f));
+            }
+        }
+    }
+    GLuint man_tri_vao = 0, man_tri_vbo = 0, man_wire_vao = 0, man_wire_vbo = 0;
+    glGenVertexArrays(1, &man_tri_vao); glGenBuffers(1, &man_tri_vbo);
+    glBindVertexArray(man_tri_vao); glBindBuffer(GL_ARRAY_BUFFER, man_tri_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(man_tris.size() * sizeof(ManVert)), man_tris.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(ManVert), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(ManVert), reinterpret_cast<void*>(12));
+    glGenVertexArrays(1, &man_wire_vao); glGenBuffers(1, &man_wire_vbo);
+    glBindVertexArray(man_wire_vao); glBindBuffer(GL_ARRAY_BUFFER, man_wire_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(man_wires.size() * sizeof(ManVert)), man_wires.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(ManVert), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(ManVert), reinterpret_cast<void*>(12));
+    glBindVertexArray(0);
+
     // Sidebar RGBA8 texture
     GLuint sidebar_tex = 0;
     glGenTextures(1, &sidebar_tex);
@@ -575,11 +660,12 @@ int main(int argc, char** argv) {
     GLuint empty_vao = 0;
     glGenVertexArrays(1, &empty_vao);
 
-    GLuint bg_prog      = link_program(kBgVertSrc, kBgFragSrc);
-    GLuint shell_prog   = link_program(kShellVertSrc, kShellFragSrc);
-    GLuint lat_prog     = link_program(kLatticeVertSrc, kLatticeFragSrc);
-    GLuint link_prog    = link_program(kLinkVertSrc, kLinkFragSrc);
-    GLuint sidebar_prog = link_program(kSidebarVertSrc, kSidebarFragSrc);
+    GLuint bg_prog       = link_program(kBgVertSrc, kBgFragSrc);
+    GLuint shell_prog    = link_program(kShellVertSrc, kShellFragSrc);
+    GLuint lat_prog      = link_program(kLatticeVertSrc, kLatticeFragSrc);
+    GLuint link_prog     = link_program(kLinkVertSrc, kLinkFragSrc);
+    GLuint manifold_prog = link_program(kManifoldVertSrc, kManifoldFragSrc);
+    GLuint sidebar_prog  = link_program(kSidebarVertSrc, kSidebarFragSrc);
 
     GLint u_sh_mvp   = glGetUniformLocation(shell_prog, "uMVP");
     GLint u_sh_cam   = glGetUniformLocation(shell_prog, "uCamPos");
@@ -597,10 +683,13 @@ int main(int argc, char** argv) {
     GLint u_lk_foc   = glGetUniformLocation(link_prog, "uFocusClass");
     GLint u_lk_num   = glGetUniformLocation(link_prog, "uNumClasses");
 
+    GLint u_mn_mvp   = glGetUniformLocation(manifold_prog, "uMVP");
     GLint u_sb_rect  = glGetUniformLocation(sidebar_prog, "uRect");
 
     gllm::SketchSidebarHUD hud;
     gllm::MatchSummary match_summary;
+    std::string primary_manifold_name = h_manifolds.empty() ? "" : std::string(h_manifolds[0].name);
+    std::string primary_manifold_sem  = h_manifolds.empty() ? "" : std::string(h_manifolds[0].semantic_label);
 
     float close_dist  = std::clamp(max_alloc_radius * 2.55f, 0.35f, 2.2f);
     float cam_dist    = (init_dist > 0.0f) ? init_dist : close_dist;
@@ -614,9 +703,10 @@ int main(int argc, char** argv) {
     bool orbit_dragging  = false;
     bool canvas_drawing  = false;
     float prev_cx = 0.0f, prev_cy = 0.0f;
-    bool auto_rot   = true;
-    bool show_links = true;
-    bool dirty_lat  = true;
+    bool auto_rot      = true;
+    bool show_links    = true;
+    bool show_manifold = true;
+    bool dirty_lat     = true;
 
     // -------------------------------------------------------------------------
     // Run 2-Stage CUDA Non-Linear Bernoulli Log-Likelihood Match on 28x28 Sketch!
@@ -667,6 +757,13 @@ int main(int argc, char** argv) {
         };
         CU_CHECK(cuEventRecord(ev_s, nullptr));
         CU_CHECK(cuLaunchKernel(fn_match, (num_regions + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, m_params, nullptr));
+        if (num_manifolds > 0u) {
+            void* r_params[] = {
+                &d_manifolds, &d_reg_manifold, &d_out_ov, &d_out_st,
+                &d_man_score, &d_man_reg, &d_man_act, &num_manifolds, &num_regions
+            };
+            CU_CHECK(cuLaunchKernel(fn_route, (num_manifolds + 31u) / 32u, 1, 1, 32, 1, 1, 0, nullptr, r_params, nullptr));
+        }
         CU_CHECK(cuEventRecord(ev_e, nullptr));
         CU_CHECK(cuEventSynchronize(ev_e));
 
@@ -677,6 +774,20 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> h_st(num_regions);
         CU_CHECK(cuMemcpyDtoH_v2(h_ov.data(), d_out_ov, num_regions * sizeof(float)));
         CU_CHECK(cuMemcpyDtoH_v2(h_st.data(), d_out_st, num_regions * sizeof(uint32_t)));
+
+        // Read back GPU-routed winning Operational Manifold from CUDA metadata register!
+        std::string routed_man_name = primary_manifold_name;
+        std::string routed_man_sem  = primary_manifold_sem;
+        if (num_manifolds > 0u) {
+            std::vector<float> h_ms(num_manifolds, 0.0f);
+            CU_CHECK(cuMemcpyDtoH_v2(h_ms.data(), d_man_score, num_manifolds * sizeof(float)));
+            uint32_t best_m = 0;
+            for (uint32_t m = 1; m < num_manifolds; ++m) {
+                if (h_ms[m] > h_ms[best_m]) best_m = m;
+            }
+            routed_man_name = h_manifolds[best_m].name;
+            routed_man_sem  = h_manifolds[best_m].semantic_label;
+        }
 
         // Aggregate sub-shadow variant scores per unique class (max-pool across each class's K clusters!)
         struct ClsAgg { float best_ov = -1.0f; uint32_t survived = 0; uint32_t total = 0; };
@@ -696,9 +807,11 @@ int main(int argc, char** argv) {
         }
 
         match_summary = gllm::MatchSummary{};
-        match_summary.has_result    = true;
-        match_summary.cuda_ms       = ms;
-        match_summary.total_classes = num_classes;
+        match_summary.has_result        = true;
+        match_summary.cuda_ms           = ms;
+        match_summary.total_classes     = num_classes;
+        match_summary.manifold_name     = routed_man_name;
+        match_summary.manifold_semantic = routed_man_sem;
 
         for (uint32_t oid : unique_outer_ids) {
             const auto& a = agg[oid];
@@ -887,6 +1000,7 @@ int main(int argc, char** argv) {
                 else if (k == SDLK_LEFT)  { focus_cls = (focus_cls >= no_focus) ? max_outer_id : ((focus_cls + max_outer_id) % (max_outer_id + 1u)); dirty_lat = true; hud.dirty_tex = true; }
                 else if (k == SDLK_h) { heatmap_mode = 1u - heatmap_mode; dirty_lat = true; }
                 else if (k == SDLK_l) show_links = !show_links;
+                else if (k == SDLK_m) show_manifold = !show_manifold;
                 else if (k == SDLK_a) auto_rot = !auto_rot;
                 else if (k == SDLK_z) cam_dist = (cam_dist > close_dist * 1.4f) ? close_dist : 2.65f;
                 else if (k == SDLK_UP)   shell_alpha = std::min(1.0f, shell_alpha + 0.08f);
@@ -925,7 +1039,8 @@ int main(int argc, char** argv) {
         }
 
         if (hud.dirty_tex) {
-            hud.rebuild_texture(match_summary, focus_cls, num_classes, num_regions);
+            hud.rebuild_texture(match_summary, focus_cls, num_classes, num_regions,
+                                primary_manifold_name, primary_manifold_sem);
             glBindTexture(GL_TEXTURE_2D, sidebar_tex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gllm::SketchSidebarHUD::kPanelW, gllm::SketchSidebarHUD::kPanelH,
                             GL_RGBA, GL_UNSIGNED_BYTE, hud.rgba.data());
@@ -980,6 +1095,17 @@ int main(int argc, char** argv) {
         glUniform1f(u_lt_vh, static_cast<float>(win_h));
         glBindVertexArray(lat_vao);
         glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(emitted_pts));
+
+        if (show_manifold && !man_wires.empty()) {
+            glUseProgram(manifold_prog);
+            glUniformMatrix4fv(u_mn_mvp, 1, GL_FALSE, mvp.m);
+            if (!man_tris.empty()) {
+                glBindVertexArray(man_tri_vao);
+                glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(man_tris.size()));
+            }
+            glBindVertexArray(man_wire_vao);
+            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(man_wires.size()));
+        }
 
         glUseProgram(shell_prog);
         glUniformMatrix4fv(u_sh_mvp, 1, GL_FALSE, mvp.m);
@@ -1044,6 +1170,11 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemFree_v2(d_sketch_ent));
     CU_CHECK(cuMemFree_v2(d_out_ov));
     CU_CHECK(cuMemFree_v2(d_out_st));
+    CU_CHECK(cuMemFree_v2(d_manifolds));
+    CU_CHECK(cuMemFree_v2(d_reg_manifold));
+    CU_CHECK(cuMemFree_v2(d_man_score));
+    CU_CHECK(cuMemFree_v2(d_man_reg));
+    CU_CHECK(cuMemFree_v2(d_man_act));
     CU_CHECK(cuEventDestroy_v2(ev_s));
     CU_CHECK(cuEventDestroy_v2(ev_e));
     CU_CHECK(cuModuleUnload(mod));

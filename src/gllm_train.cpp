@@ -41,9 +41,11 @@ static void print_usage() {
     std::cout << "Usage:\n"
               << "  gllm_train --model <path.gllm> --idx-images <img.gz> --idx-labels <lbl.gz>\n"
               << "             [--grid 1241] [--clusters 1] [--cluster-iters 10]\n"
+              << "             [--manifold fundamental_text] [--manifold-label handwritten_letters_and_numbers]\n"
               << "             [--label-names 0,1,...,9] [--label-offset 0] [--transpose]\n"
               << "             [--min-raw-label N] [--max-raw-label M]\n"
-              << "  gllm_train --model <path.gllm> --folder <class_subfolders_dir> [--grid 1241] [--clusters 1]\n";
+              << "  gllm_train --model <path.gllm> --folder <class_subfolders_dir> [--grid 1241] [--clusters 1]\n"
+              << "             [--manifold <name>] [--manifold-label <cuda_semantic_label>]\n";
 }
 
 // L2-normalize an 8-bit image into float vector; returns false if empty
@@ -75,6 +77,8 @@ int main(int argc, char** argv) {
     uint32_t grid_dim      = 1241; // ~1,000,722,000 implicit points inside the unit sphere
     uint32_t num_clusters  = 1;    // K=1 single averaged shadow; K>1 multi-shadow geometric clustering
     uint32_t cluster_iters = 10;
+    std::string manifold_name  = "fundamental_text";
+    std::string manifold_label = "handwritten_letters_and_numbers";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -89,6 +93,8 @@ int main(int argc, char** argv) {
         else if (a == "--grid" && i + 1 < argc) grid_dim = static_cast<uint32_t>(std::atoi(argv[++i]));
         else if (a == "--clusters" && i + 1 < argc) num_clusters = std::max<uint32_t>(1u, static_cast<uint32_t>(std::atoi(argv[++i])));
         else if (a == "--cluster-iters" && i + 1 < argc) cluster_iters = std::max<uint32_t>(1u, static_cast<uint32_t>(std::atoi(argv[++i])));
+        else if (a == "--manifold" && i + 1 < argc) manifold_name = argv[++i];
+        else if (a == "--manifold-label" && i + 1 < argc) manifold_label = argv[++i];
         else if (a == "--transpose") transpose = true;
         else if (a == "--help" || a == "-h") { print_usage(); return 0; }
     }
@@ -148,6 +154,10 @@ int main(int argc, char** argv) {
     constexpr uint32_t kMaxBatch = 65536u;
     float total_gpu_ms = 0.0f;
 
+    uint32_t target_manifold_id = model.find_or_create_manifold(manifold_name, manifold_label);
+    std::cout << "[MANIFOLD] Active Operational Manifold #" << target_manifold_id
+              << ": name='" << manifold_name << "' | CUDA semantic_label='" << manifold_label << "'\n";
+
     if (num_clusters <= 1u) {
         // =====================================================================
         // Mode A: Single Averaged Shadow per Class (100% backwards-compatible)
@@ -157,7 +167,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < ds.unique_labels.size(); ++i) {
             const auto& lbl = ds.unique_labels[i];
             bool existed = (model.find_class(lbl) >= 0);
-            int mid = model.register_or_get_class(lbl, ds.width, ds.height);
+            int mid = model.register_or_get_class(lbl, ds.width, ds.height, target_manifold_id);
             local_to_model[i] = mid;
             label_to_local[lbl] = static_cast<uint32_t>(i);
             const auto& rec = model.classes[static_cast<size_t>(mid)];
@@ -364,7 +374,7 @@ int main(int argc, char** argv) {
             uint32_t shared_outer = 0;
             for (uint32_t k = 0; k < K; ++k) {
                 if (h_cnt[k] == 0u) continue;
-                int mid = model.allocate_subshadow(lbl, ds.width, ds.height);
+                int mid = model.allocate_subshadow(lbl, ds.width, ds.height, target_manifold_id);
                 auto& rec = model.classes[static_cast<size_t>(mid)];
                 rec.train_count = h_cnt[k];
                 float pk = 0.0f;
@@ -387,6 +397,15 @@ int main(int argc, char** argv) {
             CU_CHECK(cuMemFree_v2(d_sum));
             CU_CHECK(cuMemFree_v2(d_cnt));
         }
+    }
+
+    // Recompute exact tight-fitting deformed-sphere Operational Manifold envelopes before saving
+    model.recompute_manifold_envelopes();
+    for (const auto& m : model.manifolds) {
+        std::printf("[MANIFOLD] #%u '%s' (CUDA: '%s') | tight lattice [%u..%u, %u..%u, %u..%u] | maxR=%.4f | vol=%.4f%% of 1B sphere\n",
+                    m.manifold_id, m.name.c_str(), m.semantic_label.c_str(),
+                    m.min_lx, m.max_lx, m.min_ly, m.max_ly, m.min_lz, m.max_lz,
+                    m.max_radius, m.volume_fraction * 100.0f);
     }
 
     std::cout << "\n[CUDA]   Total GPU kernel time on " << gpu_name << ": " << total_gpu_ms << " ms\n";
