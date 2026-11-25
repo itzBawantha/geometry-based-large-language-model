@@ -41,7 +41,10 @@ static void print_usage() {
     std::cout << "Usage:\n"
               << "  gllm_train --model <path.gllm> --idx-images <img.gz> --idx-labels <lbl.gz>\n"
               << "             [--grid 1241] [--clusters 1] [--cluster-iters 10]\n"
-              << "             [--manifold fundamental_text] [--manifold-label handwritten_letters_and_numbers]\n"
+              << "             [--manifold handwritten/numbers] [--manifold-label handwritten_numbers]\n"
+              << "             [--manifold-concept numbers] [--parent-manifold handwritten]\n"
+              << "             [--parent-concept handwritten] [--parent-label handwritten_alphanumeric]\n"
+              << "             [--envelope-box] [--anchor x,y,z]\n"
               << "             [--label-names 0,1,...,9] [--label-offset 0] [--transpose]\n"
               << "             [--min-raw-label N] [--max-raw-label M]\n"
               << "  gllm_train --model <path.gllm> --folder <class_subfolders_dir> [--grid 1241] [--clusters 1]\n"
@@ -77,8 +80,15 @@ int main(int argc, char** argv) {
     uint32_t grid_dim      = 1241; // ~1,000,722,000 implicit points inside the unit sphere
     uint32_t num_clusters  = 1;    // K=1 single averaged shadow; K>1 multi-shadow geometric clustering
     uint32_t cluster_iters = 10;
-    std::string manifold_name  = "fundamental_text";
-    std::string manifold_label = "handwritten_letters_and_numbers";
+    std::string manifold_name   = "fundamental_text";
+    std::string manifold_label  = "handwritten_letters_and_numbers";
+    std::string manifold_concept;
+    std::string parent_manifold_name;
+    std::string parent_concept;
+    std::string parent_label;
+    bool envelope_box = false;
+    bool has_anchor   = false;
+    uint32_t anchor_x = 620, anchor_y = 620, anchor_z = 620;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -95,6 +105,20 @@ int main(int argc, char** argv) {
         else if (a == "--cluster-iters" && i + 1 < argc) cluster_iters = std::max<uint32_t>(1u, static_cast<uint32_t>(std::atoi(argv[++i])));
         else if (a == "--manifold" && i + 1 < argc) manifold_name = argv[++i];
         else if (a == "--manifold-label" && i + 1 < argc) manifold_label = argv[++i];
+        else if (a == "--manifold-concept" && i + 1 < argc) manifold_concept = argv[++i];
+        else if (a == "--parent-manifold" && i + 1 < argc) parent_manifold_name = argv[++i];
+        else if (a == "--parent-concept" && i + 1 < argc) parent_concept = argv[++i];
+        else if (a == "--parent-label" && i + 1 < argc) parent_label = argv[++i];
+        else if (a == "--envelope-box") envelope_box = true;
+        else if (a == "--anchor" && i + 1 < argc) {
+            auto parts = split_csv(argv[++i]);
+            if (parts.size() == 3) {
+                anchor_x = static_cast<uint32_t>(std::atoi(parts[0].c_str()));
+                anchor_y = static_cast<uint32_t>(std::atoi(parts[1].c_str()));
+                anchor_z = static_cast<uint32_t>(std::atoi(parts[2].c_str()));
+                has_anchor = true;
+            }
+        }
         else if (a == "--transpose") transpose = true;
         else if (a == "--help" || a == "-h") { print_usage(); return 0; }
     }
@@ -154,7 +178,49 @@ int main(int argc, char** argv) {
     constexpr uint32_t kMaxBatch = 65536u;
     float total_gpu_ms = 0.0f;
 
+    uint32_t parent_id = gllm::kInvalidId;
+    uint32_t mid_lat = model.lattice_grid / 2u;
+    if (!parent_manifold_name.empty()) {
+        int pi = model.find_manifold_by_name(parent_manifold_name);
+        if (pi >= 0) {
+            parent_id = model.manifolds[pi].manifold_id;
+        } else {
+            uint32_t pid = 0u;
+            for (const auto& m : model.manifolds) pid = std::max(pid, m.manifold_id + 1u);
+            gllm::ManifoldRecord pm;
+            pm.manifold_id        = pid;
+            pm.parent_manifold_id = gllm::kInvalidId;
+            pm.depth              = 0u;
+            pm.envelope_mode      = envelope_box ? 1u : 0u;
+            pm.name               = parent_manifold_name;
+            pm.concept_label      = parent_concept.empty() ? parent_manifold_name : parent_concept;
+            pm.semantic_label     = parent_label.empty() ? pm.concept_label : parent_label;
+            pm.anchor_x           = mid_lat; pm.anchor_y = mid_lat; pm.anchor_z = mid_lat;
+            pm.outer_idx          = gllm::kInvalidId; // Bound to outer shell AFTER classes so digits keep 0..9!
+            model.manifolds.push_back(std::move(pm));
+            parent_id = pid;
+        }
+    }
+
+    // Clear manifold-only outer indices before allocating new class nodes so classes stay contiguous (0..61)
+    // and manifold concept nodes are cleanly placed immediately after them (#62, #63, #64...)
+    if (envelope_box || !manifold_concept.empty() || !parent_manifold_name.empty()) {
+        for (auto& m : model.manifolds) m.outer_idx = gllm::kInvalidId;
+    }
+
     uint32_t target_manifold_id = model.find_or_create_manifold(manifold_name, manifold_label);
+    for (auto& m : model.manifolds) {
+        if (m.manifold_id == target_manifold_id) {
+            if (parent_id != gllm::kInvalidId) {
+                m.parent_manifold_id = parent_id;
+                if (const auto* pm = model.get_manifold(parent_id)) m.depth = pm->depth + 1u;
+            }
+            if (envelope_box) m.envelope_mode = 1u;
+            if (!manifold_concept.empty()) m.concept_label = manifold_concept;
+            if (has_anchor) { m.anchor_x = anchor_x; m.anchor_y = anchor_y; m.anchor_z = anchor_z; }
+            break;
+        }
+    }
     std::cout << "[MANIFOLD] Active Operational Manifold #" << target_manifold_id
               << ": name='" << manifold_name << "' | CUDA semantic_label='" << manifold_label << "'\n";
 
@@ -399,11 +465,63 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Recompute exact tight-fitting deformed-sphere Operational Manifold envelopes before saving
+    // Bind hierarchical 3D-box manifolds to additional outer-shell concept nodes (placed AFTER class indices!)
+    // So existing digit/letter nodes (0..61) stay untouched while e.g. handwritten/numbers/letters get #62, #63, #64.
+    if (envelope_box || !manifold_concept.empty() || !parent_manifold_name.empty()) {
+        // Place hierarchical manifold concept nodes cleanly along a raised upper crown arc above the character cap
+        auto place_manifold_crown = [](uint32_t rank, float& ox, float& oy, float& oz) {
+            float tx = 0.0f, ty = 0.93f;
+            if (rank == 0u)      { tx =  0.00f; ty = 0.94f; } // root (e.g. handwritten)
+            else if (rank == 1u) { tx = -0.34f; ty = 0.87f; } // left child (e.g. numbers)
+            else if (rank == 2u) { tx =  0.34f; ty = 0.87f; } // right child (e.g. letters)
+            else {
+                constexpr float kGolden = 2.39996322972865332f;
+                tx = 0.38f * std::cos(rank * kGolden);
+                ty = 0.85f - 0.08f * std::sin(rank * kGolden);
+            }
+            float xy2 = tx * tx + ty * ty;
+            if (xy2 > 0.96f) { float s = std::sqrt(0.96f / xy2); tx *= s; ty *= s; xy2 = tx * tx + ty * ty; }
+            ox = tx; oy = ty; oz = std::sqrt(std::max(0.0f, 1.0f - xy2));
+        };
+        // Re-anchor any already-bound manifold outer indices if new classes were appended after them
+        uint32_t max_cls_outer = 0u;
+        bool any_cls = false;
+        for (const auto& c : model.classes) {
+            if (!any_cls || c.outer_idx > max_cls_outer) max_cls_outer = c.outer_idx;
+            any_cls = true;
+        }
+        uint32_t next_man_outer = any_cls ? (max_cls_outer + 1u) : 0u;
+        uint32_t rank = 0u;
+        std::map<std::string, uint32_t> concept_to_oid;
+        for (auto& m : model.manifolds) {
+            if (m.envelope_mode != 1u && m.concept_label.empty()) continue;
+            std::string cw = m.concept_label.empty() ? m.name : m.concept_label;
+            m.concept_label = cw;
+            auto it = concept_to_oid.find(cw);
+            if (it != concept_to_oid.end()) {
+                m.outer_idx = it->second;
+                for (const auto& prev : model.manifolds) {
+                    if (prev.outer_idx == m.outer_idx) {
+                        m.outer_x = prev.outer_x; m.outer_y = prev.outer_y; m.outer_z = prev.outer_z;
+                        break;
+                    }
+                }
+            } else {
+                m.outer_idx = next_man_outer++;
+                concept_to_oid[cw] = m.outer_idx;
+                place_manifold_crown(rank++, m.outer_x, m.outer_y, m.outer_z);
+            }
+        }
+    }
+
+    // Recompute exact tight-fitting Operational Manifold envelopes before saving
     model.recompute_manifold_envelopes();
     for (const auto& m : model.manifolds) {
-        std::printf("[MANIFOLD] #%u '%s' (CUDA: '%s') | tight lattice [%u..%u, %u..%u, %u..%u] | maxR=%.4f | vol=%.4f%% of 1B sphere\n",
+        std::printf("[MANIFOLD] #%u '%s' (CUDA: '%s', outer=#%s '%s', %s) | tight lattice [%u..%u, %u..%u, %u..%u] | maxR=%.4f | vol=%.4f%% of 1B sphere\n",
                     m.manifold_id, m.name.c_str(), m.semantic_label.c_str(),
+                    (m.outer_idx == gllm::kInvalidId ? "-" : std::to_string(m.outer_idx).c_str()),
+                    m.concept_label.c_str(),
+                    (m.envelope_mode == 1u ? "3D-Box" : "Deformed"),
                     m.min_lx, m.max_lx, m.min_ly, m.max_ly, m.min_lz, m.max_lz,
                     m.max_radius, m.volume_fraction * 100.0f);
     }

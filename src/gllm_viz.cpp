@@ -13,6 +13,7 @@
 #include "../include/gaussian_pyramid.hpp"
 #include "../include/gllm_model.hpp"
 #include "../include/hud_canvas.hpp"
+#include "../include/inference_dispatcher.hpp"
 
 #include <SDL2/SDL.h>
 #define GL_GLEXT_PROTOTYPES
@@ -368,6 +369,7 @@ int main(int argc, char** argv) {
     float init_dist = -1.0f;
     float prune_ratio = 0.68f; // Stage-1 64-bit canonical mask overlap ratio threshold
 
+    std::vector<std::string> cli_enable_manifolds, cli_disable_manifolds;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--model" && i + 1 < argc) model_path = argv[++i];
@@ -382,6 +384,8 @@ int main(int argc, char** argv) {
         else if (a == "--bench-rate" && i + 1 < argc) bench_rate_ips = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.5f, 120.0f);
         else if (a == "--test-img" && i + 2 < argc) { test_idx_img = argv[++i]; test_idx_pos = std::atoi(argv[++i]); }
         else if (a == "--test-transpose") test_transpose = true;
+        else if (a == "--enable-manifold" && i + 1 < argc) cli_enable_manifolds.push_back(argv[++i]);
+        else if (a == "--disable-manifold" && i + 1 < argc) cli_disable_manifolds.push_back(argv[++i]);
     }
 
     if (model_path.empty()) {
@@ -538,6 +542,11 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> h_reg_manifold(num_regions, 0u);
     for (uint32_t r = 0; r < num_regions; ++r) h_reg_manifold[r] = model.classes[r].manifold_id;
 
+    gllm::InferenceDispatcher dispatcher;
+    dispatcher.init_from_model(model);
+    for (const auto& nm : cli_enable_manifolds)  dispatcher.set_root_by_name(nm, true, model);
+    for (const auto& nm : cli_disable_manifolds) dispatcher.set_root_by_name(nm, false, model);
+
     // Upload GPU model, matcher & Operational Manifold metadata buffers
     CUdeviceptr d_regions = 0, d_outer = 0, d_shadow = 0, d_shadow_rgb = 0, d_counter = 0;
     CUdeviceptr d_masks = 0, d_log_odds = 0, d_class_prob = 0, d_bias = 0;
@@ -554,8 +563,9 @@ int main(int argc, char** argv) {
     CU_CHECK(cuMemcpyHtoD_v2(d_shadow_rgb, h_shadow_rgb.data(), h_shadow_rgb.size() * sizeof(uint32_t)));
     CU_CHECK(cuMemAlloc_v2(&d_counter, sizeof(uint32_t)));
 
+    auto active_gpu_masks = dispatcher.build_active_gpu_masks(model, h_class_masks, gllm::InferenceModality::kSketch28x28);
     CU_CHECK(cuMemAlloc_v2(&d_masks,      h_class_masks.size() * sizeof(uint64_t)));
-    CU_CHECK(cuMemcpyHtoD_v2(d_masks,     h_class_masks.data(), h_class_masks.size() * sizeof(uint64_t)));
+    CU_CHECK(cuMemcpyHtoD_v2(d_masks,     active_gpu_masks.data(), active_gpu_masks.size() * sizeof(uint64_t)));
     CU_CHECK(cuMemAlloc_v2(&d_log_odds,   h_log_odds.size() * sizeof(float)));
     CU_CHECK(cuMemcpyHtoD_v2(d_log_odds,  h_log_odds.data(), h_log_odds.size() * sizeof(float)));
     CU_CHECK(cuMemAlloc_v2(&d_class_prob, h_class_prob.size() * sizeof(float)));
@@ -621,7 +631,7 @@ int main(int argc, char** argv) {
     CUgraphicsResource cu_lat_res = nullptr;
     CU_CHECK(cuGraphicsGLRegisterBuffer(&cu_lat_res, lat_vbo, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD));
 
-    // --- VBO 3: Binding lines (manifold-to-outer concept rays in hierarchical mode, or K-to-1 class rays) ---
+    // --- VBO 3: Binding lines (manifold-to-outer concept rays + K-to-1 class rays where class != manifold node) ---
     struct LinkVert { float x, y, z, r, g, b, a, cid; };
     std::vector<LinkVert> links;
     if (has_manifold_outer_links) {
@@ -631,23 +641,26 @@ int main(int argc, char** argv) {
             float cr = 0.55f + 0.45f * std::cos(ph);
             float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
             float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
-            // Connect top-center of each manifold's 3D bounding box directly to its outer-shell concept node!
-            links.push_back({m.center_x, m.max_y, m.center_z, cr, cg, cb, 0.72f, static_cast<float>(m.outer_idx)});
-            links.push_back({m.outer_x,  m.outer_y, m.outer_z, cr, cg, cb, 0.96f, static_cast<float>(m.outer_idx)});
+            // Connect top-center (or bottom-center if outer node is below box) straight to its outer-shell concept node!
+            float anchor_y = (m.outer_y >= m.center_y) ? m.max_y : m.min_y;
+            links.push_back({m.center_x, anchor_y, m.center_z, cr, cg, cb, 0.78f, static_cast<float>(m.outer_idx)});
+            links.push_back({m.outer_x,  m.outer_y, m.outer_z, cr, cg, cb, 0.98f, static_cast<float>(m.outer_idx)});
         }
-    } else {
-        for (uint32_t r = 0; r < num_regions; ++r) {
-            const auto& rec = model.classes[r];
-            float ix = (rec.ox + rec.width * 0.5f) * step - 1.0f;
-            float iy = (rec.oy + rec.height * 0.5f) * step - 1.0f;
-            float iz = (rec.oz + 0.5f) * step - 1.0f;
-            float ph = rec.outer_idx * 2.4f;
-            float cr = 0.55f + 0.45f * std::cos(ph);
-            float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
-            float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
-            links.push_back({ix, iy, iz, cr, cg, cb, 0.25f, static_cast<float>(rec.outer_idx)});
-            links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.72f, static_cast<float>(rec.outer_idx)});
-        }
+    }
+    for (uint32_t r = 0; r < num_regions; ++r) {
+        const auto& rec = model.classes[r];
+        const auto* mr  = model.get_manifold(rec.manifold_id);
+        // Skip duplicate class rays when the manifold itself already binds to the exact same outer node
+        if (has_manifold_outer_links && mr && mr->outer_idx == rec.outer_idx) continue;
+        float ix = (rec.ox + rec.width * 0.5f) * step - 1.0f;
+        float iy = (rec.oy + rec.height * 0.5f) * step - 1.0f;
+        float iz = (rec.oz + 0.5f) * step - 1.0f;
+        float ph = rec.outer_idx * 2.4f;
+        float cr = 0.55f + 0.45f * std::cos(ph);
+        float cg = 0.55f + 0.45f * std::cos(ph + 2.0943951f);
+        float cb = 0.55f + 0.45f * std::cos(ph + 4.1887902f);
+        links.push_back({ix, iy, iz, cr, cg, cb, 0.25f, static_cast<float>(rec.outer_idx)});
+        links.push_back({rec.outer_x, rec.outer_y, rec.outer_z, cr, cg, cb, 0.72f, static_cast<float>(rec.outer_idx)});
     }
     GLuint link_vao = 0, link_vbo = 0;
     glGenVertexArrays(1, &link_vao);
@@ -789,8 +802,20 @@ int main(int argc, char** argv) {
 
     gllm::SketchSidebarHUD hud;
     gllm::MatchSummary match_summary;
+    match_summary.dispatch_status = dispatcher.hud_status_line();
     std::string primary_manifold_name = h_manifolds.empty() ? "" : std::string(h_manifolds[0].name);
     std::string primary_manifold_sem  = h_manifolds.empty() ? "" : std::string(h_manifolds[0].semantic_label);
+
+    auto sync_dispatcher_to_gpu = [&]() {
+        auto masks_now = dispatcher.build_active_gpu_masks(model, h_class_masks, gllm::InferenceModality::kSketch28x28);
+        CU_CHECK(cuMemcpyHtoD_v2(d_masks, masks_now.data(), masks_now.size() * sizeof(uint64_t)));
+        h_manifolds = model.build_gpu_manifold_table();
+        if (!h_manifolds.empty()) {
+            CU_CHECK(cuMemcpyHtoD_v2(d_manifolds, h_manifolds.data(), h_manifolds.size() * sizeof(gllm::GpuManifoldDesc)));
+        }
+        match_summary.dispatch_status = dispatcher.hud_status_line();
+        hud.dirty_tex = true;
+    };
 
     float close_dist  = std::clamp(max_alloc_radius * 2.55f, 0.35f, 2.2f);
     float cam_dist    = (init_dist > 0.0f) ? init_dist : close_dist;
@@ -813,6 +838,19 @@ int main(int argc, char** argv) {
     // Run 2-Stage Multi-Scale Gaussian Pyramid CUDA Match (Bernoulli x Soft-IoU)
     // -------------------------------------------------------------------------
     auto run_cuda_capture = [&](bool use_canvas_pyramid = true, bool verbose = true) {
+        if (dispatcher.count_active_regions(model, gllm::InferenceModality::kSketch28x28) == 0u) {
+            auto prev_bench = match_summary.bench;
+            match_summary = gllm::MatchSummary{};
+            match_summary.has_result        = true;
+            match_summary.is_unknown        = true;
+            match_summary.manifold_name     = "INFERENCE DISABLED";
+            match_summary.manifold_semantic = "PRESS 1-9 TO ENABLE ROOT MANIFOLD";
+            match_summary.dispatch_status   = dispatcher.hud_status_line();
+            match_summary.bench             = prev_bench;
+            hud.dirty_tex = true;
+            if (verbose) std::cout << "[DISPATCH] No active Sketch28 root manifold enabled (" << match_summary.dispatch_status << ")\n";
+            return;
+        }
         double base_mean = 0.0;
         for (uint32_t p = 0; p < match_pix; ++p) base_mean += hud.norm28[p];
         base_mean /= match_pix;
@@ -893,10 +931,25 @@ int main(int argc, char** argv) {
         match_summary.total_classes     = num_classes;
         match_summary.manifold_name     = routed_man_name;
         match_summary.manifold_semantic = routed_man_sem;
+        match_summary.dispatch_status   = dispatcher.hud_status_line();
         match_summary.bench             = prev_bench;
 
+        uint32_t matched_class_total = 0;
         for (uint32_t oid : unique_outer_ids) {
-            const auto& a = agg[oid];
+            auto it = agg.find(oid);
+            if (it == agg.end() || it->second.total == 0u) continue; // Skip manifold-only concept nodes
+            // Also skip classes whose regions are all disabled by the root-manifold inference dispatcher
+            bool any_active_reg = false;
+            for (uint32_t r = 0; r < num_regions; ++r) {
+                if (model.classes[r].outer_idx == oid &&
+                    dispatcher.is_region_active_for(model, r, gllm::InferenceModality::kSketch28x28)) {
+                    any_active_reg = true;
+                    break;
+                }
+            }
+            if (!any_active_reg) continue;
+            matched_class_total++;
+            const auto& a = it->second;
             const std::string& lbl = outer_to_label[oid];
             if (a.survived == 0u) {
                 match_summary.pruned_count++;
@@ -906,6 +959,7 @@ int main(int argc, char** argv) {
                 match_summary.ranked.push_back({oid, oid, lbl, a.best_ov * 100.0f, 0.0f, false});
             }
         }
+        match_summary.total_classes = matched_class_total;
 
         std::sort(match_summary.ranked.begin(), match_summary.ranked.end(),
                   [](const gllm::MatchResultRow& a, const gllm::MatchResultRow& b) {
@@ -1271,6 +1325,12 @@ int main(int argc, char** argv) {
                 else if (k == SDLK_h) { heatmap_mode = 1u - heatmap_mode; dirty_lat = true; }
                 else if (k == SDLK_l) show_links = !show_links;
                 else if (k == SDLK_m) show_manifold = !show_manifold;
+                else if (k >= SDLK_1 && k <= SDLK_9) {
+                    size_t ridx = static_cast<size_t>(k - SDLK_1);
+                    if (dispatcher.toggle_root_index(ridx, model)) {
+                        sync_dispatcher_to_gpu();
+                    }
+                }
                 else if (k == SDLK_a) auto_rot = !auto_rot;
                 else if (k == SDLK_z) cam_dist = (cam_dist > close_dist * 1.4f) ? close_dist : 2.65f;
                 else if (k == SDLK_UP)   shell_alpha = std::min(1.0f, shell_alpha + 0.08f);
@@ -1324,6 +1384,7 @@ int main(int argc, char** argv) {
         }
 
         if (hud.dirty_tex) {
+            match_summary.dispatch_status = dispatcher.hud_status_line();
             hud.rebuild_texture(match_summary, focus_cls, num_classes, num_regions,
                                 primary_manifold_name, primary_manifold_sem);
             glBindTexture(GL_TEXTURE_2D, sidebar_tex);

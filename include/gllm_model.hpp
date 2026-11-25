@@ -17,9 +17,36 @@
 namespace gllm {
 
 constexpr uint32_t kModelMagic   = 0x4D4C4C47u; // "GLLM"
-constexpr uint32_t kModelVersion = 4u;          // v4 adds hierarchical 3D AABB manifolds + shared outer-shell concept bindings
+constexpr uint32_t kModelVersion = 5u;          // v5 adds per-manifold inference_flags & modality for generalized dispatch
 constexpr uint32_t kManifoldVerts = 162u;       // 2x-subdivided geodesic icosphere (162 verts, 320 tris)
 constexpr uint32_t kInvalidId     = 0xFFFFFFFFu;
+
+// Generalized per-manifold inference flags & modality encoding (stored in ManifoldRecord & GpuManifoldDesc)
+constexpr uint32_t kInferFlagEnabled = 0x00000001u;
+enum class InferenceModality : uint32_t {
+    kNone        = 0u, // Structural / passive manifold (no active inference engine)
+    kSketch28x28 = 1u, // 28x28 grayscale 2-stage CUDA bitmask + Bernoulli x Soft-IoU matcher
+    kRgbPyramid  = 2u, // Multi-scale RGB Gaussian Pyramid / constellation matcher
+    kCustom      = 3u  // Extensible future modalities
+};
+
+inline uint32_t pack_inference_flags(bool enabled, InferenceModality modality) {
+    return (enabled ? kInferFlagEnabled : 0u) | ((static_cast<uint32_t>(modality) & 0xFFu) << 8);
+}
+inline bool is_infer_flag_enabled(uint32_t flags) {
+    return (flags & kInferFlagEnabled) != 0u;
+}
+inline InferenceModality get_infer_modality(uint32_t flags) {
+    return static_cast<InferenceModality>((flags >> 8) & 0xFFu);
+}
+inline const char* modality_name(InferenceModality mod) {
+    switch (mod) {
+        case InferenceModality::kSketch28x28: return "Sketch28";
+        case InferenceModality::kRgbPyramid:  return "RgbPyr";
+        case InferenceModality::kCustom:      return "Custom";
+        default:                              return "None";
+    }
+}
 
 // GPU-compatible 32-byte region descriptor (matches kernels/gllm_kernels.ptx)
 struct alignas(16) GpuRegionDesc {
@@ -42,8 +69,9 @@ struct alignas(16) GpuManifoldDesc {
     float    min_x, min_y, min_z, volume_fraction;
     float    max_x, max_y, max_z;
     uint32_t outer_idx;          // Shared outer-shell concept node ID (kInvalidId if unbound)
-    char     name[32];           // e.g. "fundamental_text", "animals/cats/face"
-    char     semantic_label[48]; // e.g. "handwritten_letters_and_numbers", "face"
+    char     name[32];           // e.g. "handwritten", "animals/cats/face"
+    char     semantic_label[44]; // e.g. "handwritten_numbers_0_9", "cat_facial_region"
+    uint32_t inference_flags;    // bit 0 = enabled, bits 8..15 = InferenceModality
 };
 static_assert(sizeof(GpuManifoldDesc) == 144, "GpuManifoldDesc must be 144 bytes for CUDA alignment");
 
@@ -129,6 +157,7 @@ struct ManifoldRecord {
     uint32_t parent_manifold_id = kInvalidId; // kInvalidId = root manifold
     uint32_t depth = 0;                       // Hierarchy depth (0=root, 1=species, 2=face, 3=feature)
     uint32_t envelope_mode = 0;               // 0 = geodesic deformed sphere, 1 = exact 3D Bounding Box (AABB)
+    uint32_t inference_flags = 0;             // bit 0 = enabled, bits 8..15 = InferenceModality
     uint32_t outer_idx = kInvalidId;          // Outer-shell concept node ID (shared across matching concept_label!)
     float    outer_x = 0.0f, outer_y = 0.0f, outer_z = 1.0f;
     std::string concept_label;                // Outer-shell concept word (e.g. "animals", "cat", "dog", "face")
@@ -176,6 +205,45 @@ struct GeometricModel {
             if (m.manifold_id == mid) return &m;
         }
         return nullptr;
+    }
+
+    ManifoldRecord* get_manifold_mut(uint32_t mid) {
+        for (auto& m : manifolds) {
+            if (m.manifold_id == mid) return &m;
+        }
+        return nullptr;
+    }
+
+    uint32_t get_root_manifold_id(uint32_t mid) const {
+        uint32_t cur = mid;
+        for (int hop = 0; hop < 16; ++hop) {
+            const ManifoldRecord* m = get_manifold(cur);
+            if (!m || m->parent_manifold_id == kInvalidId) return cur;
+            cur = m->parent_manifold_id;
+        }
+        return cur;
+    }
+
+    bool is_manifold_inference_active(uint32_t mid) const {
+        const ManifoldRecord* m = get_manifold(mid);
+        if (!m) return true;
+        // Walk up to root: inference is active only if this manifold AND every ancestor up to root are enabled!
+        const ManifoldRecord* cur = m;
+        for (int hop = 0; hop < 16 && cur; ++hop) {
+            if (!is_infer_flag_enabled(cur->inference_flags)) return false;
+            cur = (cur->parent_manifold_id == kInvalidId) ? nullptr : get_manifold(cur->parent_manifold_id);
+        }
+        return true;
+    }
+
+    InferenceModality get_effective_modality(uint32_t mid) const {
+        const ManifoldRecord* cur = get_manifold(mid);
+        for (int hop = 0; hop < 16 && cur; ++hop) {
+            auto mod = get_infer_modality(cur->inference_flags);
+            if (mod != InferenceModality::kNone) return mod;
+            cur = (cur->parent_manifold_id == kInvalidId) ? nullptr : get_manifold(cur->parent_manifold_id);
+        }
+        return InferenceModality::kNone;
     }
 
     // Find or allocate a new non-overlapping Operational Manifold anchor inside the 1B sphere
@@ -698,6 +766,7 @@ struct GeometricModel {
             d.max_y              = m.max_y;
             d.max_z              = m.max_z;
             d.outer_idx          = m.outer_idx;
+            d.inference_flags    = m.inference_flags;
             std::strncpy(d.name, m.name.c_str(), sizeof(d.name) - 1);
             std::strncpy(d.semantic_label, m.semantic_label.c_str(), sizeof(d.semantic_label) - 1);
             std::map<uint32_t, bool> seen_cls;
@@ -809,7 +878,7 @@ struct GeometricModel {
             ofs.write(reinterpret_cast<const char*>(&m.max_ly), 4);
             ofs.write(reinterpret_cast<const char*>(&m.max_lz), 4);
             ofs.write(reinterpret_cast<const char*>(m.deformed_radii), sizeof(m.deformed_radii));
-            // v4 hierarchical metadata & outer-shell concept link
+            // v4 hierarchical metadata & outer-shell concept link + v5 inference flags
             ofs.write(reinterpret_cast<const char*>(&m.parent_manifold_id), 4);
             ofs.write(reinterpret_cast<const char*>(&m.depth), 4);
             ofs.write(reinterpret_cast<const char*>(&m.envelope_mode), 4);
@@ -818,6 +887,7 @@ struct GeometricModel {
             ofs.write(reinterpret_cast<const char*>(&m.outer_y), 4);
             ofs.write(reinterpret_cast<const char*>(&m.outer_z), 4);
             ofs.write(mcon, 32);
+            ofs.write(reinterpret_cast<const char*>(&m.inference_flags), 4);
         }
 
         for (const auto& c : classes) {
@@ -905,12 +975,20 @@ struct GeometricModel {
                     ifs.read(reinterpret_cast<char*>(&m.outer_z), 4);
                     ifs.read(mcon, 32);
                     m.concept_label = mcon;
+                    if (ver >= 5u) {
+                        ifs.read(reinterpret_cast<char*>(&m.inference_flags), 4);
+                    } else {
+                        // Backwards-compatible default for v4 checkpoints:
+                        // infer modality from model contents after regions load
+                        m.inference_flags = 0u;
+                    }
                 } else {
                     m.parent_manifold_id = kInvalidId;
                     m.depth = 0u;
                     m.envelope_mode = 0u;
                     m.outer_idx = kInvalidId;
                     m.concept_label = m.name;
+                    m.inference_flags = pack_inference_flags(true, InferenceModality::kSketch28x28);
                 }
                 manifolds.push_back(std::move(m));
             }
@@ -959,6 +1037,21 @@ struct GeometricModel {
 
         if (ver == 1u && !classes.empty()) {
             recompute_manifold_envelopes();
+        }
+        // Auto-populate default inference_flags for pre-v5 checkpoints based on stored region modality
+        if (ver < 5u && !manifolds.empty()) {
+            for (auto& m : manifolds) {
+                if (m.inference_flags != 0u) continue;
+                bool has_sketch28 = false, has_rgb = false;
+                for (const auto& c : classes) {
+                    if (get_root_manifold_id(c.manifold_id) == get_root_manifold_id(m.manifold_id)) {
+                        if (c.channels == 3u) has_rgb = true;
+                        else if (c.width == 28u && c.height == 28u) has_sketch28 = true;
+                    }
+                }
+                if (has_rgb) m.inference_flags = pack_inference_flags(false, InferenceModality::kRgbPyramid);
+                else if (has_sketch28) m.inference_flags = pack_inference_flags(true, InferenceModality::kSketch28x28);
+            }
         }
         return ifs.good();
     }

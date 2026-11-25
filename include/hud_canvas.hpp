@@ -43,8 +43,9 @@ struct MatchSummary {
     uint32_t total_classes  = 0;
     uint32_t pruned_count   = 0;
     uint32_t survived_count = 0;
-    std::string manifold_name;                 // Routed Operational Manifold (e.g. "fundamental_text")
-    std::string manifold_semantic;             // CUDA semantic register (e.g. "handwritten_letters_and_numbers")
+    std::string manifold_name;                 // Routed Operational Manifold (e.g. "handwritten/letters")
+    std::string manifold_semantic;             // CUDA semantic register (e.g. "handwritten_letters_A_Z_a_z")
+    std::string dispatch_status;               // Live per-root inference status (e.g. "1:handwritten[ON] 2:animals[OFF]")
     VisualBenchStats bench;                    // Live visual benchmark telemetry when active
     std::vector<MatchResultRow> ranked;        // Surviving classes sorted by overlap desc
     std::vector<std::string>    pruned_labels; // Labels eliminated at Stage 1
@@ -606,9 +607,12 @@ public:
             }
         }
 
-        // Footer hint
-        draw_text(20, 800, "B: LIVE BENCH | M: MANIFOLD | Z: ZOOM", 1, 115, 150, 185);
-        draw_text(20, 816, "H: HEATMAP | UP/DN: SHELL | R: RESET", 1, 115, 150, 185);
+        // Footer hint + Live Root-Manifold Inference Dispatch Bar
+        if (!ms.dispatch_status.empty()) {
+            draw_text(20, 788, ("INF: " + ms.dispatch_status).substr(0, 48), 1, 120, 235, 195);
+        }
+        draw_text(20, 804, "1-9: INFER ON/OFF | B: BENCH | M: BOX", 1, 115, 150, 185);
+        draw_text(20, 818, "Z: ZOOM | H: HEATMAP | L: RAYS | R: RST", 1, 115, 150, 185);
         dirty_tex = false;
     }
 };

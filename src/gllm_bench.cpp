@@ -13,6 +13,7 @@
 #include "../include/gaussian_pyramid.hpp"
 #include "../include/gllm_model.hpp"
 #include "../include/hud_canvas.hpp"
+#include "../include/inference_dispatcher.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -89,7 +90,6 @@ int main(int argc, char** argv) {
         std::cerr << "[ERROR] Model contains 0 allocated regions.\n";
         return 1;
     }
-    const uint32_t P = model.classes[0].width * model.classes[0].height;
 
     // -------------------------------------------------------------------------
     // 1. Spatial Integrity Audit (Verify 0 Overlaps in 3D Sphere Lattice)
@@ -219,22 +219,37 @@ int main(int argc, char** argv) {
         CU_CHECK(cuMemFree_v2(d_mb));  CU_CHECK(cuMemFree_v2(d_mr)); CU_CHECK(cuMemFree_v2(d_ma));
     }
 
-    // Build lookup maps & L2-normalized shadow templates
-    std::vector<float> h_tmpl(static_cast<size_t>(R) * P, 0.0f);
+    gllm::InferenceDispatcher dispatcher;
+    dispatcher.init_from_model(model);
+    std::printf("         Inference Dispatch Roots: %s\n", dispatcher.hud_status_line().c_str());
+
+    // Build lookup maps & L2-normalized shadow templates ONLY for active Sketch28 regions (safe on mixed-domain universe spheres!)
+    std::vector<uint32_t> eval_reg_ids;
+    for (uint32_t r = 0; r < R; ++r) {
+        const auto& rec = model.classes[r];
+        if (rec.width == 28u && rec.height == 28u && rec.channels == 1u &&
+            dispatcher.is_region_active_for(model, r, gllm::InferenceModality::kSketch28x28)) {
+            eval_reg_ids.push_back(r);
+        }
+    }
+    const uint32_t ER = static_cast<uint32_t>(eval_reg_ids.size());
+    const uint32_t EP = 784u;
+
+    std::vector<float> h_tmpl(static_cast<size_t>(std::max(1u, ER)) * EP, 0.0f);
     std::vector<uint32_t> unique_oids;
     std::map<uint32_t, std::string> oid_to_lbl;
     uint32_t max_oid = 0;
-    for (uint32_t r = 0; r < R; ++r) {
-        const auto& rec = model.classes[r];
+    for (uint32_t ei = 0; ei < ER; ++ei) {
+        const auto& rec = model.classes[eval_reg_ids[ei]];
         if (!oid_to_lbl.count(rec.outer_idx)) {
             oid_to_lbl[rec.outer_idx] = rec.label;
             unique_oids.push_back(rec.outer_idx);
             max_oid = std::max(max_oid, rec.outer_idx);
         }
         double n2 = 0.0;
-        for (uint32_t p = 0; p < P; ++p) n2 += static_cast<double>(rec.shadow_sum[p]) * rec.shadow_sum[p];
+        for (uint32_t p = 0; p < EP; ++p) n2 += static_cast<double>(rec.shadow_sum[p]) * rec.shadow_sum[p];
         float inv = n2 > 1e-12 ? static_cast<float>(1.0 / std::sqrt(n2)) : 0.0f;
-        for (uint32_t p = 0; p < P; ++p) h_tmpl[static_cast<size_t>(r) * P + p] = rec.shadow_sum[p] * inv;
+        for (uint32_t p = 0; p < EP; ++p) h_tmpl[static_cast<size_t>(ei) * EP + p] = rec.shadow_sum[p] * inv;
     }
 
     // Load requested holdout datasets
@@ -267,17 +282,18 @@ int main(int argc, char** argv) {
     CUdeviceptr d_tmpl = 0, d_imgs = 0, d_scores = 0;
     CU_CHECK(cuMemAlloc_v2(&d_tmpl, h_tmpl.size() * sizeof(float)));
     CU_CHECK(cuMemcpyHtoD_v2(d_tmpl, h_tmpl.data(), h_tmpl.size() * sizeof(float)));
-    CU_CHECK(cuMemAlloc_v2(&d_imgs, static_cast<size_t>(CHUNK) * P));
-    CU_CHECK(cuMemAlloc_v2(&d_scores, static_cast<size_t>(CHUNK) * R * sizeof(float)));
+    CU_CHECK(cuMemAlloc_v2(&d_imgs, static_cast<size_t>(CHUNK) * EP));
+    CU_CHECK(cuMemAlloc_v2(&d_scores, static_cast<size_t>(CHUNK) * std::max(1u, ER) * sizeof(float)));
 
     uint64_t comb_n = 0, comb_top1 = 0, comb_top3 = 0, comb_equiv = 0;
     double comb_ms = 0.0;
 
     auto eval_full = [&](const char* title, const gllm::LabeledImageBatch& ds, bool report_10way) {
+        if (ER == 0u) return;
         uint32_t N = ds.count;
         uint32_t top1 = 0, top3 = 0, top1_equiv = 0, top1_10way = 0;
         std::map<std::string, std::pair<uint32_t, uint32_t>> per_cls;
-        std::vector<float> h_sc(static_cast<size_t>(CHUNK) * R);
+        std::vector<float> h_sc(static_cast<size_t>(CHUNK) * ER);
         std::vector<float> best_by_oid(max_oid + 1u);
         CUevent e0 = nullptr, e1 = nullptr;
         CU_CHECK(cuEventCreate(&e0, 0));
@@ -286,25 +302,25 @@ int main(int argc, char** argv) {
 
         for (uint32_t off = 0; off < N; off += CHUNK) {
             uint32_t cnt = std::min(CHUNK, N - off);
-            CU_CHECK(cuMemcpyHtoD_v2(d_imgs, &ds.pixels[static_cast<size_t>(off) * P], static_cast<size_t>(cnt) * P));
-            uint32_t pp = P, nc = R, ni = cnt;
+            CU_CHECK(cuMemcpyHtoD_v2(d_imgs, &ds.pixels[static_cast<size_t>(off) * EP], static_cast<size_t>(cnt) * EP));
+            uint32_t pp = EP, nc = ER, ni = cnt;
             void* args[] = {&d_imgs, &d_tmpl, &d_scores, &pp, &nc, &ni};
             CU_CHECK(cuEventRecord(e0, nullptr));
-            CU_CHECK(cuLaunchKernel(fn_eval, (cnt * R + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
+            CU_CHECK(cuLaunchKernel(fn_eval, (cnt * ER + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
             CU_CHECK(cuEventRecord(e1, nullptr));
             CU_CHECK(cuEventSynchronize(e1));
             float ms = 0.0f;
             CU_CHECK(cuEventElapsedTime(&ms, e0, e1));
             total_ms += ms;
-            CU_CHECK(cuMemcpyDtoH_v2(h_sc.data(), d_scores, static_cast<size_t>(cnt) * R * sizeof(float)));
+            CU_CHECK(cuMemcpyDtoH_v2(h_sc.data(), d_scores, static_cast<size_t>(cnt) * ER * sizeof(float)));
 
             for (uint32_t i = 0; i < cnt; ++i) {
                 const std::string& truth = ds.labels[off + i];
-                const float* row = &h_sc[static_cast<size_t>(i) * R];
+                const float* row = &h_sc[static_cast<size_t>(i) * ER];
                 std::fill(best_by_oid.begin(), best_by_oid.end(), -1e9f);
-                for (uint32_t r = 0; r < R; ++r) {
-                    uint32_t oid = model.classes[r].outer_idx;
-                    if (row[r] > best_by_oid[oid]) best_by_oid[oid] = row[r];
+                for (uint32_t ei = 0; ei < ER; ++ei) {
+                    uint32_t oid = model.classes[eval_reg_ids[ei]].outer_idx;
+                    if (row[ei] > best_by_oid[oid]) best_by_oid[oid] = row[ei];
                 }
                 std::vector<std::pair<float, uint32_t>> ranked;
                 ranked.reserve(unique_oids.size());
@@ -368,54 +384,54 @@ int main(int argc, char** argv) {
     }
 
     // -------------------------------------------------------------------------
-    // 3. Live 2-Stage CUDA Matcher (28x28: 64-bit Bitmask + 9-Shift Bernoulli x Soft-IoU)
+    // 3. Live 2-Stage CUDA Matcher (Active Sketch28 Regions Only via InferenceDispatcher)
     // -------------------------------------------------------------------------
-    if (P == 784u) {
-        std::vector<uint64_t> h_masks(R, 0ULL);
-        std::vector<float> h_lo(static_cast<size_t>(R) * P, 0.0f);
-        std::vector<float> h_pr(static_cast<size_t>(R) * P, 0.0f);
-        std::vector<float> h_bias(R, 0.0f);
-        for (uint32_t r = 0; r < R; ++r) {
-            const auto& rec = model.classes[r];
+    if (ER > 0u) {
+        std::vector<uint64_t> h_masks(ER, 0ULL);
+        std::vector<float> h_lo(static_cast<size_t>(ER) * EP, 0.0f);
+        std::vector<float> h_pr(static_cast<size_t>(ER) * EP, 0.0f);
+        std::vector<float> h_bias(ER, 0.0f);
+        for (uint32_t ei = 0; ei < ER; ++ei) {
+            const auto& rec = model.classes[eval_reg_ids[ei]];
             float inv = rec.train_count ? (1.0f / static_cast<float>(rec.train_count)) : 0.0f;
-            std::vector<float> avg(P);
-            for (uint32_t p = 0; p < P; ++p) avg[p] = rec.shadow_sum[p] * inv;
+            std::vector<float> avg(EP);
+            for (uint32_t p = 0; p < EP; ++p) avg[p] = rec.shadow_sum[p] * inv;
             float pnorm[784] = {};
             gllm::canonicalize_28(avg.data(), pnorm, 22.0f, 0.22f);
-            h_masks[r] = gllm::compute_coarse_mask64(pnorm, 0.22f);
+            h_masks[ei] = gllm::compute_coarse_mask64(pnorm, 0.22f);
             double bs = 0.0, lmax = 0.0;
-            for (uint32_t p = 0; p < P; ++p) {
-                h_pr[static_cast<size_t>(r) * P + p] = std::clamp(pnorm[p], 0.0f, 1.0f);
+            for (uint32_t p = 0; p < EP; ++p) {
+                h_pr[static_cast<size_t>(ei) * EP + p] = std::clamp(pnorm[p], 0.0f, 1.0f);
                 double pr = std::clamp(static_cast<double>(pnorm[p]) * 0.90, 0.015, 0.96);
-                h_lo[static_cast<size_t>(r) * P + p] = static_cast<float>(std::log(pr / (1.0 - pr)));
+                h_lo[static_cast<size_t>(ei) * EP + p] = static_cast<float>(std::log(pr / (1.0 - pr)));
                 bs   += std::log(1.0 - pr);
                 lmax += pr * std::log(pr) + (1.0 - pr) * std::log(1.0 - pr);
             }
-            h_bias[r] = static_cast<float>(bs - 0.5 * lmax);
+            h_bias[ei] = static_cast<float>(bs - 0.5 * lmax);
         }
 
         const uint32_t kMaxHyps = 36u;
         CUdeviceptr dm = 0, dlo = 0, dpr = 0, db = 0, dsk = 0, dent = 0, dsqm = 0, dov = 0, dst = 0;
-        CU_CHECK(cuMemAlloc_v2(&dm, R * sizeof(uint64_t)));
-        CU_CHECK(cuMemcpyHtoD_v2(dm, h_masks.data(), R * sizeof(uint64_t)));
+        CU_CHECK(cuMemAlloc_v2(&dm, ER * sizeof(uint64_t)));
+        CU_CHECK(cuMemcpyHtoD_v2(dm, h_masks.data(), ER * sizeof(uint64_t)));
         CU_CHECK(cuMemAlloc_v2(&dlo, h_lo.size() * sizeof(float)));
         CU_CHECK(cuMemcpyHtoD_v2(dlo, h_lo.data(), h_lo.size() * sizeof(float)));
         CU_CHECK(cuMemAlloc_v2(&dpr, h_pr.size() * sizeof(float)));
         CU_CHECK(cuMemcpyHtoD_v2(dpr, h_pr.data(), h_pr.size() * sizeof(float)));
-        CU_CHECK(cuMemAlloc_v2(&db, R * sizeof(float)));
-        CU_CHECK(cuMemcpyHtoD_v2(db, h_bias.data(), R * sizeof(float)));
-        CU_CHECK(cuMemAlloc_v2(&dsk,  static_cast<size_t>(kMaxHyps) * P * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&db, ER * sizeof(float)));
+        CU_CHECK(cuMemcpyHtoD_v2(db, h_bias.data(), ER * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&dsk,  static_cast<size_t>(kMaxHyps) * EP * sizeof(float)));
         CU_CHECK(cuMemAlloc_v2(&dent, kMaxHyps * sizeof(float)));
         CU_CHECK(cuMemAlloc_v2(&dsqm, kMaxHyps * sizeof(uint64_t)));
-        CU_CHECK(cuMemAlloc_v2(&dov, R * sizeof(float)));
-        CU_CHECK(cuMemAlloc_v2(&dst, R * sizeof(uint32_t)));
+        CU_CHECK(cuMemAlloc_v2(&dov, ER * sizeof(float)));
+        CU_CHECK(cuMemAlloc_v2(&dst, ER * sizeof(uint32_t)));
 
         CUevent me0 = nullptr, me1 = nullptr;
         CU_CHECK(cuEventCreate(&me0, 0));
         CU_CHECK(cuEventCreate(&me1, 0));
 
-        std::vector<float> h_ov(R);
-        std::vector<uint32_t> h_st(R);
+        std::vector<float> h_ov(ER);
+        std::vector<uint32_t> h_st(ER);
         std::vector<float> best_by_oid(max_oid + 1u);
         float prune_ratio = 0.68f;
         float inv_t_ln2   = static_cast<float>(1.0 / (200.0 * std::log(2.0)));
@@ -425,24 +441,24 @@ int main(int argc, char** argv) {
             if (nh == 0u) {
                 return std::make_pair(std::vector<std::pair<float, uint32_t>>{}, true);
             }
-            CU_CHECK(cuMemcpyHtoD_v2(dsk,  qs.raw_hyps.data(),       static_cast<size_t>(nh) * P * sizeof(float)));
+            CU_CHECK(cuMemcpyHtoD_v2(dsk,  qs.raw_hyps.data(),       static_cast<size_t>(nh) * EP * sizeof(float)));
             CU_CHECK(cuMemcpyHtoD_v2(dent, qs.self_entropies.data(), static_cast<size_t>(nh) * sizeof(float)));
             CU_CHECK(cuMemcpyHtoD_v2(dsqm, qs.coarse_masks.data(),   static_cast<size_t>(nh) * sizeof(uint64_t)));
-            uint32_t pp = P, nc = R, ns = nh;
+            uint32_t pp = EP, nc = ER, ns = nh;
             void* args[] = {&dsk, &dent, &dsqm, &dm, &dlo, &dpr, &db, &dov, &dst, &pp, &nc, &ns, &prune_ratio, &inv_t_ln2};
             CU_CHECK(cuEventRecord(me0, nullptr));
-            CU_CHECK(cuLaunchKernel(fn_match, (R + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
+            CU_CHECK(cuLaunchKernel(fn_match, (ER + 63u) / 64u, 1, 1, 64, 1, 1, 0, nullptr, args, nullptr));
             CU_CHECK(cuEventRecord(me1, nullptr));
             CU_CHECK(cuEventSynchronize(me1));
             CU_CHECK(cuEventElapsedTime(&out_ms, me0, me1));
-            CU_CHECK(cuMemcpyDtoH_v2(h_ov.data(), dov, R * sizeof(float)));
-            CU_CHECK(cuMemcpyDtoH_v2(h_st.data(), dst, R * sizeof(uint32_t)));
+            CU_CHECK(cuMemcpyDtoH_v2(h_ov.data(), dov, ER * sizeof(float)));
+            CU_CHECK(cuMemcpyDtoH_v2(h_st.data(), dst, ER * sizeof(uint32_t)));
 
             std::fill(best_by_oid.begin(), best_by_oid.end(), -1.0f);
-            for (uint32_t r = 0; r < R; ++r) {
-                if (h_st[r]) {
-                    uint32_t oid = model.classes[r].outer_idx;
-                    if (h_ov[r] > best_by_oid[oid]) best_by_oid[oid] = h_ov[r];
+            for (uint32_t ei = 0; ei < ER; ++ei) {
+                if (h_st[ei]) {
+                    uint32_t oid = model.classes[eval_reg_ids[ei]].outer_idx;
+                    if (h_ov[ei] > best_by_oid[oid]) best_by_oid[oid] = h_ov[ei];
                 }
             }
             std::vector<std::pair<float, uint32_t>> ranked;
@@ -464,12 +480,12 @@ int main(int argc, char** argv) {
             std::map<std::string, int> seen;
             uint32_t tot = 0, top1 = 0, top3 = 0, equiv = 0, t10 = 0, known_cnt = 0;
             double sum_ms = 0.0, sum_conf = 0.0;
-            std::vector<float> raw(P), can(P);
+            std::vector<float> raw(EP), can(EP);
             for (uint32_t i = 0; i < ds.count; ++i) {
                 const std::string& truth = ds.labels[i];
                 if (seen[truth] >= live_per_class) continue;
                 seen[truth]++;
-                for (uint32_t p = 0; p < P; ++p) raw[p] = ds.pixels[static_cast<size_t>(i) * P + p] / 255.0f;
+                for (uint32_t p = 0; p < EP; ++p) raw[p] = ds.pixels[static_cast<size_t>(i) * EP + p] / 255.0f;
                 gllm::canonicalize_28(raw.data(), can.data(), 22.0f, 0.10f);
                 float ms = 0.0f;
                 auto res = run_live(can.data(), ms);
