@@ -1495,6 +1495,7 @@ int main(int argc, char** argv) {
         hst.wave_step         = 0;
         hst.wave_max_steps    = fluid_sim.max_steps;
         hst.candidates        = fluid_sim.candidates;
+        hst.selected_cand     = 0;
         hst.gpu_fluid_voxels  = 0; hst.gpu_split_forks = 0;
         hst.gpu_collision_vox = 0; hst.gpu_peak_vox_wt = 0.0f;
         hst.syn_path_str      = fluid_sim.syn_cascade.path_label;
@@ -1625,6 +1626,32 @@ int main(int argc, char** argv) {
             hy = (my * gllm::TalkSidebarHUD::kPanelH) / std::max(1, cur_h);
         };
 
+        auto select_candidate = [&](uint32_t ci) {
+            if (ci >= hst.candidates.size()) return;
+            hst.selected_cand = ci;
+            const auto& cand = hst.candidates[ci];
+            fluid_sim.syn_cascade = sponge.syntax.emit_raw_sponge_answer(lex, cand.answer);
+            fluid_sim.syn_cascade_rays.clear();
+            for (const auto& ws : fluid_sim.syn_cascade.word_steps) {
+                Vec3 sh = syn_hubs[ws.syn_id % gllm::kNumSynNodes];
+                Vec3 ph = pos_hubs[ws.pos_id % gllm::kNumPosClusters];
+                Vec3 wo = word_outer_xyz(ws.word_id, lex.num_words);
+                fluid_sim.syn_cascade_rays.push_back({sh, ph, wo});
+                hst.syn_activity[ws.syn_id % gllm::kNumSynNodes] = 1.0f;
+                hst.pos_activity[ws.pos_id % gllm::kNumPosClusters] = 1.0f;
+                pending_word_flashes.push_back({ws.word_id, -1.10f});
+            }
+            hst.syn_path_str       = fluid_sim.syn_cascade.path_label;
+            hst.spoken_sentence    = fluid_sim.syn_cascade.full_sentence;
+            hst.spoken_words_total = static_cast<uint32_t>(fluid_sim.syn_cascade.word_steps.size());
+            hst.spoken_words_shown = hst.spoken_words_total;
+            char sbuf[160];
+            std::snprintf(sbuf, sizeof(sbuf), "SELECTED #%u: '%s' (%.1f mL, %u/%u drops)",
+                          ci + 1u, cand.answer.c_str(), cand.current_ml,
+                          cand.drop_sources, cand.total_sources);
+            hst.fluid_summary = sbuf;
+        };
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
@@ -1632,13 +1659,23 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_MOUSEMOTION) {
                 int hx, hy;
                 to_hud_xy(ev.motion.x, ev.motion.y, hx, hy);
-                hud.hover_btn = 0;
+                hud.hover_btn  = 0;
+                hud.hover_cand = -1;
                 if (ev.motion.x < panel_px) {
                     if (hud.btn_ask.contains(hx, hy))         hud.hover_btn = 1;
                     else if (hud.btn_carve.contains(hx, hy))  hud.hover_btn = 2;
                     else if (hud.btn_load89.contains(hx, hy)) hud.hover_btn = 3;
                     else if (hud.btn_stream.contains(hx, hy)) hud.hover_btn = 4;
                     else if (hud.btn_replay.contains(hx, hy)) hud.hover_btn = 5;
+                    else {
+                        size_t shown = std::min<size_t>(8, hst.candidates.size());
+                        for (size_t ci = 0; ci < shown; ++ci) {
+                            if (gllm::TalkSidebarHUD::cand_row_rect(ci).contains(hx, hy)) {
+                                hud.hover_cand = static_cast<int>(ci);
+                                break;
+                            }
+                        }
+                    }
                 } else if (dragging) {
                     cam_yaw   -= ev.motion.xrel * 0.0065f;
                     cam_pitch  = std::clamp(cam_pitch + ev.motion.yrel * 0.0065f, -1.50f, 1.50f);
@@ -1661,7 +1698,16 @@ int main(int argc, char** argv) {
                         if (hst.streaming) { fluid_sim.active = false; hst.fluid_wave_active = false; }
                     } else if (hud.btn_replay.contains(hx, hy)) {
                         hst.focus_field = 0; start_fluid_wave(hst.input_q);
-                    } else hst.focus_field = 0;
+                    } else {
+                        hst.focus_field = 0;
+                        size_t shown = std::min<size_t>(8, hst.candidates.size());
+                        for (size_t ci = 0; ci < shown; ++ci) {
+                            if (gllm::TalkSidebarHUD::cand_row_rect(ci).contains(hx, hy)) {
+                                select_candidate(static_cast<uint32_t>(ci));
+                                break;
+                            }
+                        }
+                    }
                 } else { hst.focus_field = 0; dragging = true; }
             } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                 dragging = false;
@@ -1816,10 +1862,12 @@ int main(int argc, char** argv) {
                 }
             }
             if (!hst.candidates.empty() && wave_t > 0.30f) {
+                uint32_t sc = std::min<uint32_t>(hst.selected_cand, static_cast<uint32_t>(hst.candidates.size() - 1));
                 char sbuf[160];
-                std::snprintf(sbuf, sizeof(sbuf), "HIGHEST FLUID: '%s' (%.1f mL, %u/%u drops)!",
-                              hst.candidates[0].answer.c_str(), hst.candidates[0].current_ml,
-                              hst.candidates[0].drop_sources, hst.candidates[0].total_sources);
+                std::snprintf(sbuf, sizeof(sbuf), "%s #%u: '%s' (%.1f mL, %u/%u drops)",
+                              sc == 0 ? "HIGHEST FLUID" : "SELECTED", sc + 1u,
+                              hst.candidates[sc].answer.c_str(), hst.candidates[sc].current_ml,
+                              hst.candidates[sc].drop_sources, hst.candidates[sc].total_sources);
                 hst.fluid_summary = sbuf;
             }
 

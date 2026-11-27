@@ -116,6 +116,7 @@ struct TalkHudState {
     uint32_t    spoken_words_total  = 0;
 
     std::vector<CandidateFluidRow> candidates;
+    uint32_t selected_cand = 0;
     std::array<float, kNumPosClusters> pos_activity{};
     std::array<float, kNumSynNodes>    syn_activity{};
 };
@@ -133,8 +134,13 @@ public:
     Rect btn_stream = {16, 382, 184, 24};
     Rect btn_replay = {208, 382, 184, 24};
 
+    static inline Rect cand_row_rect(size_t i) {
+        return {20, 606 + static_cast<int>(i) * 25, 368, 23};
+    }
+
     std::vector<uint8_t> rgba;
-    int hover_btn = 0;
+    int hover_btn  = 0;
+    int hover_cand = -1;
 
     TalkSidebarHUD() : rgba(kPanelW * kPanelH * 4, 0) {}
 
@@ -296,7 +302,13 @@ public:
         // =====================================================================
         fill_rect(14, 414, 380, 102, 12, 28, 34, 255);
         stroke_rect(14, 414, 380, 102, 70, 235, 185);
-        draw_text(22, 422, "RAW SPONGE -> SYNTACTIC SPHERE OUTPUT:", 95, 248, 195);
+        if (!st.candidates.empty()) {
+            std::snprintf(buf, sizeof(buf), "RAW SPONGE OUTPUT (#%u - CLICK ANY ANSWER BELOW):",
+                          st.selected_cand + 1u);
+            draw_text(22, 422, buf, 95, 248, 195);
+        } else {
+            draw_text(22, 422, "RAW SPONGE -> SYNTACTIC SPHERE OUTPUT:", 95, 248, 195);
+        }
         if (!st.syn_path_str.empty()) {
             draw_text(22, 436, st.syn_path_str.substr(0, 60), 150, 215, 235);
         }
@@ -319,7 +331,7 @@ public:
                     st.fluid_wave_active ? 110 : 68,
                     st.fluid_wave_active ? 255 : 108);
 
-        draw_text(22, 532, "SPONGE VOXEL FLUID SPLITTING / CANDIDATE METERS", 235, 155, 255);
+        draw_text(22, 532, "SPONGE CANDIDATES (CLICK #1-#8 TO VIEW FULL ANSWER)", 235, 155, 255);
 
         fill_rect(20, 545, 368, 38, 18, 24, 46, 255);
         stroke_rect(20, 545, 368, 38, 65, 88, 138);
@@ -341,26 +353,33 @@ public:
         size_t shown = std::min<size_t>(8, st.candidates.size());
         for (size_t i = 0; i < shown; ++i) {
             const auto& c = st.candidates[i];
-            bool winner = (i == 0 && c.current_ml > 0.0f);
-            fill_rect(20, ry, 368, 23, winner ? 38 : 16, winner ? 32 : 23, winner ? 18 : 40);
+            bool selected = (i == st.selected_cand && c.current_ml > 0.0f);
+            bool hovered  = (static_cast<int>(i) == hover_cand);
+            bool top1     = (i == 0 && c.current_ml > 0.0f);
+            fill_rect(20, ry, 368, 23,
+                      selected ? 24 : (hovered ? 26 : 16),
+                      selected ? 46 : (hovered ? 36 : 23),
+                      selected ? 38 : (hovered ? 60 : 40));
             stroke_rect(20, ry, 368, 23,
-                        winner ? 255 : (c.drop_sources >= 2 ? 195 : 42),
-                        winner ? 210 : (c.drop_sources >= 2 ? 85  : 64),
-                        winner ? 75  : (c.drop_sources >= 2 ? 240 : 96));
+                        selected ? 85  : (hovered ? 120 : (top1 ? 255 : (c.drop_sources >= 2 ? 195 : 42))),
+                        selected ? 255 : (hovered ? 230 : (top1 ? 210 : (c.drop_sources >= 2 ? 85  : 64))),
+                        selected ? 195 : (hovered ? 255 : (top1 ? 75  : (c.drop_sources >= 2 ? 240 : 96))));
 
             float frac = std::clamp(c.current_ml / max_ml, 0.0f, 1.0f);
             int bar_w = static_cast<int>(frac * 364.0f);
             if (bar_w > 0) {
-                uint8_t br = winner ? 165 : (c.drop_sources >= 2 ? 125 : 22);
-                uint8_t bg = winner ? 115 : (c.drop_sources >= 2 ? 38  : 92);
-                uint8_t bb = winner ? 24  : (c.drop_sources >= 2 ? 160 : 148);
+                uint8_t br = selected ? 36  : (top1 ? 165 : (c.drop_sources >= 2 ? 125 : 22));
+                uint8_t bg = selected ? 145 : (top1 ? 115 : (c.drop_sources >= 2 ? 38  : 92));
+                uint8_t bb = selected ? 110 : (top1 ? 24  : (c.drop_sources >= 2 ? 160 : 148));
                 fill_rect(22, ry + 2, bar_w, 19, br, bg, bb);
             }
 
             std::string ans_short = c.answer.substr(0, 24);
             std::snprintf(buf, sizeof(buf), "#%zu %s", i + 1, ans_short.c_str());
             draw_text(26, ry + 7, buf,
-                      winner ? 255 : 230, winner ? 245 : 240, winner ? 185 : 255);
+                      selected ? 255 : (top1 ? 255 : 230),
+                      selected ? 255 : (top1 ? 245 : 240),
+                      selected ? 215 : (top1 ? 185 : 255));
 
             if (c.current_ml < 10.0f) {
                 std::snprintf(buf, sizeof(buf), "%5.2fmL [%u/%u%s]",
@@ -373,9 +392,9 @@ public:
             }
             int rw = static_cast<int>(std::strlen(buf)) * 6;
             draw_text(384 - rw, ry + 7, buf,
-                      winner ? 255 : (c.drop_sources >= 2 ? 255 : 170),
-                      winner ? 235 : (c.drop_sources >= 2 ? 190 : 225),
-                      winner ? 120 : 255);
+                      selected ? 160 : (top1 ? 255 : (c.drop_sources >= 2 ? 255 : 170)),
+                      selected ? 255 : (top1 ? 235 : (c.drop_sources >= 2 ? 190 : 225)),
+                      selected ? 225 : (top1 ? 120 : 255));
             ry += 25;
         }
 
