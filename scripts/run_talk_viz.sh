@@ -7,4 +7,5 @@ fi
 export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
 export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
 export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+cd "${ROOT}"
 exec "${ROOT}/bin/gllm_talk_viz" "$@"

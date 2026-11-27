@@ -230,9 +230,24 @@ static CUmodule load_ptx(const std::string& ptx_path) {
     return mod;
 }
 
+static std::string resolve_data_file(const std::string& filename) {
+    std::string exe_dir = gllm::get_exe_dir();
+    std::vector<std::string> cands = {
+        "./data/" + filename,
+        exe_dir + "../data/" + filename,
+        exe_dir + "data/" + filename,
+        "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/" + filename
+    };
+    for (const auto& p : cands) {
+        std::ifstream f(p, std::ios::binary);
+        if (f.good()) return p;
+    }
+    return cands[0];
+}
+
 int main(int argc, char** argv) {
-    std::string lex_path    = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
-    std::string sponge_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/msmarco_sponge.bin";
+    std::string lex_path    = resolve_data_file("kaikki_lexicon.bin");
+    std::string sponge_path = resolve_data_file("msmarco_sponge.bin");
     std::string ptx_path    = "kernels/gllm_talk_kernels.ptx";
     std::string queries_tsv = "/home/liveuser/.gemini/antigravity-cli/brain/a8eaa546-9a14-44da-badc-ed3f36787d7c/scratch/bench_100_qa.tsv";
     std::string out_tsv     = "/home/liveuser/.gemini/antigravity-cli/brain/a8eaa546-9a14-44da-badc-ed3f36787d7c/scratch/bench_100_results.tsv";

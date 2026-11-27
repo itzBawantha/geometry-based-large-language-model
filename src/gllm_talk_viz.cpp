@@ -1239,10 +1239,25 @@ static void save_ppm_screenshot(const std::string& path, int w, int h) {
 // -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
+static std::string resolve_data_file(const std::string& filename) {
+    std::string exe_dir = gllm::get_exe_dir();
+    std::vector<std::string> cands = {
+        "./data/" + filename,
+        exe_dir + "../data/" + filename,
+        exe_dir + "data/" + filename,
+        "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/" + filename
+    };
+    for (const auto& p : cands) {
+        std::ifstream f(p, std::ios::binary);
+        if (f.good()) return p;
+    }
+    return cands[0];
+}
+
 int main(int argc, char** argv) {
-    std::string lex_path    = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
-    std::string sponge_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/msmarco_sponge.bin";
-    std::string qa_path     = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/msmarco_sample_qa.tsv";
+    std::string lex_path    = resolve_data_file("kaikki_lexicon.bin");
+    std::string sponge_path = resolve_data_file("msmarco_sponge.bin");
+    std::string qa_path     = resolve_data_file("msmarco_sample_qa.tsv");
     std::string screenshot_path;
     std::string auto_ask = "What is the speed of light?";
     int warmup_qa = 120;

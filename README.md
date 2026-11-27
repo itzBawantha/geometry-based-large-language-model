@@ -117,30 +117,42 @@ Measured directly with [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) on a
 
 ---
 
-## Try It Yourself (Live 3D on Your GPU)
+## Try It Yourself (Ready Out of the Box — Model Included!)
 
-### What You Need
+The full **100.7 MB** pre-carved 4-Sphere Fluid Sponge (`data/kaikki_lexicon.bin` + `data/msmarco_sponge.bin` + `data/msmarco_sample_qa.tsv`) is **already committed inside `data/`**—no dataset downloads or Python setup required!
+
+### 1. Prerequisites
 - Linux + an NVIDIA GPU (uses standard `libcuda.so` — **no CUDA Toolkit / `nvcc` needed**)
-- `g++`, `SDL2`, `OpenGL`, `zlib`, `python3`, `curl`
+- `g++`, `SDL2`, `OpenGL`, `zlib`
 
 ```bash
 # Arch / CachyOS
-sudo pacman -S base-devel sdl2 mesa zlib curl python
+sudo pacman -S base-devel sdl2 mesa zlib
 
 # Ubuntu / Debian
-sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev curl python3
+sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev
 ```
 
-### Build & Run
+### 2. Clone, Build & Launch (3 Commands)
 ```bash
-# 1. Build the visualizer (and all GLLM tools)
+# 1. Clone the repo (includes the bundled 100.7 MB model in data/)
+git clone https://github.com/itzBawantha/geometry-based-large-language-model.git
+cd geometry-based-large-language-model
+
+# 2. Build the live 4-Sphere visualizer and benchmark tools
 ./scripts/build.sh
 
-# 2. Pack the Kaikki lexicon + Microsoft MS MARCO v2.1 CSR binary sponge
-python3 scripts/prepare_msmarco_data.py
+# 3. Launch the live 4-Sphere Fluid Sponge (auto-loads ./data/msmarco_sponge.bin!)
+./scripts/run_talk_viz.sh
+```
 
-# 3. Launch the live 4-Sphere Fluid Sponge!
-./scripts/run_talk_viz.sh --ask "What is the speed of light?"
+Want to ask a specific question immediately on launch, or load a custom sponge you packed yourself?
+```bash
+# Launch with a custom question
+./scripts/run_talk_viz.sh --ask "Who invented the telephone?"
+
+# Optional: load a larger custom sponge you packed with bin/gllm_pack_sponge
+./scripts/run_talk_viz.sh --sponge /path/to/custom_sponge.bin
 ```
 
 ### Controls Inside the Window
@@ -160,6 +172,9 @@ Before teaching the sphere to talk, GLLM started with **zero-weight vision** ins
 
 ## Files in This Repo
 
+- [`data/msmarco_sponge.bin`](data/msmarco_sponge.bin) — **80.6 MB** pre-carved MS MARCO v2.1 CSR Fluid Sponge (`559,659` Q&As, `3.14M` channels, `7.69M` syntax transitions)
+- [`data/kaikki_lexicon.bin`](data/kaikki_lexicon.bin) — **20.1 MB** outer vocabulary sphere (`1,360,919` English words & parts of speech from Wiktionary/Kaikki)
+- [`data/msmarco_sample_qa.tsv`](data/msmarco_sample_qa.tsv) — `6,000` sample Q&As for live `Space` / `T` sponge-carving playback
 - [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app (zero rules, zero penalties, binary CSR loader)
 - [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) — 100-question real GPU + CPU latency, VRAM, RAM, and answer-validity benchmark runner
 - [`src/gllm_pack_sponge.cpp`](src/gllm_pack_sponge.cpp) — High-speed C++17 streaming CSR sponge packer (packs 14.7M Q&As / 67.3M channels in ~50s)

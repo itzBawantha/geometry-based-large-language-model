@@ -6,8 +6,11 @@ bin/
 *.png
 !docs/images/*.png
 
-# Local datasets & generated model checkpoints
-data/
+# Local raw datasets & generated model checkpoints (keep bundled 100 MB talk sponge!)
+data/*
+!data/kaikki_lexicon.bin
+!data/msmarco_sponge.bin
+!data/msmarco_sample_qa.tsv
 models/
 lattice_mnist/cuda_lattice_mnist
 lattice_mnist/trained_shadows.bin
