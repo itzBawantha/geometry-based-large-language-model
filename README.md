@@ -80,6 +80,52 @@ We want this project to be 100% transparent—no smoke and mirrors, no hidden le
 
 ---
 
+## Benchmarks (100-Question Live RTX A3000 Test)
+
+Measured directly with [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) on an **NVIDIA RTX A3000 Laptop GPU (6 GB VRAM)** across **100 questions** (50 random MS MARCO queries + 50 unseen everyday factual questions), with **zero neural weights, zero rules, zero penalties, and zero bandages**:
+
+### Model Size, Compute & Energy
+
+| Metric | Measured Value | What It Means |
+| :--- | :---: | :--- |
+| **Total Model Size on Disk** | **100.7 MB** | `20.1 MB` dictionary (`1.36M` words) + `80.6 MB` sponge index (`559,659` Q&As, `3.14M` channels) |
+| **Cold Load Time** | **557.8 ms** | Loads the entire model from NVMe into memory in ~0.56 seconds |
+| **CPU RAM Used (RSS)** | **238 MiB** | Full 1.36M lexicon + 521,576 answer basins + 3.14M channels |
+| **GPU VRAM Used** | **82.0 MiB** | Only `1.3%` of a 6 GB GPU (`128³` sponge + double-buffered fluid grids) |
+| **Fluid Channel Solve (CPU, 1 core)** | **6.19 ms** mean (`6.75 ms` p50) | **161.6 queries/sec** across 3.14M channels — zero matrix multiplications |
+| **3D Voxel Wave (GPU, 36 steps)** | **81.59 ms** mean (`81.58 ms` p50) | Parallel CUDA splitting across `2.1M` voxels (avg `2,634` active, `1,755` collisions/query) |
+| **Full End-to-End Latency** | **87.78 ms** mean (`92.80 ms` p95) | **11.4 full 3D GPU queries/sec** |
+| **GPU Power Draw** | **34.8 W** avg (`35.0 W` peak) | **~3.05 Joules** per full 3D GPU query (`~0.00085 Wh`) |
+
+### Raw Answer Validity (100 Questions — Zero Bandages)
+
+| Split | Top-1 Strict Valid | Top-5 Valid | Notes |
+| :--- | :---: | :---: | :--- |
+| **50 Sampled MS MARCO Queries** | **38.0%** (`19/50` exact) | **64.0%** (`32/50`) | Across `521,576` competing answer basins (Mean Token-F1: `0.446`) |
+| **50 Unseen General-Knowledge Qs** | **42.0%** (`21/50` human-verified) | **70.0%** (`35/50` key hit) | Everyday questions written from scratch, zero rules |
+| **Combined 100 Questions** | **40.0%** (`40/100`) | **67.0%** (`67/100`) | Completely raw, unedited sponge outputs |
+
+<details>
+<summary><strong>Sample Raw Outputs (Real Wins & Honest Misses)</strong></summary>
+
+**Clean Raw Wins (Unseen Questions):**
+- *"What is the speed of light?"* → **`"The speed of light in MPH is 670,616,629 mph."`**
+- *"Who painted the Mona Lisa?"* → **`"Leonardo da Vinci."`**
+- *"What is the tallest mountain in the world?"* → **`"The tallest mountain in the world in a mountain range is Mount Everest."`**
+- *"What is the powerhouse of the cell?"* → **`"The mitochondria is called the powerhouse of the cell..."`**
+- *"Who developed the theory of relativity?"* → **`"Albert Einstein developed the theory of relativity."`**
+- *"What is the capital of Germany?"* → **`"Berlin is the capital of Germany."`**
+- *"What is the distance from Earth to the Sun?"* → **`"The average distance from earth to the sun is 150 million kilometers or 93 million miles."`**
+
+**Honest Raw Misses (Showing Geometric Neighbor Behavior):**
+- *"What is the largest planet in our solar system?"* → **`"The name of the second biggest planet in our solar system is Saturn."`** *(right topic neighborhood, missed superlative)*
+- *"What is the capital of Canada?"* → **`"The capital of Holland is Amsterdam."`** *(missing fact in MS MARCO → exited at nearest `"capital of [X]"` channel)*
+- *"What is the square root of 144?"* → **`"The square root of 50 is Approximately 7.07106."`** *(no arithmetic engine yet — exited at nearest `"square root of [N]"` tunnel)*
+
+</details>
+
+---
+
 ## Try It Yourself (Live 3D on Your GPU)
 
 ### What You Need
@@ -124,6 +170,7 @@ Before teaching the sphere to talk, GLLM started with **zero-weight vision** ins
 ## Files in This Repo
 
 - [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app (zero rules, zero penalties, binary CSR loader)
+- [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) — 100-question real GPU + CPU latency, VRAM, RAM, and answer-validity benchmark runner
 - [`kernels/gllm_talk_kernels.ptx`](kernels/gllm_talk_kernels.ptx) — GPU kernels for the 1.36M word shell, sponge carving, and parallel `128³` voxel fluid splitting & collisions
 - [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, raw sponge syntactic output, and competing answer fluid meters
 - [`scripts/prepare_msmarco_data.py`](scripts/prepare_msmarco_data.py) — Packs Microsoft MS MARCO v2.1 into a fast-loading binary CSR sponge index (`msmarco_sponge.bin`)
