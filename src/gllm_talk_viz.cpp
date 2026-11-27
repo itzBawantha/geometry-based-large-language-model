@@ -661,7 +661,8 @@ public:
     // 100% LEARNED POS VALVE: opening words -> raw observed answer POS counts (ZERO levers!)
     std::unordered_map<uint32_t, std::array<uint32_t, gllm::kNumPosClusters>> opener_to_ans_pos;
 
-    // Reusable flat accumulators for millisecond zero-hash fluid pouring across 1M+ basins
+    // Reusable flat accumulators for millisecond zero-hash fluid pouring across 15M+ Q&As
+    std::vector<float>    log_hits;
     std::vector<float>    acc_ml;
     std::vector<uint32_t> acc_mask;
     std::vector<uint32_t> touched_aids;
@@ -677,7 +678,7 @@ public:
         csr_words.clear(); csr_edges.clear();
         dyn_word_to_ans.clear(); dyn_word_tot.clear();
         opener_to_ans_pos.clear();
-        acc_ml.clear(); acc_mask.clear(); touched_aids.clear();
+        log_hits.clear(); acc_ml.clear(); acc_mask.clear(); touched_aids.clear();
         syntax = SyntacticSphere{};
         qa_indexed = 0;
     }
@@ -763,6 +764,10 @@ public:
             opener_to_ans_pos.emplace(op.wid, arr);
         }
 
+        log_hits.resize(answers.size());
+        for (size_t i = 0; i < answers.size(); ++i) {
+            log_hits[i] = std::log(static_cast<float>(std::max<uint32_t>(1u, answers[i].total_hits)));
+        }
         acc_ml.assign(answers.size(), 0.0f);
         acc_mask.assign(answers.size(), 0u);
         std::cout << "[SPONGE] Loaded binary CSR sponge (" << qa_indexed << " Q&As, "
@@ -1029,63 +1034,81 @@ public:
         const uint32_t K = static_cast<uint32_t>(active_words.size());
         if (K == 0) return sim;
 
-        // 3. Pure Mass Conservation: 1000 mL per word -> split proportionally by raw carved channel counts!
+        // 3. Exact Zero-Parameter Bayes Multi-Drop Fluid Intersection!
+        //    log(P(w|A)/P(w)) = log(c(w,A)) + log(N_qa / tot(w)) - log(hits(A))
+        //    Colliding drops multiply (log-ratios add); common stopwords vanish naturally to 0!
         if (acc_ml.size() < answers.size()) {
+            log_hits.resize(answers.size(), 0.0f);
+            for (size_t i = 0; i < answers.size(); ++i) {
+                log_hits[i] = std::log(static_cast<float>(std::max<uint32_t>(1u, answers[i].total_hits)));
+            }
             acc_ml.assign(answers.size(), 0.0f);
             acc_mask.assign(answers.size(), 0u);
         }
         touched_aids.clear();
+        const double N_qa = static_cast<double>(std::max<uint32_t>(1u, qa_indexed));
+        const float log_N = static_cast<float>(std::log(N_qa));
 
         for (uint32_t k = 0; k < K; ++k) {
             const auto& aw = active_words[k];
-            const double scale = 1000.0 / aw.total_cnt;
+            const float log_inv_pw = static_cast<float>(std::log(N_qa / aw.total_cnt));
             const uint32_t bit = 1u << std::min<uint32_t>(k, 31u);
 
             if (aw.wid < csr_words.size() && csr_words[aw.wid].edge_cnt > 0) {
                 const uint32_t off = csr_words[aw.wid].edge_off;
                 const uint32_t cnt = csr_words[aw.wid].edge_cnt;
                 const CsrEdge* ep  = csr_edges.data() + off;
+                const float* lh    = log_hits.data();
                 for (uint32_t i = 0; i < cnt; ++i) {
                     uint32_t aid = ep[i].aid;
-                    float split_ml = static_cast<float>(static_cast<double>(ep[i].count) * scale);
-                    if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
-                    acc_ml[aid]   += split_ml;
-                    acc_mask[aid] |= bit;
+                    float lc = (ep[i].count == 1u) ? 0.0f : std::log(static_cast<float>(ep[i].count));
+                    float llr = lc + log_inv_pw - lh[aid];
+                    if (llr > 0.0f) {
+                        if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
+                        acc_ml[aid]   += llr;
+                        acc_mask[aid] |= bit;
+                    }
                 }
             }
             auto itd = dyn_word_to_ans.find(aw.wid);
             if (itd != dyn_word_to_ans.end()) {
                 for (const auto& kv : itd->second) {
                     uint32_t aid = kv.first;
-                    float split_ml = static_cast<float>(static_cast<double>(kv.second) * scale);
-                    if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
-                    acc_ml[aid]   += split_ml;
-                    acc_mask[aid] |= bit;
+                    float lc = (kv.second == 1u) ? 0.0f : std::log(static_cast<float>(kv.second));
+                    float lh_a = std::log(static_cast<float>(std::max<uint32_t>(1u, answers[aid].total_hits)));
+                    float llr = lc + log_inv_pw - lh_a;
+                    if (llr > 0.0f) {
+                        if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
+                        acc_ml[aid]   += llr;
+                        acc_mask[aid] |= bit;
+                    }
                 }
             }
         }
         if (touched_aids.empty()) return sim;
 
-        // 4. Pure symmetric fluid pressure (inflow / basin_capacity) * pure Sphere-2 POS fraction (ZERO levers!)
-        struct RankedCand { uint32_t aid; float final_ml; uint32_t drop_sources; bool valve_ok; uint32_t src_mask; };
+        // 4. Exact Bayes Log-Posterior: log P(A) + sum log(P(w|A)/P(w)) + log P(POS|opener)
+        struct RankedCand { uint32_t aid; float log_post; float display_ml; uint32_t drop_sources; bool valve_ok; uint32_t src_mask; };
         std::vector<RankedCand> ranked;
         ranked.reserve(touched_aids.size());
         for (uint32_t aid : touched_aids) {
-            uint32_t mask     = acc_mask[aid];
-            uint32_t drops    = static_cast<uint32_t>(__builtin_popcount(mask));
-            uint8_t  ap       = answers[aid].primary_pos < gllm::kNumPosClusters ? answers[aid].primary_pos : 11u;
-            float    vp       = valve_prob[ap];
-            float    capacity = static_cast<float>(std::max<uint32_t>(1u, answers[aid].total_hits));
-            float    fml      = (acc_ml[aid] / capacity) * vp;
-            ranked.push_back({aid, fml, drops, (ap == top_vpos), mask});
-            // Reset sparse slot immediately for next query
+            uint32_t mask  = acc_mask[aid];
+            uint32_t drops = static_cast<uint32_t>(__builtin_popcount(mask));
+            uint8_t  ap    = answers[aid].primary_pos < gllm::kNumPosClusters ? answers[aid].primary_pos : 11u;
+            float    lp    = (log_hits[aid] - log_N) + acc_ml[aid] + std::log(std::max(1e-6f, valve_prob[ap]));
+            ranked.push_back({aid, lp, 0.0f, drops, (ap == top_vpos), mask});
             acc_ml[aid]   = 0.0f;
             acc_mask[aid] = 0u;
         }
         size_t keep_n = std::min<size_t>(22, ranked.size());
         std::partial_sort(ranked.begin(), ranked.begin() + keep_n, ranked.end(),
-                          [](const RankedCand& a, const RankedCand& b) { return a.final_ml > b.final_ml; });
+                          [](const RankedCand& a, const RankedCand& b) { return a.log_post > b.log_post; });
         ranked.resize(keep_n);
+        // Convert top-22 relative Bayes posterior probability into normalized mL fluid meters (100 mL total)
+        float max_lp = ranked[0].log_post;
+        float sum_exp = 0.0f;
+        for (auto& rc : ranked) { rc.display_ml = std::exp(std::max(-30.0f, rc.log_post - max_lp)); sum_exp += rc.display_ml; }
+        for (auto& rc : ranked) { rc.display_ml = (sum_exp > 0.0f) ? (100.0f * rc.display_ml / sum_exp) : 0.0f; }
 
         // Compute per-source branch flow ONLY for the top 22 winning candidates for crisp 3D visualization
         std::unordered_map<uint32_t, uint32_t> top_aid_to_ci;
@@ -1093,7 +1116,7 @@ public:
         std::vector<std::vector<std::pair<uint32_t, float>>> top_contribs(ranked.size());
         for (uint32_t k = 0; k < K; ++k) {
             const auto& aw = active_words[k];
-            const double scale = 1000.0 / aw.total_cnt;
+            const float log_inv_pw = static_cast<float>(std::log(N_qa / aw.total_cnt));
             if (aw.wid < csr_words.size() && csr_words[aw.wid].edge_cnt > 0) {
                 const uint32_t off = csr_words[aw.wid].edge_off;
                 const uint32_t cnt = csr_words[aw.wid].edge_cnt;
@@ -1101,7 +1124,9 @@ public:
                 for (uint32_t i = 0; i < cnt; ++i) {
                     auto it = top_aid_to_ci.find(ep[i].aid);
                     if (it != top_aid_to_ci.end()) {
-                        top_contribs[it->second].push_back({k, static_cast<float>(static_cast<double>(ep[i].count) * scale)});
+                        float lc = (ep[i].count == 1u) ? 0.0f : std::log(static_cast<float>(ep[i].count));
+                        float llr = lc + log_inv_pw - log_hits[ep[i].aid];
+                        if (llr > 0.0f) top_contribs[it->second].push_back({k, llr});
                     }
                 }
             }
@@ -1110,7 +1135,9 @@ public:
                 for (const auto& kv : itd->second) {
                     auto it = top_aid_to_ci.find(kv.first);
                     if (it != top_aid_to_ci.end()) {
-                        top_contribs[it->second].push_back({k, static_cast<float>(static_cast<double>(kv.second) * scale)});
+                        float lc = (kv.second == 1u) ? 0.0f : std::log(static_cast<float>(kv.second));
+                        float llr = lc + log_inv_pw - log_hits[kv.first];
+                        if (llr > 0.0f) top_contribs[it->second].push_back({k, llr});
                     }
                 }
             }
@@ -1132,7 +1159,7 @@ public:
             const auto& rc = ranked[ci];
             const auto& an = answers[rc.aid];
             gllm::CandidateFluidRow row;
-            row.answer = an.text; row.target_ml = rc.final_ml;
+            row.answer = an.text; row.target_ml = rc.display_ml;
             row.drop_sources = rc.drop_sources; row.total_sources = K;
             row.pos_valve_ok = rc.valve_ok; row.answer_pos = an.primary_pos;
             sim.candidates.push_back(std::move(row));

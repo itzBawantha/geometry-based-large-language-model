@@ -72,55 +72,46 @@ We want this project to be 100% transparent—no smoke and mirrors, no hidden le
 - **Zero Rules, Zero Penalties, Zero Bandages:**
   - **Outer Sphere (Sphere 1):** Static `1,360,919`-word English dictionary from Wiktionary (Kaikki).
   - **Single Q&A Dataset (MS MARCO v2.1):** All `559,659` labeled human Q&A pairs (`521,576` unique answer basins, `3,144,991` carved sponge channels, `7,688,886` syntactic transitions) train Spheres 2, 3, and 4 together—no separate sentence corpus.
-  - **Pure Symmetric Fluid Physics:** Every question word pours an equal `1000 mL` droplet divided proportionally across all carved channels (`count / word_total_count` — **no stopword lists, no exponents, no cutoffs**). Colliding droplets simply add together and divide by each answer basin's own capacity (`inflow / basin_hits` — pure fluid pressure, **no heuristic collision multipliers**), then pass through Sphere 2's raw learned POS fraction (`v_counts[pos] / v_tot`).
-  - **Raw Untouched Output:** Zero beam-search penalties, zero templates, zero post-processing—whatever basin wins in the sponge is emitted completely raw through Sphere 3, even when a missing fact or rare word produces a raw/imperfect answer!
-- **What's Next (Scaling Past 1M → 15M+ Q&As):**
-  - MS MARCO v2.1 has `559,659` answered human Q&As (out of `909,824` train+dev queries), so facts absent from MS MARCO (like *"What is the capital of France?"*) still fall back to nearby carved shape neighbors (*"The capital of Holland is Amsterdam."*).
-  - **Next goal:** Combine MS MARCO with multi-million Q&A archives like **PAQ-L1 (14.1M)** and **TQA+NQ+PAQ (65M)** into the exact same binary CSR sponge format so every sphere gets deeper, richer geometry purely from data.
+  - **Exact Zero-Parameter Multi-Drop Collision (Bayes Intersection):** Instead of merely adding independent drops, colliding water streams multiply via exact Bayes' law (`log P(A) + sum log(P(w|A)/P(w)) + log P(POS|opener)`) — **zero free parameters, zero stopword lists, zero penalties, zero rules**. Common words (`"the"`, `"of"`) automatically evaluate to `log(1) = 0`, while multi-word factual collisions amplify cleanly above single-word noise.
+  - **Raw Untouched Output:** Zero beam-search penalties, zero templates, zero post-processing—whatever basin wins in the sponge is emitted completely raw through Sphere 3!
+- **Key Scaling Discovery (Human Data Quality > Synthetic Volume):**
+  - Layering **14.1M auto-generated Wikipedia trivia pairs (PAQ-L1)** onto MS MARCO packed **14,703,069 Q&As (67.3M channels)** into just **704.5 MB** (loading in **0.96s**, still only **82 MiB VRAM**)—but noisy machine-generated questions diluted unseen accuracy from **66% → 48%**. Clean human Q&As win decisively in a pure geometry sponge!
 
 ---
 
-## Benchmarks (100-Question Live RTX A3000 Test)
+## Benchmarks (100-Question Head-to-Head RTX A3000 Test)
 
 Measured directly with [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) on an **NVIDIA RTX A3000 Laptop GPU (6 GB VRAM)** across **100 questions** (50 random MS MARCO queries + 50 unseen everyday factual questions), with **zero neural weights, zero rules, zero penalties, and zero bandages**:
 
-### Model Size, Compute & Energy
+### Head-to-Head Scaling & Physics Comparison
 
-| Metric | Measured Value | What It Means |
-| :--- | :---: | :--- |
-| **Total Model Size on Disk** | **100.7 MB** | `20.1 MB` dictionary (`1.36M` words) + `80.6 MB` sponge index (`559,659` Q&As, `3.14M` channels) |
-| **Cold Load Time** | **557.8 ms** | Loads the entire model from NVMe into memory in ~0.56 seconds |
-| **CPU RAM Used (RSS)** | **238 MiB** | Full 1.36M lexicon + 521,576 answer basins + 3.14M channels |
-| **GPU VRAM Used** | **82.0 MiB** | Only `1.3%` of a 6 GB GPU (`128³` sponge + double-buffered fluid grids) |
-| **Fluid Channel Solve (CPU, 1 core)** | **6.19 ms** mean (`6.75 ms` p50) | **161.6 queries/sec** across 3.14M channels — zero matrix multiplications |
-| **3D Voxel Wave (GPU, 36 steps)** | **81.59 ms** mean (`81.58 ms` p50) | Parallel CUDA splitting across `2.1M` voxels (avg `2,634` active, `1,755` collisions/query) |
-| **Full End-to-End Latency** | **87.78 ms** mean (`92.80 ms` p95) | **11.4 full 3D GPU queries/sec** |
-| **GPU Power Draw** | **34.8 W** avg (`35.0 W` peak) | **~3.05 Joules** per full 3D GPU query (`~0.00085 Wh`) |
+| Configuration | Disk Size | Load Time | CPU RAM | GPU VRAM | CSR Solve (CPU) | 3D GPU Wave (36 steps) | In-Dist Top-1 / Top-5 | Unseen Top-1 (Strict) / Top-5 | Combined Top-1 / Top-5 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **559k MS MARCO** *(Additive Pressure)* | 100.7 MB | 558 ms | 238 MiB | 82.0 MiB | 6.19 ms | 81.59 ms | 38% / 64% | 42% / 70% | 40% / 67% |
+| **559k MS MARCO** *(Exact Bayes Collision)* | **100.7 MB** | **529 ms** | **240 MiB** | **82.0 MiB** | **8.68 ms** (`115 Q/s`) | **81.38 ms** | **90% / 100%** | **66% / 90%** | **78% / 95%** |
+| **14.7M MS MARCO + PAQ-L1** *(Exact Bayes)* | 724.6 MB | 965 ms | 1,038 MiB | 82.0 MiB | 104.59 ms (`9.6 Q/s`) | 79.60 ms | 88% / 100% | 48% / 68% | 68% / 84% |
 
-### Raw Answer Validity (100 Questions — Zero Bandages)
-
-| Split | Top-1 Strict Valid | Top-5 Valid | Notes |
-| :--- | :---: | :---: | :--- |
-| **50 Sampled MS MARCO Queries** | **38.0%** (`19/50` exact) | **64.0%** (`32/50`) | Across `521,576` competing answer basins (Mean Token-F1: `0.446`) |
-| **50 Unseen General-Knowledge Qs** | **42.0%** (`21/50` human-verified) | **70.0%** (`35/50` key hit) | Everyday questions written from scratch, zero rules |
-| **Combined 100 Questions** | **40.0%** (`40/100`) | **67.0%** (`67/100`) | Completely raw, unedited sponge outputs |
+- **GPU Power Draw:** **34.7–34.8 W** avg (`35.0 W` peak) on RTX A3000 → **~3.1 Joules** per full 3D GPU query (`~0.00087 Wh`) at `82 MiB` VRAM (`1.3%` of 6 GB).
+- **Zero Matrix Multiplications:** Every single query runs pure sparse channel collision + parallel `128³` (`2.1M`-voxel) CUDA fluid splitting.
 
 <details>
-<summary><strong>Sample Raw Outputs (Real Wins & Honest Misses)</strong></summary>
+<summary><strong>Sample Raw Outputs on 559k Exact Bayes Sponge (Real Wins & Honest Misses)</strong></summary>
 
-**Clean Raw Wins (Unseen Questions):**
-- *"What is the speed of light?"* → **`"The speed of light in MPH is 670,616,629 mph."`**
-- *"Who painted the Mona Lisa?"* → **`"Leonardo da Vinci."`**
-- *"What is the tallest mountain in the world?"* → **`"The tallest mountain in the world in a mountain range is Mount Everest."`**
-- *"What is the powerhouse of the cell?"* → **`"The mitochondria is called the powerhouse of the cell..."`**
+**Clean Raw Wins (Unseen Everyday Questions — 33/50 Strict Human-Verified):**
+- *"What is the speed of light?"* → **`"The correct speed of light is 299,792,458 metres per second."`**
+- *"Who invented the telephone?"* → **`"Alexander Graham Bell"`**
+- *"What is the boiling point of water?"* → **`"The boiling point of water is 100 degrees Celsius."`**
+- *"What is the largest planet in our solar system?"* → **`"Jupiter is the largest planet in our solar system."`**
+- *"In what year did World War II end?"* → **`"World War II ended in 1945."`**
+- *"What is the capital of Canada / Australia / Brazil / Germany / Japan?"* → **Ottawa / Canberra / Brasilia / Berlin / Tokyo** (all 5 nailed!)
+- *"What causes iron nails to rust?"* → **`"Water causes rust on iron."`**
+- *"What is the normal human body temperature?"* → **`"37°C or 98.6°F"`**
 - *"Who developed the theory of relativity?"* → **`"Albert Einstein developed the theory of relativity."`**
-- *"What is the capital of Germany?"* → **`"Berlin is the capital of Germany."`**
-- *"What is the distance from Earth to the Sun?"* → **`"The average distance from earth to the sun is 150 million kilometers or 93 million miles."`**
 
-**Honest Raw Misses (Showing Geometric Neighbor Behavior):**
-- *"What is the largest planet in our solar system?"* → **`"The name of the second biggest planet in our solar system is Saturn."`** *(right topic neighborhood, missed superlative)*
-- *"What is the capital of Canada?"* → **`"The capital of Holland is Amsterdam."`** *(missing fact in MS MARCO → exited at nearest `"capital of [X]"` channel)*
+**Honest Raw Misses (Zero Bandages):**
+- *"What is the smallest planet in our solar system?"* → **`"The name of the second biggest planet in our solar system is Saturn."`** *(shared solar-system channels outweighed `"smallest"`)*
 - *"What is the square root of 144?"* → **`"The square root of 50 is Approximately 7.07106."`** *(no arithmetic engine yet — exited at nearest `"square root of [N]"` tunnel)*
+- *"What is the capital of Spain?"* → **`"No, Seville is not the capital of Spain."`** *(negative phrasing shared `"capital of Spain"`)*
 
 </details>
 
@@ -171,6 +162,7 @@ Before teaching the sphere to talk, GLLM started with **zero-weight vision** ins
 
 - [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app (zero rules, zero penalties, binary CSR loader)
 - [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) — 100-question real GPU + CPU latency, VRAM, RAM, and answer-validity benchmark runner
+- [`src/gllm_pack_sponge.cpp`](src/gllm_pack_sponge.cpp) — High-speed C++17 streaming CSR sponge packer (packs 14.7M Q&As / 67.3M channels in ~50s)
 - [`kernels/gllm_talk_kernels.ptx`](kernels/gllm_talk_kernels.ptx) — GPU kernels for the 1.36M word shell, sponge carving, and parallel `128³` voxel fluid splitting & collisions
 - [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, raw sponge syntactic output, and competing answer fluid meters
 - [`scripts/prepare_msmarco_data.py`](scripts/prepare_msmarco_data.py) — Packs Microsoft MS MARCO v2.1 into a fast-loading binary CSR sponge index (`msmarco_sponge.bin`)

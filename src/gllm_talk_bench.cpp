@@ -162,6 +162,7 @@ struct SpongeIndex {
     std::vector<CsrWordMeta> csr_words;
     std::vector<CsrEdge> csr_edges;
     std::unordered_map<uint32_t, std::array<uint32_t, kNumPos>> opener_to_ans_pos;
+    std::vector<float> log_hits;
     std::vector<float> acc_ml;
     std::vector<uint32_t> acc_mask;
     std::vector<uint32_t> touched_aids;
@@ -209,6 +210,10 @@ struct SpongeIndex {
             for (int p = 0; p < 12; ++p) arr[p] = op.cnts[p];
             opener_to_ans_pos.emplace(op.wid, arr);
         }
+        log_hits.resize(answers.size());
+        for (size_t i = 0; i < answers.size(); ++i) {
+            log_hits[i] = std::log(static_cast<float>(std::max<uint32_t>(1u, answers[i].total_hits)));
+        }
         acc_ml.assign(answers.size(), 0.0f);
         acc_mask.assign(answers.size(), 0u);
         return true;
@@ -236,6 +241,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--queries" && i + 1 < argc) queries_tsv = argv[++i];
+        else if (a == "--sponge" && i + 1 < argc) sponge_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_tsv = argv[++i];
         else if (a == "--gpu-steps" && i + 1 < argc) gpu_steps = std::atoi(argv[++i]);
     }
@@ -345,16 +351,23 @@ int main(int argc, char** argv) {
         }
         uint32_t K = static_cast<uint32_t>(aws.size());
         sp.touched_aids.clear();
+        const double N_qa = static_cast<double>(std::max<uint32_t>(1u, sp.qa_indexed));
+        const float log_N = static_cast<float>(std::log(N_qa));
+        const float* lh = sp.log_hits.data();
         for (uint32_t k = 0; k < K; ++k) {
             const auto& m = sp.csr_words[aws[k].wid];
-            const double sc = 1000.0 / aws[k].tot;
+            const float log_inv_pw = static_cast<float>(std::log(N_qa / aws[k].tot));
             const uint32_t bit = 1u << std::min<uint32_t>(k, 31u);
             const CsrEdge* ep = sp.csr_edges.data() + m.edge_off;
             for (uint32_t i = 0; i < m.edge_cnt; ++i) {
                 uint32_t aid = ep[i].aid;
-                if (sp.acc_mask[aid] == 0u) sp.touched_aids.push_back(aid);
-                sp.acc_ml[aid] += static_cast<float>(ep[i].count * sc);
-                sp.acc_mask[aid] |= bit;
+                float lc = (ep[i].count == 1u) ? 0.0f : std::log(static_cast<float>(ep[i].count));
+                float llr = lc + log_inv_pw - lh[aid];
+                if (llr > 0.0f) {
+                    if (sp.acc_mask[aid] == 0u) sp.touched_aids.push_back(aid);
+                    sp.acc_ml[aid] += llr;
+                    sp.acc_mask[aid] |= bit;
+                }
             }
         }
         struct RC { uint32_t aid; float fml; uint32_t drops; uint32_t mask; };
@@ -364,8 +377,7 @@ int main(int argc, char** argv) {
             uint32_t mask = sp.acc_mask[aid];
             uint32_t drops = static_cast<uint32_t>(__builtin_popcount(mask));
             uint8_t ap = sp.answers[aid].primary_pos < 12u ? sp.answers[aid].primary_pos : 11u;
-            float cap = static_cast<float>(std::max<uint32_t>(1u, sp.answers[aid].total_hits));
-            float fml = (sp.acc_ml[aid] / cap) * vp[ap];
+            float fml = (lh[aid] - log_N) + sp.acc_ml[aid] + std::log(std::max(1e-6f, vp[ap]));
             ranked.push_back({aid, fml, drops, mask});
             sp.acc_ml[aid] = 0.0f; sp.acc_mask[aid] = 0u;
         }
