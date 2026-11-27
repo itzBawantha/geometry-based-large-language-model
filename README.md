@@ -89,6 +89,7 @@ Measured directly with [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) on a
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **559k MS MARCO** *(Additive Pressure)* | 100.7 MB | 558 ms | 238 MiB | 82.0 MiB | 6.19 ms | 81.59 ms | 38% / 64% | 42% / 70% | 40% / 67% |
 | **559k MS MARCO** *(Exact Bayes Collision)* | **100.7 MB** | **529 ms** | **240 MiB** | **82.0 MiB** | **8.68 ms** (`115 Q/s`) | **81.38 ms** | **90% / 100%** | **66% / 90%** | **78% / 95%** |
+| **816k MS MARCO + Clean OpenHermes-2.5** *(Exact Bayes)* | **356.8 MB** | **831 ms** | **510 MiB** | **82.0 MiB** | **14.28 ms** (`70 Q/s`) | **82.50 ms** | **92% / 100%** | **82% / 98%** | **87% / 99%** |
 | **14.7M MS MARCO + PAQ-L1** *(Exact Bayes)* | 724.6 MB | 965 ms | 1,038 MiB | 82.0 MiB | 104.59 ms (`9.6 Q/s`) | 79.60 ms | 88% / 100% | 48% / 68% | 68% / 84% |
 
 - **GPU Power Draw:** **34.7–34.8 W** avg (`35.0 W` peak) on RTX A3000 → **~3.1 Joules** per full 3D GPU query (`~0.00087 Wh`) at `82 MiB` VRAM (`1.3%` of 6 GB).
@@ -181,6 +182,7 @@ Before teaching the sphere to talk, GLLM started with **zero-weight vision** ins
 - [`kernels/gllm_talk_kernels.ptx`](kernels/gllm_talk_kernels.ptx) — GPU kernels for the 1.36M word shell, sponge carving, and parallel `128³` voxel fluid splitting & collisions
 - [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, raw sponge syntactic output, and competing answer fluid meters
 - [`scripts/prepare_msmarco_data.py`](scripts/prepare_msmarco_data.py) — Packs Microsoft MS MARCO v2.1 into a fast-loading binary CSR sponge index (`msmarco_sponge.bin`)
+- [`scripts/prepare_openhermes_tsv.py`](scripts/prepare_openhermes_tsv.py) — Extracts curated GPT-4 Q&As from `teknium/OpenHermes-2.5` for packing with `gllm_pack_sponge`
 - [`scripts/prepare_talk_data.py`](scripts/prepare_talk_data.py) — Packs the Kaikki English dictionary lexicon (`kaikki_lexicon.bin`)
 - [`scripts/run_talk_viz.sh`](scripts/run_talk_viz.sh) — Launches `gllm_talk_viz` on your NVIDIA GPU
 - [`src/gllm_*.cpp`](src/) & [`kernels/gllm_kernels.ptx`](kernels/gllm_kernels.ptx) — The earlier visual 1B-sphere CLI suite

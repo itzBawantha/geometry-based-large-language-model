@@ -111,9 +111,11 @@ struct TalkHudState {
 
     // Syntactic Sphere Natural Sentence Output!
     std::string syn_path_str;       // e.g. "WH_Q -> NP_S -> VP_BE -> NP_O -> DECL"
-    std::string spoken_sentence;    // Full natural sentence emerging word-by-word!
+    std::string spoken_sentence;    // Full raw sponge answer (scrollable when long!)
     uint32_t    spoken_words_shown  = 0;
     uint32_t    spoken_words_total  = 0;
+    int         resp_scroll         = 0;
+    int         resp_max_scroll     = 0;
 
     std::vector<CandidateFluidRow> candidates;
     uint32_t selected_cand = 0;
@@ -133,6 +135,7 @@ public:
     Rect btn_load89 = {272, 350, 120, 26};
     Rect btn_stream = {16, 382, 184, 24};
     Rect btn_replay = {208, 382, 184, 24};
+    Rect box_resp   = {14, 414, 380, 102};
 
     static inline Rect cand_row_rect(size_t i) {
         return {20, 606 + static_cast<int>(i) * 25, 368, 23};
@@ -298,26 +301,62 @@ public:
         draw_btn(btn_replay, "REPLAY FLUID WAVE", hover_btn == 5, 85, 220, 175);
 
         // =====================================================================
-        // SYNTACTIC SPHERE RAW SPONGE OUTPUT (ZERO BANDAGES / ZERO PENALTIES!)
+        // SYNTACTIC SPHERE RAW SPONGE OUTPUT (SCROLLABLE FOR IN-DEPTH ANSWERS!)
         // =====================================================================
         fill_rect(14, 414, 380, 102, 12, 28, 34, 255);
         stroke_rect(14, 414, 380, 102, 70, 235, 185);
         if (!st.candidates.empty()) {
-            std::snprintf(buf, sizeof(buf), "RAW SPONGE OUTPUT (#%u - CLICK ANY ANSWER BELOW):",
+            std::snprintf(buf, sizeof(buf), "RAW SPONGE OUTPUT (#%u - CLICK #1-#8 / SCROLL):",
                           st.selected_cand + 1u);
             draw_text(22, 422, buf, 95, 248, 195);
         } else {
             draw_text(22, 422, "RAW SPONGE -> SYNTACTIC SPHERE OUTPUT:", 95, 248, 195);
         }
         if (!st.syn_path_str.empty()) {
-            draw_text(22, 436, st.syn_path_str.substr(0, 60), 150, 215, 235);
+            draw_text(22, 435, st.syn_path_str.substr(0, 60), 150, 215, 235);
         }
         if (!st.spoken_sentence.empty()) {
-            int scale = st.spoken_sentence.size() > 70 ? 1 : 2;
-            int max_ch = scale == 2 ? 30 : 60;
-            int max_ln = scale == 2 ? 3 : 5;
-            int lh     = scale == 2 ? 18 : 11;
-            draw_wrapped(22, 454, max_ch, max_ln, st.spoken_sentence, 255, 248, 205, lh, scale);
+            int scale  = (st.spoken_sentence.size() > 70 || st.spoken_sentence.find('\n') != std::string::npos) ? 1 : 2;
+            int max_ch = scale == 2 ? 30 : 59;
+            int max_ln = scale == 2 ? 3 : 6;
+            int lh     = scale == 2 ? 18 : 10;
+
+            // Wrap respecting real newlines so multi-step explanations scroll smoothly!
+            std::vector<std::string> wlines;
+            size_t pos = 0;
+            while (pos < st.spoken_sentence.size()) {
+                size_t nl = st.spoken_sentence.find('\n', pos);
+                std::string para = (nl == std::string::npos)
+                    ? st.spoken_sentence.substr(pos)
+                    : st.spoken_sentence.substr(pos, nl - pos);
+                pos = (nl == std::string::npos) ? st.spoken_sentence.size() : (nl + 1);
+                if (para.empty()) { continue; }
+                size_t p = 0;
+                while (p < para.size()) {
+                    while (p < para.size() && para[p] == ' ') p++;
+                    if (p >= para.size()) break;
+                    size_t len = std::min<size_t>(max_ch, para.size() - p);
+                    if (p + len < para.size() && para[p + len] != ' ') {
+                        size_t sp = para.rfind(' ', p + len);
+                        if (sp != std::string::npos && sp > p) len = sp - p;
+                    }
+                    wlines.push_back(para.substr(p, len));
+                    p += len;
+                }
+            }
+            int max_sc = std::max(0, static_cast<int>(wlines.size()) - max_ln);
+            int sc = std::clamp(st.resp_scroll, 0, max_sc);
+            for (int li = 0; li < max_ln && (sc + li) < static_cast<int>(wlines.size()); ++li) {
+                draw_text(22, 449 + li * lh, wlines[sc + li], 255, 248, 205, scale);
+            }
+            if (max_sc > 0) {
+                // Draw subtle scrollbar on right side of response box
+                int sb_x = 386, sb_y = 448, sb_h = 62;
+                fill_rect(sb_x, sb_y, 4, sb_h, 24, 52, 58);
+                int thumb_h = std::max(10, (sb_h * max_ln) / static_cast<int>(wlines.size()));
+                int thumb_y = sb_y + ((sb_h - thumb_h) * sc) / max_sc;
+                fill_rect(sb_x, thumb_y, 4, thumb_h, 95, 248, 195);
+            }
         } else {
             draw_wrapped(22, 456, 58, 2, "Ask any question to watch water split in the sponge and emerge raw through the Syntactic Sphere!", 145, 195, 205, 11);
         }

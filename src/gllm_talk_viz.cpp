@@ -1496,6 +1496,7 @@ int main(int argc, char** argv) {
         hst.wave_max_steps    = fluid_sim.max_steps;
         hst.candidates        = fluid_sim.candidates;
         hst.selected_cand     = 0;
+        hst.resp_scroll       = 0;
         hst.gpu_fluid_voxels  = 0; hst.gpu_split_forks = 0;
         hst.gpu_collision_vox = 0; hst.gpu_peak_vox_wt = 0.0f;
         hst.syn_path_str      = fluid_sim.syn_cascade.path_label;
@@ -1629,6 +1630,7 @@ int main(int argc, char** argv) {
         auto select_candidate = [&](uint32_t ci) {
             if (ci >= hst.candidates.size()) return;
             hst.selected_cand = ci;
+            hst.resp_scroll   = 0;
             const auto& cand = hst.candidates[ci];
             fluid_sim.syn_cascade = sponge.syntax.emit_raw_sponge_answer(lex, cand.answer);
             fluid_sim.syn_cascade_rays.clear();
@@ -1712,7 +1714,15 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                 dragging = false;
             } else if (ev.type == SDL_MOUSEWHEEL) {
-                cam_dist = std::clamp(cam_dist * (ev.wheel.y > 0 ? 0.90f : 1.11f), 0.45f, 7.5f);
+                int mx = 0, my = 0;
+                SDL_GetMouseState(&mx, &my);
+                int hx = 0, hy = 0;
+                to_hud_xy(mx, my, hx, hy);
+                if (mx < panel_px && hud.box_resp.contains(hx, hy)) {
+                    hst.resp_scroll = std::max(0, hst.resp_scroll - ev.wheel.y * 2);
+                } else {
+                    cam_dist = std::clamp(cam_dist * (ev.wheel.y > 0 ? 0.90f : 1.11f), 0.45f, 7.5f);
+                }
             } else if (ev.type == SDL_TEXTINPUT && hst.focus_field != 0) {
                 std::string& dst = (hst.focus_field == 1) ? hst.input_q : hst.input_a;
                 if (dst.size() < 96) dst += ev.text.text;

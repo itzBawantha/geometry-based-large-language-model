@@ -227,15 +227,31 @@ static bool parse_paq_jsonl_line(const std::string& line, std::string& out_q, st
     return !out_q.empty() && !out_a.empty();
 }
 
+// Unescape \\n -> real newline inside rich multi-line answers
+static std::string unescape_newlines(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            if (s[i + 1] == 'n') { out.push_back('\n'); ++i; continue; }
+            if (s[i + 1] == '\\') { out.push_back('\\'); ++i; continue; }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
 int main(int argc, char** argv) {
     std::string lex_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
     std::string out_bin  = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/gllm_15m_sponge.bin";
     std::vector<std::pair<std::string, bool>> inputs; // (path, is_jsonl)
+    size_t max_ans_len = 2400;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--lexicon" && i + 1 < argc) lex_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_bin = argv[++i];
+        else if (a == "--max-ans-len" && i + 1 < argc) max_ans_len = static_cast<size_t>(std::atoi(argv[++i]));
         else if (a == "--tsv" && i + 1 < argc) inputs.push_back({argv[++i], false});
         else if (a == "--jsonl" && i + 1 < argc) inputs.push_back({argv[++i], true});
     }
@@ -286,10 +302,10 @@ int main(int argc, char** argv) {
                 size_t tab = line.find('\t');
                 if (tab == std::string::npos) continue;
                 q = line.substr(0, tab);
-                a = clean_answer_field(line.substr(tab + 1));
+                a = unescape_newlines(clean_answer_field(line.substr(tab + 1)));
                 if (q.empty() || a.empty()) continue;
             }
-            if (a.size() > 320) a.resize(320);
+            if (a.size() > max_ans_len) a.resize(max_ans_len);
 
             lex.tokenize(q, q_toks);
             lex.tokenize(a, a_toks);
