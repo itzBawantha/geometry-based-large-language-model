@@ -4,10 +4,13 @@
 MODEL ?= models/sphere_1b.gllm
 CLUSTERS ?= 8
 
-.PHONY: all train benchmark benchmark-viz demo viz inspect clean legacy
+.PHONY: all talk-viz train benchmark benchmark-viz demo viz inspect clean legacy
 
 all:
 	@./scripts/build.sh
+
+talk-viz: all
+	@./scripts/run_talk_viz.sh --ask "What is the capital of France?"
 
 train: all
 	@./scripts/train_digits_and_letters.sh $(MODEL) $(CLUSTERS)

@@ -27,4 +27,7 @@ g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_hierarchy.cpp" -o "${ROOT}/bi
 echo "[BUILD] Compiling gllm_merge..."
 g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_merge.cpp" -o "${ROOT}/bin/gllm_merge" -lz
 
-echo "[BUILD] Done: bin/gllm_train, bin/gllm_eval, bin/gllm_inspect, bin/gllm_bench, bin/gllm_viz, bin/gllm_pyramid, bin/gllm_hierarchy, bin/gllm_merge"
+echo "[BUILD] Compiling gllm_talk_viz..."
+g++ -std=c++17 -O3 -Wall -Wextra "${ROOT}/src/gllm_talk_viz.cpp" -o "${ROOT}/bin/gllm_talk_viz" -lcuda -lSDL2 -lGL -lz -ldl -lpthread
+
+echo "[BUILD] Done: bin/gllm_train, bin/gllm_eval, bin/gllm_inspect, bin/gllm_bench, bin/gllm_viz, bin/gllm_pyramid, bin/gllm_hierarchy, bin/gllm_merge, bin/gllm_talk_viz"

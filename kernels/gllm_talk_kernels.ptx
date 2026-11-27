@@ -1,0 +1,780 @@
+// =============================================================================
+// CUDA PTX Kernels for GLLM Learning-to-Talk Parallel Fluid Sponge Engine
+// Target: sm_52+ (JIT-compiled by NVIDIA CUDA Driver via libcuda.so, no nvcc)
+//
+// Kernels:
+//   1. init_word_outer_shell     : Places all ~1.36M Kaikki English words on R=1.0
+//   2. decay_word_glow           : Per-frame outer-shell word activation decay
+//   3. carve_sponge_voxels       : 3D GPU atomic sponge erosion (porosity + flow)
+//   4. inject_fluid_segments     : Injects multi-word fluid droplets + source bitmasks
+//   5. step_fluid_split_recombine: Parallel 128^3 voxel fluid splitting across carved
+//                                  forks & multi-source collision/recombination!
+//   6. emit_sponge_voxels        : Zero-copy CUDA-GL emitter visualizing both sponge
+//                                  channels AND live voxel fluid weight + collisions
+// =============================================================================
+
+.version 7.0
+.target sm_52
+.address_size 64
+
+// -----------------------------------------------------------------------------
+// Kernel 1: init_word_outer_shell
+// -----------------------------------------------------------------------------
+.visible .entry init_word_outer_shell(
+    .param .u64 param_out_vbo,
+    .param .u64 param_pos_ids,
+    .param .u64 param_pos_colors,
+    .param .u32 param_num_words
+)
+{
+    .reg .pred %p<2>;
+    .reg .u32  %r<8>;
+    .reg .u64  %rd<10>;
+    .reg .f32  %f<16>;
+    .reg .f64  %fd<10>;
+
+    ld.param.u64 %rd0, [param_out_vbo];
+    ld.param.u64 %rd1, [param_pos_ids];
+    ld.param.u64 %rd2, [param_pos_colors];
+    ld.param.u32 %r0,  [param_num_words];
+
+    mov.u32    %r1, %ctaid.x;
+    mov.u32    %r2, %ntid.x;
+    mov.u32    %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra INIT_DONE;
+
+    cvt.rn.f64.u32 %fd0, %r4;
+    add.f64        %fd0, %fd0, 0d3FE0000000000000;
+    cvt.rn.f64.u32 %fd1, %r0;
+    div.rn.f64     %fd2, %fd0, %fd1;
+    mul.f64        %fd2, %fd2, 0d4000000000000000;
+    mov.f64        %fd3, 0d3FF0000000000000;
+    sub.f64        %fd3, %fd3, %fd2;
+    cvt.rn.f32.f64 %f0, %fd3;
+
+    mul.f32        %f1, %f0, %f0;
+    sub.f32        %f1, 1.0, %f1;
+    max.f32        %f1, %f1, 0.0;
+    sqrt.approx.f32 %f2, %f1;
+
+    cvt.rn.f64.u32 %fd4, %r4;
+    mul.f64        %fd5, %fd4, 0d3FD87222BB651B83;
+    cvt.rmi.f64.f64 %fd6, %fd5;
+    sub.f64        %fd5, %fd5, %fd6;
+    mul.f64        %fd5, %fd5, 0d401921FB54442D18;
+    cvt.rn.f32.f64 %f3, %fd5;
+
+    cos.approx.f32 %f4, %f3;
+    sin.approx.f32 %f5, %f3;
+    mul.f32        %f6, %f2, %f4;
+    mul.f32        %f7, %f2, %f5;
+
+    cvt.u64.u32    %rd3, %r4;
+    add.u64        %rd4, %rd1, %rd3;
+    ld.global.u8   %r5, [%rd4];
+    min.u32        %r5, %r5, 11;
+    cvt.u64.u32    %rd5, %r5;
+    shl.b64        %rd5, %rd5, 4;
+    add.u64        %rd6, %rd2, %rd5;
+    ld.global.v4.f32 {%f8, %f9, %f10, %f11}, [%rd6];
+
+    shl.b64        %rd7, %rd3, 5;
+    add.u64        %rd8, %rd0, %rd7;
+    mov.f32        %f12, 0.0;
+    mov.f32        %f13, 1.0;
+    st.global.v4.f32 [%rd8],      {%f6, %f0, %f7, %f12};
+    st.global.v4.f32 [%rd8 + 16], {%f8, %f9, %f10, %f13};
+
+INIT_DONE:
+    ret;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 2: decay_word_glow
+// -----------------------------------------------------------------------------
+.visible .entry decay_word_glow(
+    .param .u64 param_vbo,
+    .param .u32 param_num_words,
+    .param .f32 param_decay
+)
+{
+    .reg .pred %p<3>;
+    .reg .u32  %r<6>;
+    .reg .u64  %rd<4>;
+    .reg .f32  %f<4>;
+
+    ld.param.u64 %rd0, [param_vbo];
+    ld.param.u32 %r0,  [param_num_words];
+    ld.param.f32 %f0,  [param_decay];
+
+    mov.u32    %r1, %ctaid.x;
+    mov.u32    %r2, %ntid.x;
+    mov.u32    %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra DECAY_DONE;
+
+    cvt.u64.u32 %rd1, %r4;
+    shl.b64     %rd1, %rd1, 5;
+    add.u64     %rd2, %rd0, %rd1;
+    ld.global.f32 %f1, [%rd2 + 12];
+    abs.f32     %f2, %f1;
+    setp.lt.f32 %p1, %f2, 0.002;
+    @%p1 bra DECAY_DONE;
+
+    mul.f32     %f1, %f1, %f0;
+    abs.f32     %f3, %f1;
+    setp.lt.f32 %p2, %f3, 0.002;
+    selp.f32    %f1, 0.0, %f1, %p2;
+    st.global.f32 [%rd2 + 12], %f1;
+
+DECAY_DONE:
+    ret;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 3: carve_sponge_voxels
+// -----------------------------------------------------------------------------
+.visible .entry carve_sponge_voxels(
+    .param .u64 param_sponge,
+    .param .u64 param_meta,
+    .param .u64 param_segs,
+    .param .u32 param_num_segs,
+    .param .u32 param_grid,
+    .param .f32 param_world_rad
+)
+{
+    .reg .pred %p<12>;
+    .reg .u32  %r<24>;
+    .reg .s32  %s<14>;
+    .reg .u64  %rd<14>;
+    .reg .f32  %f<34>;
+
+    ld.param.u64 %rd0, [param_sponge];
+    ld.param.u64 %rd1, [param_meta];
+    ld.param.u64 %rd2, [param_segs];
+    ld.param.u32 %r0,  [param_num_segs];
+    ld.param.u32 %r1,  [param_grid];
+    ld.param.f32 %f0,  [param_world_rad];
+
+    mov.u32    %r2, %ctaid.x;
+    mov.u32    %r3, %ntid.x;
+    mov.u32    %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+
+    shr.u32    %r6, %r5, 5;
+    and.b32    %r7, %r5, 31;
+    setp.ge.u32 %p0, %r6, %r0;
+    @%p0 bra CARVE_DONE;
+
+    mul.wide.u32 %rd3, %r6, 48;
+    add.u64      %rd4, %rd2, %rd3;
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4},    [%rd4];
+    ld.global.v4.f32 {%f5, %f6, %f7, %f8},    [%rd4 + 16];
+    ld.global.v4.f32 {%f9, %f10, %f11, %f12}, [%rd4 + 32];
+
+    cvt.rn.f32.u32 %f13, %r7;
+    mul.f32        %f13, %f13, 0.0322580645;
+
+    sub.f32 %f14, %f5, %f1;
+    sub.f32 %f15, %f6, %f2;
+    sub.f32 %f16, %f7, %f3;
+    fma.rn.f32 %f17, %f13, %f14, %f1;
+    fma.rn.f32 %f18, %f13, %f15, %f2;
+    fma.rn.f32 %f19, %f13, %f16, %f3;
+
+    mul.f32 %f20, %f17, %f17;
+    fma.rn.f32 %f20, %f18, %f18, %f20;
+    fma.rn.f32 %f20, %f19, %f19, %f20;
+    mul.f32 %f21, %f0, %f0;
+    setp.gt.f32 %p1, %f20, %f21;
+    @%p1 bra CARVE_DONE;
+
+    rcp.approx.f32 %f22, %f0;
+    mul.f32        %f22, %f22, 0.5;
+    cvt.rn.f32.u32 %f23, %r1;
+    fma.rn.f32 %f24, %f17, %f22, 0.5; mul.f32 %f24, %f24, %f23;
+    fma.rn.f32 %f25, %f18, %f22, 0.5; mul.f32 %f25, %f25, %f23;
+    fma.rn.f32 %f26, %f19, %f22, 0.5; mul.f32 %f26, %f26, %f23;
+
+    cvt.rni.s32.f32 %s0, %f24;
+    cvt.rni.s32.f32 %s1, %f25;
+    cvt.rni.s32.f32 %s2, %f26;
+    mov.s32         %s3, %r1;
+
+    mov.s32 %s4, -1;
+LOOP_OZ:
+    setp.gt.s32 %p2, %s4, 1;
+    @%p2 bra CARVE_DONE;
+    add.s32 %s7, %s2, %s4;
+    setp.lt.s32 %p3, %s7, 0;
+    setp.ge.s32 %p4, %s7, %s3;
+    or.pred %p3, %p3, %p4;
+    @%p3 bra NEXT_OZ;
+
+    mov.s32 %s5, -1;
+LOOP_OY:
+    setp.gt.s32 %p5, %s5, 1;
+    @%p5 bra NEXT_OZ;
+    add.s32 %s8, %s1, %s5;
+    setp.lt.s32 %p6, %s8, 0;
+    setp.ge.s32 %p7, %s8, %s3;
+    or.pred %p6, %p6, %p7;
+    @%p6 bra NEXT_OY;
+
+    mov.s32 %s6, -1;
+LOOP_OX:
+    setp.gt.s32 %p8, %s6, 1;
+    @%p8 bra NEXT_OY;
+    add.s32 %s9, %s0, %s6;
+    setp.lt.s32 %p9, %s9, 0;
+    setp.ge.s32 %p10, %s9, %s3;
+    or.pred %p9, %p9, %p10;
+    @%p9 bra NEXT_OX;
+
+    mul.lo.s32 %s10, %s6, %s6;
+    mad.lo.s32 %s10, %s5, %s5, %s10;
+    mad.lo.s32 %s10, %s4, %s4, %s10;
+    setp.gt.s32 %p11, %s10, 1;
+    @%p11 bra NEXT_OX;
+
+    cvt.rn.f32.s32 %f27, %s10;
+    fma.rn.f32     %f27, %f27, 3.5, 1.0;
+    rcp.approx.f32 %f27, %f27;
+    mul.f32        %f28, %f8, %f27;
+
+    mad.lo.s32 %s11, %s7, %s3, %s8;
+    mad.lo.s32 %s11, %s11, %s3, %s9;
+    cvt.u64.s32 %rd5, %s11;
+
+    shl.b64 %rd6, %rd5, 4;
+    add.u64 %rd7, %rd0, %rd6;
+    atom.global.add.f32 %f29, [%rd7],      %f28;
+    mul.f32 %f30, %f9,  %f28;
+    mul.f32 %f31, %f10, %f28;
+    mul.f32 %f32, %f11, %f28;
+    atom.global.add.f32 %f29, [%rd7 + 4],  %f30;
+    atom.global.add.f32 %f29, [%rd7 + 8],  %f31;
+    atom.global.add.f32 %f29, [%rd7 + 12], %f32;
+
+    shl.b64 %rd8, %rd5, 3;
+    add.u64 %rd9, %rd1, %rd8;
+    mov.f32 %f33, 1.0;
+    st.global.f32 [%rd9], %f33;
+    mul.f32 %f33, %f12, %f28;
+    atom.global.add.f32 %f29, [%rd9 + 4], %f33;
+
+NEXT_OX:
+    add.s32 %s6, %s6, 1;
+    bra LOOP_OX;
+NEXT_OY:
+    add.s32 %s5, %s5, 1;
+    bra LOOP_OY;
+NEXT_OZ:
+    add.s32 %s4, %s4, 1;
+    bra LOOP_OZ;
+
+CARVE_DONE:
+    ret;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 4: inject_fluid_drops
+//   Injects fluid droplets (mass + source word bitmask) at world positions into
+//   the 128^3 CUDA fluid buffer (d_fluid[G^3] float, d_fmask[G^3] uint32_t).
+//
+//   FluidDrop layout (32 bytes):
+//     +0  float4 {x, y, z, fluid_mass}
+//     +16 uint32 source_bit, uint32 pad0, float flow_x, float flow_y
+// -----------------------------------------------------------------------------
+.visible .entry inject_fluid_drops(
+    .param .u64 param_fluid,
+    .param .u64 param_fmask,
+    .param .u64 param_drops,
+    .param .u32 param_num_drops,
+    .param .u32 param_grid,
+    .param .f32 param_world_rad
+)
+{
+    .reg .pred %p<11>;
+    .reg .u32  %r<12>;
+    .reg .s32  %s<14>;
+    .reg .u64  %rd<10>;
+    .reg .f32  %f<16>;
+
+    ld.param.u64 %rd0, [param_fluid];
+    ld.param.u64 %rd1, [param_fmask];
+    ld.param.u64 %rd2, [param_drops];
+    ld.param.u32 %r0,  [param_num_drops];
+    ld.param.u32 %r1,  [param_grid];
+    ld.param.f32 %f0,  [param_world_rad];
+
+    mov.u32    %r2, %ctaid.x;
+    mov.u32    %r3, %ntid.x;
+    mov.u32    %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p0, %r5, %r0;
+    @%p0 bra INJ_DONE;
+
+    cvt.u64.u32 %rd3, %r5;
+    shl.b64     %rd3, %rd3, 5;          // * 32 bytes
+    add.u64     %rd4, %rd2, %rd3;
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd4]; // x, y, z, mass
+    ld.global.u32    %r6, [%rd4 + 16];             // source_bit
+
+    mul.f32 %f5, %f1, %f1;
+    fma.rn.f32 %f5, %f2, %f2, %f5;
+    fma.rn.f32 %f5, %f3, %f3, %f5;
+    mul.f32 %f6, %f0, %f0;
+    setp.gt.f32 %p1, %f5, %f6;
+    @%p1 bra INJ_DONE;
+
+    rcp.approx.f32 %f7, %f0;
+    mul.f32        %f7, %f7, 0.5;
+    cvt.rn.f32.u32 %f8, %r1;
+    fma.rn.f32 %f9,  %f1, %f7, 0.5; mul.f32 %f9,  %f9,  %f8;
+    fma.rn.f32 %f10, %f2, %f7, 0.5; mul.f32 %f10, %f10, %f8;
+    fma.rn.f32 %f11, %f3, %f7, 0.5; mul.f32 %f11, %f11, %f8;
+
+    cvt.rni.s32.f32 %s0, %f9;
+    cvt.rni.s32.f32 %s1, %f10;
+    cvt.rni.s32.f32 %s2, %f11;
+    mov.s32         %s3, %r1;
+
+    mov.s32 %s4, -1;
+INJ_OZ:
+    setp.gt.s32 %p2, %s4, 1; @%p2 bra INJ_DONE;
+    add.s32 %s7, %s2, %s4;
+    setp.lt.s32 %p3, %s7, 0; setp.ge.s32 %p4, %s7, %s3; or.pred %p3, %p3, %p4; @%p3 bra INJ_NOZ;
+    mov.s32 %s5, -1;
+INJ_OY:
+    setp.gt.s32 %p5, %s5, 1; @%p5 bra INJ_NOZ;
+    add.s32 %s8, %s1, %s5;
+    setp.lt.s32 %p6, %s8, 0; setp.ge.s32 %p7, %s8, %s3; or.pred %p6, %p6, %p7; @%p6 bra INJ_NOY;
+    mov.s32 %s6, -1;
+INJ_OX:
+    setp.gt.s32 %p8, %s6, 1; @%p8 bra INJ_NOY;
+    add.s32 %s9, %s0, %s6;
+    setp.lt.s32 %p9, %s9, 0; setp.ge.s32 %p10, %s9, %s3; or.pred %p9, %p9, %p10; @%p9 bra INJ_NOX;
+
+    mul.lo.s32 %s10, %s6, %s6;
+    mad.lo.s32 %s10, %s5, %s5, %s10;
+    mad.lo.s32 %s10, %s4, %s4, %s10;
+    setp.gt.s32 %p9, %s10, 1; @%p9 bra INJ_NOX;
+
+    cvt.rn.f32.s32 %f12, %s10;
+    fma.rn.f32     %f12, %f12, 2.5, 1.0;
+    rcp.approx.f32 %f12, %f12;
+    mul.f32        %f13, %f4, %f12;
+
+    mad.lo.s32 %s11, %s7, %s3, %s8;
+    mad.lo.s32 %s11, %s11, %s3, %s9;
+    cvt.u64.s32 %rd5, %s11;
+    shl.b64     %rd6, %rd5, 2;
+    add.u64     %rd7, %rd0, %rd6;
+    add.u64     %rd8, %rd1, %rd6;
+    atom.global.add.f32 %f14, [%rd7], %f13;
+    atom.global.or.b32  %r7,  [%rd8], %r6;
+
+INJ_NOX:
+    add.s32 %s6, %s6, 1; bra INJ_OX;
+INJ_NOY:
+    add.s32 %s5, %s5, 1; bra INJ_OY;
+INJ_NOZ:
+    add.s32 %s4, %s4, 1; bra INJ_OZ;
+
+INJ_DONE:
+    ret;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 5: step_fluid_split_recombine
+//   TRUE PARALLEL 128^3 VOXEL FLUID SPLITTING & RECOMBINING ON CUDA!
+//   Every active voxel splits its fluid proportionally across all open carved
+//   6-neighbors (weighted by neighbor porosity + directional flow alignment),
+//   OR-ing source bitmasks so colliding question-word waves immediately trigger
+//   recombination! Also tracks exact GPU stats:
+//     d_stats[0] = active fluid voxels
+//     d_stats[1] = splitting fork voxels (degree >= 2)
+//     d_stats[2] = collision/recombination voxels (popc(fmask) >= 2)
+//     d_stats[3] = peak voxel fluid (scaled x1000 as uint32 via atomicMax)
+// -----------------------------------------------------------------------------
+.visible .entry step_fluid_split_recombine(
+    .param .u64 param_sponge,       // float4[G^3]: {por, fx, fy, fz}
+    .param .u64 param_fluid_in,     // float[G^3]
+    .param .u64 param_fmask_in,     // uint32[G^3]
+    .param .u64 param_fluid_out,    // float[G^3] (zeroed before launch)
+    .param .u64 param_fmask_out,    // uint32[G^3] (zeroed before launch)
+    .param .u64 param_stats,        // uint32[4]
+    .param .u32 param_grid
+)
+{
+    .reg .pred %p<14>;
+    .reg .u32  %r<26>;
+    .reg .u64  %rd<16>;
+    .reg .f32  %f<32>;
+
+    ld.param.u64 %rd0, [param_sponge];
+    ld.param.u64 %rd1, [param_fluid_in];
+    ld.param.u64 %rd2, [param_fmask_in];
+    ld.param.u64 %rd3, [param_fluid_out];
+    ld.param.u64 %rd4, [param_fmask_out];
+    ld.param.u64 %rd5, [param_stats];
+    ld.param.u32 %r0,  [param_grid];
+
+    mov.u32    %r1, %ctaid.x;
+    mov.u32    %r2, %ntid.x;
+    mov.u32    %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;      // idx
+    mul.lo.u32 %r5, %r0, %r0;           // G*G
+    mul.lo.u32 %r6, %r5, %r0;           // G^3
+    setp.ge.u32 %p0, %r4, %r6;
+    @%p0 bra STEP_DONE;
+
+    cvt.u64.u32 %rd6, %r4;
+    shl.b64     %rd7, %rd6, 2;          // idx * 4
+    add.u64     %rd8, %rd1, %rd7;
+    ld.global.f32 %f0, [%rd8];          // vol
+    setp.lt.f32 %p1, %f0, 0.0003;
+    @%p1 bra STEP_DONE;
+
+    add.u64     %rd9, %rd2, %rd7;
+    ld.global.u32 %r7, [%rd9];          // fmask
+
+    // Update live GPU telemetry
+    atom.global.add.u32 %r20, [%rd5], 1;
+    popc.b32            %r21, %r7;
+    setp.ge.u32 %p2, %r21, 2;
+    @%p2 atom.global.add.u32 %r20, [%rd5 + 8], 1;
+    mul.f32             %f29, %f0, 1000.0;
+    cvt.rni.u32.f32     %r22, %f29;
+    atom.global.max.u32 %r20, [%rd5 + 12], %r22;
+
+    // Load local sponge flow direction (fx, fy, fz) and normalize
+    shl.b64 %rd10, %rd6, 4;
+    add.u64 %rd11, %rd0, %rd10;
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd11]; // por, fx, fy, fz
+    mul.f32 %f5, %f2, %f2;
+    fma.rn.f32 %f5, %f3, %f3, %f5;
+    fma.rn.f32 %f5, %f4, %f4, %f5;
+    add.f32 %f5, %f5, 0.000001;
+    rsqrt.approx.f32 %f5, %f5;
+    mul.f32 %f2, %f2, %f5;              // unit fx
+    mul.f32 %f3, %f3, %f5;              // unit fy
+    mul.f32 %f4, %f4, %f5;              // unit fz
+
+    // Recover (ix, iy, iz)
+    div.u32 %r8,  %r4, %r5;             // iz
+    rem.u32 %r9,  %r4, %r5;
+    div.u32 %r10, %r9, %r0;             // iy
+    rem.u32 %r11, %r9, %r0;             // ix
+    sub.u32 %r12, %r0, 1;               // G - 1
+
+    // Evaluate 6-neighbor carved conductances: w0..w5 for (+x, -x, +y, -y, +z, -z)
+    mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0;
+    mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.u32 %r13, 0;                    // open branch degree
+
+    // +X
+    setp.lt.u32 %p3, %r11, %r12;
+    @!%p3 bra CHK_NX;
+    add.u32 %r14, %r4, 1;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra CHK_NX;
+    max.f32 %f7, %f2, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f10, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+CHK_NX:
+    setp.gt.u32 %p3, %r11, 0;
+    @!%p3 bra CHK_PY;
+    sub.u32 %r14, %r4, 1;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra CHK_PY;
+    neg.f32 %f7, %f2; max.f32 %f7, %f7, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f11, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+CHK_PY:
+    setp.lt.u32 %p3, %r10, %r12;
+    @!%p3 bra CHK_NY;
+    add.u32 %r14, %r4, %r0;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra CHK_NY;
+    max.f32 %f7, %f3, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f12, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+CHK_NY:
+    setp.gt.u32 %p3, %r10, 0;
+    @!%p3 bra CHK_PZ;
+    sub.u32 %r14, %r4, %r0;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra CHK_PZ;
+    neg.f32 %f7, %f3; max.f32 %f7, %f7, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f13, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+CHK_PZ:
+    setp.lt.u32 %p3, %r8, %r12;
+    @!%p3 bra CHK_NZ;
+    add.u32 %r14, %r4, %r5;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra CHK_NZ;
+    max.f32 %f7, %f4, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f14, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+CHK_NZ:
+    setp.gt.u32 %p3, %r8, 0;
+    @!%p3 bra DO_SPLIT;
+    sub.u32 %r14, %r4, %r5;
+    cvt.u64.u32 %rd12, %r14; shl.b64 %rd12, %rd12, 4; add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    setp.gt.f32 %p4, %f6, 0.02;
+    @!%p4 bra DO_SPLIT;
+    neg.f32 %f7, %f4; max.f32 %f7, %f7, 0.0; fma.rn.f32 %f7, %f7, 0.65, 0.35; mul.f32 %f15, %f6, %f7;
+    add.u32 %r13, %r13, 1;
+
+DO_SPLIT:
+    // Record fork split count if >= 2 open branches
+    setp.ge.u32 %p5, %r13, 2;
+    @%p5 atom.global.add.u32 %r20, [%rd5 + 4], 1;
+
+    add.f32 %f16, %f10, %f11;
+    add.f32 %f16, %f16, %f12;
+    add.f32 %f16, %f16, %f13;
+    add.f32 %f16, %f16, %f14;
+    add.f32 %f16, %f16, %f15;           // total_w
+
+    // Retain residual wetness (24% if splitting, 92% if dead-end pool) + pour 78% across forks!
+    setp.gt.f32 %p6, %f16, 0.0001;
+    selp.f32 %f17, 0.24, 0.92, %p6;
+    mul.f32  %f18, %f0, %f17;
+    add.u64  %rd13, %rd3, %rd7;
+    add.u64  %rd14, %rd4, %rd7;
+    atom.global.add.f32 %f28, [%rd13], %f18;
+    atom.global.or.b32  %r20, [%rd14], %r7;
+    @!%p6 bra STEP_DONE;
+
+    // Pour 78% of voxel fluid split proportionally across open carved branches!
+    mul.f32        %f19, %f0, 0.78;
+    div.approx.f32 %f20, %f19, %f16;    // scale = (0.78 * vol) / total_w
+
+    // Pour into +X, -X, +Y, -Y, +Z, -Z where w > 0
+    setp.gt.f32 %p7, %f10, 0.0; @!%p7 bra POUR_NX;
+    add.u32 %r15, %r4, 1; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f10, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+POUR_NX:
+    setp.gt.f32 %p7, %f11, 0.0; @!%p7 bra POUR_PY;
+    sub.u32 %r15, %r4, 1; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f11, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+POUR_PY:
+    setp.gt.f32 %p7, %f12, 0.0; @!%p7 bra POUR_NY;
+    add.u32 %r15, %r4, %r0; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f12, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+POUR_NY:
+    setp.gt.f32 %p7, %f13, 0.0; @!%p7 bra POUR_PZ;
+    sub.u32 %r15, %r4, %r0; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f13, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+POUR_PZ:
+    setp.gt.f32 %p7, %f14, 0.0; @!%p7 bra POUR_NZ;
+    add.u32 %r15, %r4, %r5; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f14, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+POUR_NZ:
+    setp.gt.f32 %p7, %f15, 0.0; @!%p7 bra STEP_DONE;
+    sub.u32 %r15, %r4, %r5; cvt.u64.u32 %rd12, %r15; shl.b64 %rd12, %rd12, 2;
+    mul.f32 %f21, %f15, %f20;
+    add.u64 %rd13, %rd3, %rd12; atom.global.add.f32 %f28, [%rd13], %f21;
+    add.u64 %rd14, %rd4, %rd12; atom.global.or.b32  %r20, [%rd14], %r7;
+
+STEP_DONE:
+    ret;
+}
+
+// -----------------------------------------------------------------------------
+// Kernel 6: emit_sponge_voxels
+//   Dual-mode zero-copy CUDA-GL emitter:
+//     fluid_mode == 0 : crisp carved sponge channels (cyan Q / amber A / gold trunks)
+//     fluid_mode == 1 : translucent sponge skeleton + BRIGHT FLUID WEIGHT MAP!
+//                       (1-word split fluid = electric cyan scaled by voxel weight;
+//                        2+ word RECOMBINED collision = blazing magenta-gold splash!)
+// -----------------------------------------------------------------------------
+.visible .entry emit_sponge_voxels(
+    .param .u64 param_sponge,
+    .param .u64 param_meta,
+    .param .u64 param_fluid,
+    .param .u64 param_fmask,
+    .param .u64 param_out_vbo,
+    .param .u64 param_out_count,
+    .param .u32 param_grid,
+    .param .u32 param_max_verts,
+    .param .f32 param_world_rad,
+    .param .f32 param_min_por,
+    .param .f32 param_pulse_decay,
+    .param .u32 param_fluid_mode
+)
+{
+    .reg .pred %p<9>;
+    .reg .u32  %r<20>;
+    .reg .u64  %rd<14>;
+    .reg .f32  %f<36>;
+
+    ld.param.u64 %rd0, [param_sponge];
+    ld.param.u64 %rd1, [param_meta];
+    ld.param.u64 %rd2, [param_fluid];
+    ld.param.u64 %rd3, [param_fmask];
+    ld.param.u64 %rd4, [param_out_vbo];
+    ld.param.u64 %rd5, [param_out_count];
+    ld.param.u32 %r0,  [param_grid];
+    ld.param.u32 %r1,  [param_max_verts];
+    ld.param.f32 %f0,  [param_world_rad];
+    ld.param.f32 %f1,  [param_min_por];
+    ld.param.f32 %f2,  [param_pulse_decay];
+    ld.param.u32 %r14, [param_fluid_mode];
+
+    mov.u32    %r2, %ctaid.x;
+    mov.u32    %r3, %ntid.x;
+    mov.u32    %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+
+    mul.lo.u32 %r6, %r0, %r0;
+    mul.lo.u32 %r7, %r6, %r0;
+    setp.ge.u32 %p0, %r5, %r7;
+    @%p0 bra EMIT_DONE;
+
+    cvt.u64.u32 %rd6, %r5;
+    shl.b64     %rd7, %rd6, 4;
+    add.u64     %rd8, %rd0, %rd7;
+    ld.global.f32 %f3, [%rd8];          // porosity
+
+    shl.b64     %rd9, %rd6, 2;
+    add.u64     %rd10, %rd2, %rd9;
+    ld.global.f32 %f25, [%rd10];        // fluid_vol
+
+    // Emit if porosity >= min_por OR (fluid_mode && fluid_vol >= 0.004)
+    setp.ge.f32 %p1, %f3, %f1;
+    setp.ne.u32 %p7, %r14, 0;
+    setp.ge.f32 %p8, %f25, 0.004;
+    and.pred    %p8, %p7, %p8;
+    or.pred     %p1, %p1, %p8;
+    @!%p1 bra EMIT_DONE;
+
+    shl.b64     %rd11, %rd6, 3;
+    add.u64     %rd12, %rd1, %rd11;
+    ld.global.v2.f32 {%f4, %f5}, [%rd12];
+    mul.f32     %f6, %f4, %f2;
+    setp.lt.f32 %p2, %f6, 0.004;
+    selp.f32    %f6, 0.0, %f6, %p2;
+    st.global.f32 [%rd12], %f6;
+
+    atom.global.add.u32 %r8, [%rd5], 1;
+    setp.ge.u32 %p3, %r8, %r1;
+    @%p3 bra EMIT_DONE;
+
+    div.u32 %r9,  %r5, %r6;
+    rem.u32 %r10, %r5, %r6;
+    div.u32 %r11, %r10, %r0;
+    rem.u32 %r12, %r10, %r0;
+
+    cvt.rn.f32.u32 %f7, %r0;
+    rcp.approx.f32 %f7, %f7;
+    mul.f32        %f7, %f7, 2.0;
+    cvt.rn.f32.u32 %f8,  %r12; add.f32 %f8,  %f8,  0.5; fma.rn.f32 %f8,  %f8,  %f7, -1.0; mul.f32 %f8,  %f8,  %f0;
+    cvt.rn.f32.u32 %f9,  %r11; add.f32 %f9,  %f9,  0.5; fma.rn.f32 %f9,  %f9,  %f7, -1.0; mul.f32 %f9,  %f9,  %f0;
+    cvt.rn.f32.u32 %f10, %r9;  add.f32 %f10, %f10, 0.5; fma.rn.f32 %f10, %f10, %f7, -1.0; mul.f32 %f10, %f10, %f0;
+
+    // If fluid_mode && voxel carries live question fluid -> show FLUID WEIGHT & RECOMBINATION!
+    @%p8 bra COLOR_FLUID;
+
+    // Standard carved sponge coloring (dimmed gently to glass skeleton during fluid wave)
+    fma.rn.f32     %f11, %f3, 0.14, 1.0;
+    rcp.approx.f32 %f11, %f11;
+    sub.f32        %f11, 1.0, %f11;
+
+    add.f32        %f12, %f3, 0.001;
+    div.approx.f32 %f13, %f5, %f12;
+    fma.rn.f32     %f13, %f13, 0.5, 0.5;
+    max.f32        %f13, %f13, 0.0;
+    min.f32        %f13, %f13, 1.0;
+    sub.f32        %f14, 1.0, %f13;
+
+    mul.f32 %f15, %f14, 0.04; fma.rn.f32 %f15, %f13, 1.00, %f15;
+    mul.f32 %f16, %f14, 0.72; fma.rn.f32 %f16, %f13, 0.48, %f16;
+    mul.f32 %f17, %f14, 1.00; fma.rn.f32 %f17, %f13, 0.08, %f17;
+
+    mul.f32 %f18, %f11, %f11;
+    mul.f32 %f18, %f18, 0.55;
+    sub.f32 %f19, 1.0, %f18;
+    mul.f32 %f15, %f15, %f19; fma.rn.f32 %f15, %f18, 1.00, %f15;
+    mul.f32 %f16, %f16, %f19; fma.rn.f32 %f16, %f18, 0.88, %f16;
+    mul.f32 %f17, %f17, %f19; fma.rn.f32 %f17, %f18, 0.42, %f17;
+
+    mul.f32 %f20, %f4, 0.42;
+    add.f32 %f15, %f15, %f20; min.f32 %f15, %f15, 1.0;
+    add.f32 %f16, %f16, %f20; min.f32 %f16, %f16, 1.0;
+    add.f32 %f17, %f17, %f20; min.f32 %f17, %f17, 1.0;
+
+    fma.rn.f32 %f21, %f11, 0.22, 0.055;
+    fma.rn.f32 %f21, %f4,  0.30, %f21;
+    min.f32    %f21, %f21, 0.65;
+    // Dim dry skeleton when inspecting live fluid wave
+    selp.f32   %f23, 0.26, 1.0, %p7;
+    mul.f32    %f21, %f21, %f23;
+    fma.rn.f32 %f22, %f11, 0.80, 0.35;
+    fma.rn.f32 %f22, %f4,  0.45, %f22;
+    bra WRITE_VERT;
+
+COLOR_FLUID:
+    // Load fmask to count how many distinct question words collided in this voxel!
+    add.u64       %rd13, %rd3, %rd9;
+    ld.global.u32 %r15, [%rd13];
+    popc.b32      %r16, %r15;           // num_sources (1 = split stream, >=2 = RECOMBINED COLLISION!)
+
+    // Fluid weight curve: w = 1 - 1 / (1 + fluid_vol * 4.5) in [0..1)
+    fma.rn.f32     %f26, %f25, 4.5, 1.0;
+    rcp.approx.f32 %f26, %f26;
+    sub.f32        %f26, 1.0, %f26;     // weight in [0..1)
+
+    setp.ge.u32 %p4, %r16, 2;
+    @%p4 bra COLOR_COLLISION;
+
+    // Single-source split fluid: cool deep blue -> electric cyan -> bright aqua by weight!
+    mov.f32    %f15, 0.06; fma.rn.f32 %f15, %f26, 0.36, %f15; // R: 0.06 -> 0.42
+    mov.f32    %f16, 0.52; fma.rn.f32 %f16, %f26, 0.48, %f16; // G: 0.52 -> 1.00
+    mov.f32    %f17, 0.96; fma.rn.f32 %f17, %f26, 0.04, %f17; // B: 0.96 -> 1.00
+    fma.rn.f32 %f21, %f26, 0.72, 0.22;                        // alpha scales with voxel weight
+    fma.rn.f32 %f22, %f26, 1.85, 0.65;                        // size scales with voxel weight
+    bra WRITE_VERT;
+
+COLOR_COLLISION:
+    // Multi-word RECOMBINATION voxel (2+ words' fluid merged!): blazing magenta -> radiant white-gold!
+    mov.f32    %f15, 1.00;                                    // R = 1.0
+    mov.f32    %f16, 0.34; fma.rn.f32 %f16, %f26, 0.62, %f16; // G: 0.34 -> 0.96
+    mov.f32    %f17, 0.88; fma.rn.f32 %f17, %f26, -0.32, %f17;// B: 0.88 -> 0.56 (magenta -> gold!)
+    fma.rn.f32 %f21, %f26, 0.40, 0.60; min.f32 %f21, %f21, 0.98;
+    fma.rn.f32 %f22, %f26, 2.40, 1.45;                        // visibly bigger collision hotspot!
+
+WRITE_VERT:
+    cvt.u64.u32 %rd13, %r8;
+    shl.b64     %rd13, %rd13, 5;
+    add.u64     %rd13, %rd4, %rd13;
+    st.global.v4.f32 [%rd13],      {%f8, %f9, %f10, %f22};
+    st.global.v4.f32 [%rd13 + 16], {%f15, %f16, %f17, %f21};
+
+EMIT_DONE:
+    ret;
+}
