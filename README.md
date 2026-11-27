@@ -7,11 +7,11 @@ Normal AI models learn by tweaking billions of hidden numbers with math (backpro
 **GLLM** tries something completely different, inspired by **nature**: **four spheres nested inside each other**, with a **3D sponge** in the center that gets carved out by real English text—running live on an NVIDIA GPU (CUDA + OpenGL, no `nvcc` needed).
 
 <p align="center">
-  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Asking What is the capital of France in GLLM 4-Sphere Fluid Sponge and getting The capital of France is Paris" width="49%" />
+  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Asking What is the capital of France in GLLM 4-Sphere Fluid Sponge and getting Paris is the capital of France" width="49%" />
   <img src="docs/images/gllm_sponge_carving.png" alt="Live English Q&A pairs carving tunnels through the 3D sponge" width="49%" />
 </p>
 <p align="center">
-  <em><strong>Left (Asking a Question):</strong> Asking <code>"What is the capital of France?"</code> (even though that exact question is not in the dataset). Water drops from <code>capital</code> and <code>France</code> split across <strong>5,205</strong> voxels inside the sponge and collide at <strong>1,499</strong> pink/gold overlap spots. Every possible answer fills up on the left—<strong>Paris</strong> collects the most water (<strong>23.2 mL</strong>) and flows out through the sentence layer as <strong>"The capital of France is Paris."</strong><br/>
+  <em><strong>Left (Asking a Question — Zero Hardcoded Rules):</strong> Asking <code>"What is the capital of France?"</code> (even though that exact question is not in the dataset). Water drops from <code>capital</code> and <code>France</code> split across <strong>6,388</strong> voxels inside the sponge and collide at <strong>2,986</strong> pink/gold overlap spots. Every possible answer fills up on the left—<strong>Paris</strong> collects the most water (<strong>5.7 mL</strong>) and flows out through the learned sentence layer as <strong>"Paris is the capital of France."</strong><br/>
   <strong>Right (Carving the Sponge):</strong> Watching real English questions and answers poke tunnels through the 3D sponge in real time, merging shared paths together and splitting apart at the answers.</em>
 </p>
 
@@ -55,9 +55,9 @@ flowchart LR
 1. **Sphere 1 — Outer Word Sphere (`R = 1.00`):**  
    Holds **`1,360,919` real English words** from the Wiktionary dictionary (Kaikki). Every word sits at its own fixed spot on the outside of the sphere.
 2. **Sphere 2 — Part-of-Speech Sphere (`R = 0.80`):**  
-   Has **12 buckets** (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every word on the outside connects inward to its bucket. This layer also acts like a **valve**—so a *"When…?"* question opens the path for numbers/years, while a *"What is…?"* question opens the path for names/things.
+   Has **12 buckets** (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every word on the outside connects inward to its bucket. This layer also learns its own **valve openings** straight from the 89,003 Q&A pairs—without a single hardcoded rule, it discovers on its own that *"When…?"* flows **75%** toward numbers/years while *"What…?"* flows **38%** toward names.
 3. **Sphere 3 — Sentence / Syntax Sphere (`R = 0.64`, glowing green ring):**  
-   Has **8 sentence-shape hubs** (question starter, subject, linking verb, action verb, object, time/place phrase, statement finish, connector). Running **60,230 real English sentences** through it maps **598,482** real grammar connections so the winning answer can flow back out as a normal English sentence (`"The capital of France is Paris."`) instead of just a single word.
+   Has **8 sentence-shape hubs** (question starter, subject, linking verb, action verb, object, time/place phrase, statement finish, connector). Running **60,230 real English sentences** through it carves **590,074** real grammar and word-to-word channels so the winning answer can flow back out on its own as a natural English sentence (`"Paris is the capital of France."`) with zero hardcoded sentence templates.
 4. **Sphere 4 — The 3D Sponge (`R < 0.52`):**  
    A `128 × 128 × 128` grid of **2,097,152 voxels** running in parallel on your GPU. Every frame you can literally see:
    - **Blue/Cyan cubes:** Water from one word splitting through tunnels (brighter = more water in that cube).
@@ -65,17 +65,19 @@ flowchart LR
 
 ---
 
-## Being Honest: What's Already Pure Data vs. What's Next
+## Being Honest: Zero Hardcoded Rules & What's Next
 
 We want this project to be 100% transparent—no smoke and mirrors:
 
-- **100% Learned From Data (No Hardcoded Facts):**
+- **100% Learned From Data (Zero Hardcoded Rules, Word Lists, or Templates):**
   - All `1,360,919` outer words and their parts of speech come straight from Wiktionary (Kaikki).
-  - All `89,003` Q&A channels (`63,384` answer basins), sponge tunnel carving, parallel GPU fluid splitting, multi-word voxel collisions, and the **`#1 Paris (23.2 mL)`** fluid winner come purely from the data—no answers are hardcoded.
-  - All `598,482` syntactic hub connections on Sphere 3 are measured directly from `60,230` real English sentences.
-- **Still Using Simple Starter Rules (Next To Make 100% Emergent):**
-  - Right now, the **POS valve** (e.g., *"When"* opens numbers) and the **final word-reordering step** that turns the winning word `"Paris"` into `"The capital of France is Paris."` still use lightweight starter grammar rules in code.
-  - **Next goal:** Let the sponge carve those question-to-sentence reordering paths and multi-sentence flow completely on its own from larger conversational datasets, removing the last starter rules.
+  - **No stopword lists:** Common words like `"the"` and `"of"` connect to tens of thousands of tunnels, so a single drop of water splits so thinly that it barely registers—while specific words like `"capital"` and `"France"` stay concentrated naturally by fluid conservation.
+  - **Learned POS valve (Sphere 2):** Zero `if ("when")` rules. Opening words learn which answer buckets they drain into directly from the `89,003` Q&A pairs (`when -> 75% num`, `who -> 83% name`, `what -> 38% name`).
+  - **Learned 3D sponge fluid collision (Sphere 4):** All `63,384` answer basins, sponge tunnel carving, parallel GPU voxel splitting, multi-word collisions, and the **`#1 Paris (5.7 mL)`** fluid winner emerge purely from the carved data.
+  - **Learned sentence flow (Sphere 3):** Zero sentence templates or irregular-verb tables. The spoken response (`"Paris is the capital of France."`, `"Boston is the capital of Massachusetts."`) walks purely along word-to-word and part-of-speech channels carved from `60,230` real English sentences until it hits a learned end-of-sentence pore.
+- **What's Next (Scaling Up the Data):**
+  - Because there are zero grammar patches left in the code and Sphere 3 has only seen `60,230` Wikipedia sentences so far, trickier or multi-clause questions can still produce awkward word order (or flip two equally common names).
+  - **Next goal:** Carve millions of real sentences and multi-turn conversations through the sponge so even complex, multi-sentence answers flow smoothly on their own.
 
 ---
 
