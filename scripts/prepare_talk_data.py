@@ -217,6 +217,32 @@ def build_squad_qa(squad_files: list, out_tsv: str) -> int:
     return len(ordered)
 
 
+def build_squad_sentences(squad_files: list, out_tsv: str) -> int:
+    t0 = time.time()
+    sent_re = re.compile(r"(?<=[.!?])\s+")
+    sents = []
+    seen = set()
+    for path in squad_files:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for art in data.get("data", []):
+            for para in art.get("paragraphs", []):
+                ctx = para.get("context", "")
+                for s in sent_re.split(ctx):
+                    s = " ".join(s.strip().split())
+                    if 5 <= len(TOKEN_RE.findall(s)) <= 24 and s not in seen:
+                        seen.add(s)
+                        sents.append(s)
+    os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+    with open(out_tsv, "w", encoding="utf-8") as out:
+        for s in sents:
+            out.write(s + "\n")
+    print(f"[SYN] Wrote {len(sents):,} real English sentences -> {out_tsv} in {time.time() - t0:.1f}s")
+    return len(sents)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kaikki", default="/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/kaikki_english/kaikki.org-dictionary-English.jsonl")
@@ -227,6 +253,7 @@ def main():
 
     build_lexicon(args.kaikki, os.path.join(args.out_dir, "kaikki_lexicon.bin"))
     build_squad_qa([args.squad_train, args.squad_dev], os.path.join(args.out_dir, "squad_qa.tsv"))
+    build_squad_sentences([args.squad_train, args.squad_dev], os.path.join(args.out_dir, "squad_sentences.tsv"))
 
 
 if __name__ == "__main__":

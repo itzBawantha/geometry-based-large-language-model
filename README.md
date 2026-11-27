@@ -1,100 +1,89 @@
-# Geometry-Based Large Language Model (GLLM) — Concentric Fluid Sponge Architecture
+# Geometry-Based Large Language Model (GLLM)
 
-> **Intelligence modeled directly on nature: water droplets carving, merging, splitting, and recombining inside a porous 3D sponge.**  
-> A **zero-weight, zero-backpropagation** CUDA Driver API (`libcuda.so`, no `nvcc`) + OpenGL 4.6 geometric language engine built on **three concentric spheres**: a **1.36M-word outer English vocabulary shell (`R = 1.00`)**, a **12-cluster Part-of-Speech valve sphere (`R = 0.72`)**, and a **`128³` (2,097,152-voxel) carvable 3D fluid sponge (`R < 0.62`)**.
+> **What if an AI didn't use neural-network weights at all—and instead worked like water flowing through a sponge?**
+
+Normal AI models learn by tweaking billions of hidden numbers with math (backpropagation). You can't see inside them, and it's hard to tell *why* they gave an answer.
+
+**GLLM** tries something completely different, inspired by **nature**: **four spheres nested inside each other**, with a **3D sponge** in the center that gets carved out by real English text—running live on an NVIDIA GPU (CUDA + OpenGL, no `nvcc` needed).
 
 <p align="center">
-  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Live Parallel CUDA Fluid Splitting & Recombination solving What is the capital of France -> #1 Paris (16.5 mL)" width="49%" />
-  <img src="docs/images/gllm_sponge_carving.png" alt="Real-Time English Q&A Stream Carving Water Arteries Through the 128^3 CUDA Sponge" width="49%" />
+  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Asking What is the capital of France in GLLM 4-Sphere Fluid Sponge and getting The capital of France is Paris" width="49%" />
+  <img src="docs/images/gllm_sponge_carving.png" alt="Live English Q&A pairs carving tunnels through the 3D sponge" width="49%" />
 </p>
 <p align="center">
-  <em><strong>Left (Live Q&A Fluid Splitting &amp; Recombination):</strong> Asking <code>"What is the capital of France?"</code> (a phrasing not literally present in SQuAD v1.1) injects independent fluid streams from <code>capital</code> and <code>France</code> into the <code>128³</code> CUDA sponge. Fluid physically splits across <strong>6,225 forks</strong> and <strong>6,337 active voxels</strong> (electric cyan = 1-word fluid weight) and collides across <strong>769 multi-word recombination voxels</strong> (blazing magenta–gold core). Every competing answer fills its live fluid meter until <strong><code>#1 Paris</code> (<code>16.5 mL</code>, <code>2/2 drops + POS valve</code>)</strong> emerges as the highest-fluid winner.<br/>
-  <strong>Right (Real-Time Sponge Carving Stream):</strong> Streaming <code>89,003</code> English Q&amp;A pairs through the <code>1,360,919</code>-word outer dictionary sphere and 12 POS clusters—boring cyan inward and amber outward water channels that naturally merge into shared trunks (<code>90.8%</code> merge rate) and split back out to answer words.</em>
+  <em><strong>Left (Asking a Question):</strong> Asking <code>"What is the capital of France?"</code> (even though that exact question is not in the dataset). Water drops from <code>capital</code> and <code>France</code> split across <strong>5,205</strong> voxels inside the sponge and collide at <strong>1,499</strong> pink/gold overlap spots. Every possible answer fills up on the left—<strong>Paris</strong> collects the most water (<strong>23.2 mL</strong>) and flows out through the sentence layer as <strong>"The capital of France is Paris."</strong><br/>
+  <strong>Right (Carving the Sponge):</strong> Watching real English questions and answers poke tunnels through the 3D sponge in real time, merging shared paths together and splitting apart at the answers.</em>
 </p>
 
 ---
 
-## The Nature & Fluid Philosophy: Why a Porous 3D Sponge?
+## The Basic Idea (Think of Water on a Tree Branch)
 
-Traditional language models compress all language knowledge into billions of opaque floating-point matrix weights tuned by backpropagation. GLLM takes a completely different first-principles view inspired directly by **how fluids behave in nature**:
+Imagine rain falling on a tree branch, or water soaking through a kitchen sponge:
 
-1. **Think of Water Flowing Down a Tree Branch:**
-   - When rain falls onto a branching tree, a single drop of water doesn't have to stay a single rigid marble. As it meets forks and ridges, **one droplet splits into 2, 3, or 10 smaller streams** depending purely on the physical geometry it encounters.
-   - Downstream, **separate droplets from different branches meet and merge back together** into thicker shared trunks—and then split again further down the branch.
-2. **A Carvable Porous Sponge (Zero Hardcoded Grammar Rules):**
-   - Between the outer vocabulary and the core sits a **3D porous sponge** (`128³ = 2,097,152` CUDA voxels) that begins completely solid (high resistance, zero hardcoded syntax connections).
-   - As real English Question–Answer pairs stream through the geometry, rays pierce from the outer words through their Part-of-Speech clusters and **spear tunnels directly through the sponge**.
-   - Just like water eroding riverbeds or lightning following ionized air, new rays bend smoothly toward **already-carved nearby pores**. Repeated patterns erode wider, lower-resistance main arteries, while specific facts carve fine capillaries out to their exact answer words.
-3. **Answering a Question = Parallel Fluid Splitting & Constructive Splash:**
-   - When you ask a question like **`"What is the capital of France?"`**:
-     - Every content word (`capital`, `France`) releases its own **fluid stream (`100 mL`)** into the sponge—each tagged with a unique hardware bitmask (`source_bit`).
-     - In parallel across all **2.1 million voxels** on the GPU (`step_fluid_split_recombine`), each active voxel **splits its fluid proportionally across all open carved neighbor tunnels** based on local porosity and directional flow alignment.
-     - Single-word branches carry only partial, diluted fluid (`Europe` gets a drop from `France`; `Melbourne` and `Beijing` get a drop from `capital`).
-     - Only where split streams from **multiple question words physically collide inside the sponge** (`capital` ∩ `France` at their 3D chord-midpoint pool) do the waves **recombine into a high-pressure magenta–gold splash**—guided out through the open **POS valve** (`NAME/NOUN` for `"What is ...?"` vs. `NUM/DATE` for `"When ...?"`).
-   - **Every possible candidate answer** is initialized and tracked visibly as a fluid basin both on the 3D outer sphere and in the live HUD fluid meters. At the end of the wave, **the answer holding the highest accumulated fluid volume (`mL`) wins.**
+1. **A single drop of water doesn't have to stay one drop.**  
+   When water hits a fork in a branch or holes in a sponge, it **splits** into 2, 3, or 10 smaller drops depending on the shape it hits.
+2. **Different drops can meet, merge, and split again.**  
+   When two separate drops flow into the same groove, they combine into a bigger stream—and later split again into smaller paths.
+3. **Paths carve themselves from data.**  
+   Inside our sphere sits a 3D sponge made of **2.1 million tiny cubes (voxels)**. At the start, it is completely solid. As you push real English questions and answers through it, they **poke holes (tunnels)** through the sponge. Paths that happen often get wider and easier to flow through.
+4. **How a question gets answered:**  
+   Suppose you ask: **`"What is the capital of France?"`**
+   - The word **`capital`** drops water into the sponge. That water splits down *every* tunnel connected to `capital` (`Paris`, `Melbourne`, `Beijing`, `Jerusalem`, `Brazzaville`…).
+   - At the same time, the word **`France`** drops water into the sponge. That water splits down *every* tunnel connected to `France` (`Paris`, `Brazzaville`, `1790`, `Europe`…).
+   - Most possible answers only get **one small drop** (from either `capital` *or* `France`).
+   - Only **`Paris`** gets **both streams colliding together** (plus the grammar filter saying *"this question wants a place/name, not a year"*).
+   - You watch **every competing answer fill up like a water glass** on screen—and **whichever answer ends up with the most water wins.**
 
 ---
 
-## Concentric 3-Sphere Architecture
+## The 4 Nested Spheres
+
+Think of it like four Russian nesting dolls—each layer does one simple job:
 
 ```mermaid
 flowchart LR
-    subgraph S1["Sphere 1: Outer Vocabulary Shell (R = 1.00)"]
-        W["1,360,919 Kaikki English Words\n(Zero-Copy CUDA-GL VBO)\nQuestion words flash Cyan · Candidates glow Gold"]
-    end
+    S1["1. Outer Word Sphere\n1.36 Million English Words\n(Every word is a point on the outside)"]
+    S2["2. Part-of-Speech Sphere\n12 Grammar Buckets\n(noun, verb, adjective, number...)"]
+    S3["3. Sentence / Syntax Sphere\n8 Sentence Building Blocks\n(subject, verb, object, time/place...)"]
+    S4["4. 3D Sponge Core\n2.1 Million Tiny Voxels\n(Water splits, collides & carves tunnels)"]
 
-    subgraph S2["Sphere 2: POS Cluster Valves (R = 0.72)"]
-        P["12 Part-of-Speech Hubs\nnoun · verb · adj · adv · name · pron\nprep · det · conj · num · intj · other\nActs as 3D directional aperture"]
-    end
-
-    subgraph S3["Sphere 3: Core 128³ Fluid Sponge (R < 0.62)"]
-        SP["2,097,152 CUDA Voxels\nStores: porosity + 3D flow vector +\nlive fluid volume + source bitmask\nSplits across forks · Collides at chord pools"]
-    end
-
-    W -- "Each word injects 100 mL\nfluid stream inward" --> P
-    P -- "POS-guided entry rays\ninto carved pores" --> SP
-    SP -- "Parallel GPU splitting &\n2+ word recombination splash" --> P
-    P -- "Open POS valve steers\nflow to competing basins" --> W
+    S1 --> S2 --> S3 --> S4
+    S4 --> S3 --> S2 --> S1
 ```
 
-### How Each Sphere Works
-1. **Outer Vocabulary Sphere (`R = 1.00`):** Holds all **`1,360,919` unique English words** extracted from [Kaikki English Wiktionary](https://kaikki.org/dictionary/rawdata.html) (every entry mapped to its Parts of Speech with **0 missing POS**), placed deterministically on the unit sphere in double precision inside a zero-copy CUDA–OpenGL VBO (`init_word_outer_shell`).
-2. **Middle POS Cluster Sphere (`R = 0.72`):** 12 evenly spaced grammatical cluster hubs (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every outer word links inward to its POS cluster—and during inference, the question's opening (`What / Who / Where` vs. `When / How many`) opens the matching **POS valve** so fluid flows toward the right kind of answer (a place/name vs. a date/number).
-3. **Core `128³` Carvable Fluid Sponge (`R < 0.62`):**
-   - **During Carving (`carve_sponge_voxels`):** GPU atomic operations (`atom.global.add.f32`) erode 3D porosity, directional flow vectors `(fx, fy, fz)`, and Q/A polarity directly in VRAM.
-   - **During Question Probing (`inject_fluid_drops` + `step_fluid_split_recombine`):** Double-buffered parallel CUDA fluid simulation splits mass across 6-neighbor carved pores, atomically OR-ing source bitmasks (`atom.global.or.b32`) so `popc(fmask) >= 2` immediately detects and highlights **multi-word collision hotspots** in real time.
-   - **Zero-Copy Voxel Weight Visualization (`emit_sponge_voxels`):** Every active fluid voxel is emitted straight into an OpenGL VBO with brightness and sprite size proportional to **the exact fluid weight carried by that voxel**—electric cyan for 1-word split streams, blazing magenta–gold for 2+ word recombined collisions!
+1. **Sphere 1 — Outer Word Sphere (`R = 1.00`):**  
+   Holds **`1,360,919` real English words** from the Wiktionary dictionary (Kaikki). Every word sits at its own fixed spot on the outside of the sphere.
+2. **Sphere 2 — Part-of-Speech Sphere (`R = 0.80`):**  
+   Has **12 buckets** (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every word on the outside connects inward to its bucket. This layer also acts like a **valve**—so a *"When…?"* question opens the path for numbers/years, while a *"What is…?"* question opens the path for names/things.
+3. **Sphere 3 — Sentence / Syntax Sphere (`R = 0.64`, glowing green ring):**  
+   Has **8 sentence-shape hubs** (question starter, subject, linking verb, action verb, object, time/place phrase, statement finish, connector). Running **60,230 real English sentences** through it maps **598,482** real grammar connections so the winning answer can flow back out as a normal English sentence (`"The capital of France is Paris."`) instead of just a single word.
+4. **Sphere 4 — The 3D Sponge (`R < 0.52`):**  
+   A `128 × 128 × 128` grid of **2,097,152 voxels** running in parallel on your GPU. Every frame you can literally see:
+   - **Blue/Cyan cubes:** Water from one word splitting through tunnels (brighter = more water in that cube).
+   - **Pink/Gold glowing cloud:** Spots where water from **2 or more words collides and merges** inside the sponge.
 
 ---
 
-## Verified Live Fluid-Wave Result (Unseen Question Phrasing)
+## Being Honest: What's Already Pure Data vs. What's Next
 
-Evaluated directly in `bin/gllm_talk_viz` on an **NVIDIA RTX A3000 Laptop GPU** after indexing all **`89,003` SQuAD v1.1 Q&A pairs** (`63,384` unique answer basins) and **`1,360,919` Kaikki English words**—with **zero hardcoded answers and zero neural weights**:
+We want this project to be 100% transparent—no smoke and mirrors:
 
-- **Query:** `"What is the capital of France?"` *(exact phrasing does not appear in SQuAD v1.1; the dataset only contains indirect references such as "What capital of France was lost to the Nazi Germans?" → "Paris")*
-- **Live `128³` CUDA Voxel Telemetry (Step 54 / 72, `9.0 ms` CUDA frame):**
-  - **Active Fluid Voxels:** `6,337`
-  - **Splitting Forks (`degree >= 2`):** `6,225`
-  - **Multi-Word Collision Voxels (`popc(fmask) >= 2`):** `769`
-  - **Peak Single-Voxel Fluid Weight:** `6.32`
-- **Competing Candidate Answer Fluid Meters:**
-
-| Rank | Competing Candidate Answer | Accumulated Fluid | Drop Recombination & Valve | Status |
-|---:|---|---:|---|---|
-| **#1** | **`Paris`** | **`16.5 mL`** | **`2/2 drops + POS valve (NAME/NOUN)`** | **Highest-Fluid Winner** |
-| #2 | `Brazzaville` | `14.5 mL` | `2/2 drops + POS valve` | Runner-up (Free France WWII capital) |
-| #3 | `6` | `4.2 mL` | `2/2 drops` | Damped by `NAME/NOUN` POS valve |
-| #4 | `Melbourne` | `4.4 mL` | `1/2 drops + POS valve` | Single-word (`capital`) split stream |
-| #5 | `one` | `4.1 mL` | `2/2 drops` | Damped by POS valve |
-| #6 | `1790` | `3.2 mL` | `2/2 drops` | Damped by POS valve |
+- **100% Learned From Data (No Hardcoded Facts):**
+  - All `1,360,919` outer words and their parts of speech come straight from Wiktionary (Kaikki).
+  - All `89,003` Q&A channels (`63,384` answer basins), sponge tunnel carving, parallel GPU fluid splitting, multi-word voxel collisions, and the **`#1 Paris (23.2 mL)`** fluid winner come purely from the data—no answers are hardcoded.
+  - All `598,482` syntactic hub connections on Sphere 3 are measured directly from `60,230` real English sentences.
+- **Still Using Simple Starter Rules (Next To Make 100% Emergent):**
+  - Right now, the **POS valve** (e.g., *"When"* opens numbers) and the **final word-reordering step** that turns the winning word `"Paris"` into `"The capital of France is Paris."` still use lightweight starter grammar rules in code.
+  - **Next goal:** Let the sponge carve those question-to-sentence reordering paths and multi-sentence flow completely on its own from larger conversational datasets, removing the last starter rules.
 
 ---
 
-## Quick Start: Run the Real-Time CUDA Fluid Sponge
+## Try It Yourself (Live 3D on Your GPU)
 
-### Prerequisites
-- Linux + NVIDIA GPU + standard NVIDIA driver (`libcuda.so` — **no `nvcc` / CUDA Toolkit required**)
-- `g++` (C++17), `SDL2`, `OpenGL 4.6`, `zlib`, `python3`, `curl`
+### What You Need
+- Linux + an NVIDIA GPU (uses standard `libcuda.so` — **no CUDA Toolkit / `nvcc` needed**)
+- `g++`, `SDL2`, `OpenGL`, `zlib`, `python3`, `curl`
 
 ```bash
 # Arch / CachyOS
@@ -104,75 +93,38 @@ sudo pacman -S base-devel sdl2 mesa zlib curl python
 sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev curl python3
 ```
 
-### 1. Prepare Datasets (Kaikki English Wiktionary + SQuAD v1.1)
-If you haven't already downloaded the raw datasets onto your local data drive (`GLLM_DATA`), download and index them into the compact binary lexicon (`19.3 MB`) and clean Q&A stream (`6.5 MB`):
-
+### Build & Run
 ```bash
-python3 scripts/prepare_talk_data.py \
-  --kaikki /run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/kaikki_english/kaikki.org-dictionary-English.jsonl \
-  --squad-train /run/media/liveuser/GLLM_DATA/gllm_datasets/raw/squad-train-v1.1.json \
-  --squad-dev /run/media/liveuser/GLLM_DATA/gllm_datasets/raw/squad-dev-v1.1.json \
-  --out-dir /run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index
-```
-
-### 2. Build & Launch Live in 3D
-```bash
+# 1. Build the visualizer (and all GLLM tools)
 ./scripts/build.sh
+
+# 2. Prepare the dictionary + Q&A + sentence index (from Kaikki + SQuAD)
+python3 scripts/prepare_talk_data.py
+
+# 3. Launch the live 4-Sphere Fluid Sponge!
 ./scripts/run_talk_viz.sh --ask "What is the capital of France?"
-# or: make talk-viz
 ```
 
-### Interactive Controls (`gllm_talk_viz`)
-- **Type & Ask Live:** Click the **`Q:`** box, type any English question, and press **`Enter`** (or click **`[ASK (FLUID)]`**) to launch a real-time CUDA fluid splitting wave and watch every competing candidate fill its fluid meter.
-- **Carve Custom Knowledge Live:** Click **`Q:`** and **`A:`**, type a new question & answer, and click **`[CARVE Q->A]`** to watch your own droplets bore new tunnels through the sponge.
-- **Replay / Stream Controls:** **`[REPLAY FLUID WAVE]`** replay the voxel wave in slow motion • **`[INDEX ALL 89K]`** load all 89,003 SQuAD Q&As • **`Space`** play/pause real-time Q&A carving stream • **`T`** burst carving (20 Q&As/frame) • **`S`** single-step • **`+`/`-`** speed • **`X`** clear sponge.
-- **3D Viewport:** `Left-drag` / `Scroll` orbit & zoom • **`1`** Outer Word Sphere • **`2`** Middle POS Sphere • **`3`** `128³` Fluid Sponge • **`4`** Splitting/Carving Rays • **`Up`/`Down`** outer shell transparency • **`A`** auto-rotate • **`R`** reset camera • **`Q`/`Esc`** quit.
+### Controls Inside the Window
+- **Ask your own question:** Click the **`Q:`** box, type any question, and hit **`Enter`** (or click **`[ASK (4-SPHERE)]`**).
+- **Teach a new fact live:** Type a question in **`Q:`** and an answer in **`A:`**, then click **`[CARVE Q->A]`** to watch it poke a new tunnel through the sponge.
+- **Watch it again:** Click **`[REPLAY FLUID + SYNTAX]`** to replay the water splitting and sentence flow in slow motion.
+- **Stream Q&As live:** **`Space`** play/pause • **`T`** fast burst carving • **`S`** one step at a time • **`X`** wipe sponge clean.
+- **Move around in 3D:** Drag with mouse to spin • Scroll to zoom • **`1`–`5`** toggle each sphere & rays • **`Up`/`Down`** fade the outer word shell • **`R`** reset camera.
 
 ---
 
-## Visual Geometry Foundation (Previous Milestones Preserved)
+## Earlier Visual Experiments (Still Included)
 
-The concentric fluid sponge builds directly on GLLM's earlier zero-weight visual geometry engine (all 8 visual CLIs remain built and runnable via `./scripts/build.sh`):
-
-- **Unified 1-Billion-Point Sphere (`1241³`)** with nested 3D bounding-box manifolds (`handwritten → numbers / letters` and 4-level true-RGB `animals → cats / dogs → face → 6 facial features`), `0` spatial overlaps, `2,048 / 2,048` corners enclosed, and dynamic per-manifold CUDA inference dispatch ([include/inference_dispatcher.hpp](include/inference_dispatcher.hpp)).
-- **68,405-Image Unseen Holdout:** `92.02%` 10-way MNIST digits, `80.65%` visually-equivalent 62-way Top-1 (`88.63%` Top-3) at `~120k imgs/s`, and `100%` OOD rejection (`./scripts/benchmark.sh`).
+Before teaching the sphere to talk, GLLM started with **zero-weight vision** inside a 1-billion-point sphere (`1241³`)—recognizing unseen handwritten numbers & letters (`92.02%` MNIST digits, `80.65%` visually-equivalent 62-way characters at `~120k imgs/s`, `100%` unknown dot rejection) and organizing RGB animal hierarchies (`cats` / `dogs` → `face` → 6 facial parts). All of those tools (`gllm_train`, `gllm_viz`, `gllm_bench`, `gllm_hierarchy`, `gllm_merge`) are still built by `./scripts/build.sh`.
 
 ---
 
-## Repository Layout
+## Files in This Repo
 
-```text
-Makefile                              # Build / talk-viz / train / benchmark / viz targets
-include/
-  cuda_driver_min.hpp                 # Minimal CUDA Driver API bindings (libcuda.so, no nvcc)
-  talk_hud.hpp                        # Left sidebar HUD: live voxel telemetry, Q/A typing & Top-8 fluid meters
-  gllm_model.hpp                      # .gllm v5 schema, 3D-box hierarchical manifolds & RGB storage
-  gaussian_pyramid.hpp                # Burt-Adelson multi-scale Gaussian Pyramid
-  hud_canvas.hpp                      # 5x7 bitmap font & 224x224 visual sketch canvas
-  inference_dispatcher.hpp            # Per-root-manifold CUDA inference dispatcher
-kernels/
-  gllm_talk_kernels.ptx               # JIT-compiled CUDA PTX: 1.36M outer shell, sponge carving, 128^3 fluid splitting & recombination
-  gllm_talk_kernels.cu                # Readable CUDA C++ reference mirror for fluid sponge kernels
-  gllm_kernels.ptx                    # JIT-compiled CUDA PTX for visual shadow training, matching & routing
-  gllm_kernels.cu                     # Readable CUDA C++ reference mirror for visual kernels
-src/
-  gllm_talk_viz.cpp                   # Real-time CUDA-OpenGL 4.6 Concentric Fluid Sponge visualizer
-  gllm_train.cpp                      # GPU shadow trainer + Spherical K-Means
-  gllm_pyramid.cpp                    # RGB Burt-Adelson Gaussian Pyramid lattice mapper
-  gllm_hierarchy.cpp                  # 4-level RGB animals hierarchy builder
-  gllm_merge.cpp                      # Unified 1B universe sphere merger
-  gllm_eval.cpp                       # Batch GPU evaluator
-  gllm_bench.cpp                      # Full holdout, containment & OOD auditor
-  gllm_inspect.cpp                    # Checkpoint hierarchy & lookup inspector
-  gllm_viz.cpp                        # Interactive 3D visual sphere + sketch capture UI
-scripts/
-  prepare_talk_data.py                # Builds fast binary Kaikki 1.36M lexicon + 89k SQuAD Q&A stream
-  run_talk_viz.sh                     # NVIDIA PRIME offload launcher for gllm_talk_viz
-  build.sh                            # Compiles all 9 standalone C++17 / CUDA CLIs into bin/
-  train_digits_and_letters.sh         # Hierarchical handwritten trainer
-  benchmark.sh                        # Reproducible 68,405-image holdout benchmark
-  run_viz.sh                          # Launcher for visual gllm_viz
-docs/images/
-  gllm_fluid_sponge_qa.png            # Live parallel CUDA voxel fluid splitting -> #1 Paris (16.5 mL)
-  gllm_sponge_carving.png             # Real-time Q&A water-artery carving through the 128^3 sponge
-```
+- [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app
+- [`kernels/gllm_talk_kernels.ptx`](kernels/gllm_talk_kernels.ptx) — GPU kernels for the 1.36M word shell, sponge carving, and parallel `128³` voxel fluid splitting & collisions
+- [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, spoken sentence output, and competing answer water meters
+- [`scripts/prepare_talk_data.py`](scripts/prepare_talk_data.py) — Packs the Kaikki English dictionary + SQuAD Q&A pairs + real sentences for fast GPU loading
+- [`scripts/run_talk_viz.sh`](scripts/run_talk_viz.sh) — Launches `gllm_talk_viz` on your NVIDIA GPU
+- [`src/gllm_*.cpp`](src/) & [`kernels/gllm_kernels.ptx`](kernels/gllm_kernels.ptx) — The earlier visual 1B-sphere CLI suite

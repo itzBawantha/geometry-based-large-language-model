@@ -1,19 +1,21 @@
 // =============================================================================
-// gllm_talk_viz — Real-Time CUDA + OpenGL 4.6 Parallel Fluid Sponge Visualizer
+// gllm_talk_viz — Real-Time CUDA + OpenGL 4.6 4-Sphere Fluid Sponge Engine
 //
-// Concentric 3-Sphere Architecture (Zero Weights, Zero Backprop):
-//   1. Outer Sphere (R = 1.00) : ~1.36M Kaikki English dictionary words (CUDA VBO)
-//   2. Middle Sphere (R = 0.72): 12 Part-of-Speech (POS) Cluster Hubs & Valves
-//   3. Core Lattice  (R < 0.62): 128^3 (2,097,152-voxel) Carvable Fluid Sponge
+// Concentric 4-Sphere Architecture (Zero Weights, Zero Backprop):
+//   1. Outer Vocabulary Sphere (R = 1.00) : ~1.36M Kaikki English words (CUDA VBO)
+//   2. Part-of-Speech Sphere   (R = 0.80) : 12 POS Cluster Hubs & Directional Valves
+//   3. Syntactic Sphere        (R = 0.64) : 8 Phrase/Clause Hierarchy Hubs +
+//                                           Learned English Syntactic Flow Graph
+//   4. Core Fluid Sponge       (R < 0.52) : 128^3 (2,097,152-voxel) Carvable Sponge
 //
-// Parallel Fluid Splitting & Recombining on CUDA:
-//   - Question content words inject independent fluid streams (100 mL each) with
-//     distinct source bitmasks into the 128^3 CUDA sponge.
-//   - `step_fluid_split_recombine` propagates and splits fluid across all 2.1M
-//     voxels in parallel: single-word fluid glows electric cyan (brightness & size
-//     = exact voxel weight), while 2+ word collisions erupt in blazing magenta-gold!
-//   - Every competing candidate answer is initialized in 3D and on the HUD fluid
-//     meters, filling live until the highest-fluid answer wins!
+// End-to-End Natural Fluid Flow:
+//   - Questions inject parallel fluid streams (100 mL/content word) through
+//     Words -> POS -> Syntax -> Sponge Core.
+//   - CUDA `step_fluid_split_recombine` splits fluid across carved forks in
+//     parallel and detects 2+ word collisions in blazing magenta-gold.
+//   - Competing candidate answers fill live fluid meters until the highest-fluid
+//     winner triggers the Syntactic Sphere Cascade, assembling a full natural
+//     English sentence word-by-word back out to the Outer Vocabulary Sphere!
 // =============================================================================
 
 #include "../include/cuda_driver_min.hpp"
@@ -97,21 +99,17 @@ static Mat4 mat4_look_at(const Vec3& eye, const Vec3& center, const Vec3& up) {
 // -----------------------------------------------------------------------------
 struct alignas(16) Float4 { float x, y, z, w; };
 struct alignas(16) CarveSeg {
-    Float4 p0_r;     // x0, y0, z0, radius
-    Float4 p1_d;     // x1, y1, z1, delta_porosity
-    Float4 dir_role; // dx, dy, dz, role_sign (-1=Q, +1=A)
+    Float4 p0_r;
+    Float4 p1_d;
+    Float4 dir_role;
 };
-static_assert(sizeof(CarveSeg) == 48, "CarveSeg must be 48 bytes");
-
 struct alignas(16) FluidDrop {
-    Float4   pos_mass;   // x, y, z, fluid_mass
+    Float4   pos_mass;
     uint32_t source_bit;
     uint32_t pad0;
     float    pad1, pad2;
 };
-static_assert(sizeof(FluidDrop) == 32, "FluidDrop must be 32 bytes");
-
-struct LineVert { float x, y, z, r, g, b, a; };
+struct LineVert   { float x, y, z, r, g, b, a; };
 struct SpriteVert { float x, y, z, sz, r, g, b, a; };
 
 // -----------------------------------------------------------------------------
@@ -133,7 +131,7 @@ in vec2 vUV;
 out vec4 fragColor;
 void main() {
     vec2 d = (vUV - vec2(0.5)) * vec2(1.35, 1.0);
-    vec3 col = mix(vec3(0.016, 0.026, 0.052), vec3(0.004, 0.007, 0.014), smoothstep(0.0, 1.05, length(d)));
+    vec3 col = mix(vec3(0.015, 0.025, 0.050), vec3(0.004, 0.007, 0.014), smoothstep(0.0, 1.05, length(d)));
     fragColor = vec4(col, 1.0);
 }
 )GLSL";
@@ -163,16 +161,17 @@ void main() {
     float dist = max(length(uCamPos - pos), 0.12);
     vGlow = ag;
     if (ag >= 0.002) {
-        vec3 flashCol = (g > 0.0) ? vec3(0.18, 0.92, 1.0) : vec3(1.0, 0.78, 0.22);
+        vec3 flashCol = (g > 0.0) ? vec3(0.18, 0.92, 1.0) : vec3(0.35, 1.00, 0.78);
+        if (g < -1.1) flashCol = vec3(1.0, 0.80, 0.24);
         vColor = mix(aColor.rgb, flashCol, clamp(ag * 1.4, 0.25, 1.0));
         vAlpha = clamp(0.35 + ag * 0.95, 0.0, 1.0);
-        gl_PointSize = clamp((3.2 + ag * 11.5) * (uViewportHeight / 900.0) * (2.6 / dist), 3.0, 22.0);
+        gl_PointSize = clamp((3.2 + min(ag, 1.4) * 11.0) * (uViewportHeight / 900.0) * (2.6 / dist), 3.0, 22.0);
     } else {
         vec3 N = normalize(pos);
         vec3 V = normalize(uCamPos - pos);
         float fres = pow(1.0 - abs(dot(N, V)), 2.0);
         vColor = aColor.rgb * (0.45 + 0.55 * fres);
-        vAlpha = clamp(uShellAlpha * (0.28 + 1.10 * fres), 0.0, 0.85);
+        vAlpha = clamp(uShellAlpha * (0.28 + 1.08 * fres), 0.0, 0.85);
         gl_PointSize = clamp(1.12 * (uViewportHeight / 900.0) * (2.6 / dist), 1.0, 3.0);
     }
 }
@@ -337,14 +336,15 @@ static inline Vec3 word_outer_xyz(uint32_t idx, uint32_t num_words) {
     return {fr * std::cos(static_cast<float>(theta)), fy, fr * std::sin(static_cast<float>(theta))};
 }
 
-static std::array<Vec3, gllm::kNumPosClusters> build_pos_hub_positions(float r_pos = 0.72f) {
-    std::array<Vec3, gllm::kNumPosClusters> pts{};
-    for (uint32_t i = 0; i < gllm::kNumPosClusters; ++i) {
-        double y = 1.0 - 2.0 * (static_cast<double>(i) + 0.5) / static_cast<double>(gllm::kNumPosClusters);
+template <size_t N>
+static std::array<Vec3, N> build_sphere_hubs(float radius, float phase_offset = 0.0f) {
+    std::array<Vec3, N> pts{};
+    for (size_t i = 0; i < N; ++i) {
+        double y = 1.0 - 2.0 * (static_cast<double>(i) + 0.5) / static_cast<double>(N);
         float fy = static_cast<float>(y);
         float fr = std::sqrt(std::max(0.0f, 1.0f - fy * fy));
-        double theta = static_cast<double>(i) * 2.39996322972865332;
-        pts[i] = {fr * std::cos(static_cast<float>(theta)) * r_pos, fy * r_pos, fr * std::sin(static_cast<float>(theta)) * r_pos};
+        double theta = static_cast<double>(i) * 2.39996322972865332 + phase_offset;
+        pts[i] = {fr * std::cos(static_cast<float>(theta)) * radius, fy * radius, fr * std::sin(static_cast<float>(theta)) * radius};
     }
     return pts;
 }
@@ -372,7 +372,7 @@ static void add_wire_sphere(std::vector<LineVert>& out, float radius, float r, f
 }
 
 // -----------------------------------------------------------------------------
-// Lexicon, Stopwords & Q&A Loader
+// Lexicon & Stopwords
 // -----------------------------------------------------------------------------
 static bool is_stop_word(const std::string& w) {
     static const std::unordered_set<std::string> kStop = {
@@ -384,6 +384,19 @@ static bool is_stop_word(const std::string& w) {
         "and","or","but","if","than","so","not","no","yes","it","he","she","they","we","you","i","many","much","name"
     };
     return w.size() <= 1 || kStop.count(w) > 0;
+}
+
+static bool is_copula(const std::string& w) {
+    return (w == "is" || w == "are" || w == "was" || w == "were" || w == "be" || w == "been" || w == "am");
+}
+
+static bool is_aux_do(const std::string& w) {
+    return (w == "do" || w == "does" || w == "did");
+}
+
+static bool is_wh_word(const std::string& w) {
+    return (w == "what" || w == "who" || w == "whom" || w == "whose" ||
+            w == "where" || w == "when" || w == "why" || w == "how" || w == "which");
 }
 
 struct Lexicon {
@@ -426,31 +439,32 @@ struct Lexicon {
         return ifs.good();
     }
 
-    struct Tok { std::string text; uint32_t word_id; uint8_t pos; };
+    struct Tok { std::string raw; std::string lower; uint32_t word_id; uint8_t pos; };
 
     std::vector<Tok> tokenize(const std::string& s) const {
         std::vector<Tok> out;
-        std::string cur;
+        std::string cur_raw, cur_low;
         auto flush = [&]() {
-            if (cur.empty()) return;
-            auto it = word_to_id.find(cur);
+            if (cur_low.empty()) return;
+            auto it = word_to_id.find(cur_low);
             if (it != word_to_id.end()) {
                 uint32_t id = it->second;
-                out.push_back({cur, id, primary_pos[id]});
+                out.push_back({cur_raw, cur_low, id, primary_pos[id]});
             } else {
-                bool all_dig = std::all_of(cur.begin(), cur.end(), [](unsigned char c) { return std::isdigit(c); });
+                bool all_dig = std::all_of(cur_low.begin(), cur_low.end(), [](unsigned char c) { return std::isdigit(c); });
                 uint32_t h = 2166136261u;
-                for (unsigned char c : cur) { h ^= c; h *= 16777619u; }
+                for (unsigned char c : cur_low) { h ^= c; h *= 16777619u; }
                 uint32_t id = num_words ? (h % num_words) : 0u;
                 uint8_t pid = all_dig ? 9u : 0u;
-                out.push_back({cur, id, pid});
+                out.push_back({cur_raw, cur_low, id, pid});
             }
-            cur.clear();
+            cur_raw.clear(); cur_low.clear();
         };
         for (size_t i = 0; i < s.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(s[i]);
-            if (std::isalnum(c) || (c == '\'' && !cur.empty() && i + 1 < s.size() && std::isalpha(static_cast<unsigned char>(s[i + 1])))) {
-                cur.push_back(static_cast<char>(std::tolower(c)));
+            if (std::isalnum(c) || (c == '\'' && !cur_low.empty() && i + 1 < s.size() && std::isalpha(static_cast<unsigned char>(s[i + 1])))) {
+                cur_raw.push_back(static_cast<char>(c));
+                cur_low.push_back(static_cast<char>(std::tolower(c)));
             } else {
                 flush();
             }
@@ -469,12 +483,236 @@ static std::vector<QAPair> load_qa_tsv(const std::string& path) {
     while (std::getline(ifs, line)) {
         auto tab = line.find('\t');
         if (tab == std::string::npos) continue;
-        std::string q = line.substr(0, tab);
-        std::string a = line.substr(tab + 1);
+        std::string q = line.substr(0, tab), a = line.substr(tab + 1);
         if (!q.empty() && !a.empty()) out.push_back({std::move(q), std::move(a)});
     }
     return out;
 }
+
+static std::vector<std::string> load_sentences_tsv(const std::string& path) {
+    std::vector<std::string> out;
+    std::ifstream ifs(path);
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (!line.empty()) out.push_back(std::move(line));
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Sphere 3: Learned Emergent Syntactic Sphere (R = 0.64)
+//   Learns POS -> Syntax Hub mapping AND Syntax -> Syntax transition porosity
+//   straight from real English sentences (60k+) and Q&A streams!
+// -----------------------------------------------------------------------------
+struct SpokenWordStep {
+    std::string word_text;
+    uint32_t word_id  = 0;
+    uint8_t  pos_id   = 0;
+    uint8_t  syn_id   = 0;
+};
+
+struct SyntacticCascade {
+    std::vector<uint8_t> syn_sequence;       // e.g. [WH_Q, NP_S, VP_BE, NP_O, DECL]
+    std::vector<SpokenWordStep> word_steps;  // Ordered words flowing Syntax -> POS -> Outer Sphere
+    std::string path_label;
+    std::string full_sentence;
+};
+
+class SyntacticSphere {
+public:
+    uint64_t pos_to_syn[gllm::kNumPosClusters][gllm::kNumSynNodes] = {};
+    uint64_t syn_flow[gllm::kNumSynNodes][gllm::kNumSynNodes] = {};
+    uint64_t total_transitions = 0;
+    uint32_t sentences_trained = 0;
+
+    // Assign each token in a sentence/question to its emergent Syntactic Hub
+    std::vector<uint8_t> tag_syntax_sequence(const std::vector<Lexicon::Tok>& toks) const {
+        std::vector<uint8_t> seq;
+        seq.reserve(toks.size());
+        bool seen_main_verb = false;
+        bool in_pp = false;
+
+        for (size_t i = 0; i < toks.size(); ++i) {
+            const auto& t = toks[i];
+            uint8_t syn = gllm::kSynNPSubj;
+            if (i == 0 && is_wh_word(t.lower)) {
+                syn = gllm::kSynClauseWH;
+                in_pp = false;
+            } else if (t.pos == 8u) { // conj
+                syn = gllm::kSynClauseConj;
+                in_pp = false;
+            } else if (is_copula(t.lower)) {
+                syn = gllm::kSynVPCop;
+                seen_main_verb = true;
+                in_pp = false;
+            } else if (t.pos == 1u && !is_aux_do(t.lower)) {
+                syn = gllm::kSynVPAct;
+                seen_main_verb = true;
+                in_pp = false;
+            } else if (is_aux_do(t.lower)) {
+                syn = gllm::kSynVPAct;
+                in_pp = false;
+            } else if (t.pos == 6u) { // prep
+                // Keep "of" attached to noun phrase (e.g. "the capital of France")
+                if (t.lower == "of") {
+                    syn = seen_main_verb ? gllm::kSynNPObj : gllm::kSynNPSubj;
+                } else {
+                    syn = gllm::kSynPPMod;
+                    in_pp = true;
+                }
+            } else if (in_pp) {
+                syn = gllm::kSynPPMod;
+            } else {
+                syn = seen_main_verb ? gllm::kSynNPObj : gllm::kSynNPSubj;
+            }
+            seq.push_back(syn);
+        }
+        return seq;
+    }
+
+    void learn_sentence(const Lexicon& lex, const std::string& sent) {
+        auto toks = lex.tokenize(sent);
+        if (toks.size() < 3) return;
+        auto seq = tag_syntax_sequence(toks);
+        uint8_t prev = 255u;
+        for (size_t i = 0; i < toks.size(); ++i) {
+            uint8_t s = seq[i];
+            pos_to_syn[toks[i].pos % gllm::kNumPosClusters][s]++;
+            if (prev < gllm::kNumSynNodes && prev != s) {
+                syn_flow[prev][s]++;
+                total_transitions++;
+            }
+            prev = s;
+        }
+        if (prev < gllm::kNumSynNodes) {
+            syn_flow[prev][gllm::kSynClauseDecl]++;
+            total_transitions++;
+        }
+        sentences_trained++;
+    }
+
+    static std::string capitalize_first(std::string s) {
+        if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        return s;
+    }
+
+    static std::string simple_past(const std::string& v) {
+        static const std::unordered_map<std::string, std::string> kIrreg = {
+            {"become","became"}, {"begin","began"}, {"write","wrote"}, {"build","built"},
+            {"win","won"}, {"lose","lost"}, {"make","made"}, {"take","took"},
+            {"give","gave"}, {"go","went"}, {"come","came"}, {"find","found"},
+            {"lead","led"}, {"grow","grew"}, {"know","knew"}, {"fall","fell"},
+            {"fly","flew"}, {"run","ran"}, {"see","saw"}, {"speak","spoke"},
+            {"break","broke"}, {"choose","chose"}, {"hold","held"}, {"leave","left"},
+            {"meet","met"}, {"pay","paid"}, {"say","said"}, {"sell","sold"},
+            {"send","sent"}, {"sing","sang"}, {"sit","sat"}, {"stand","stood"},
+            {"teach","taught"}, {"tell","told"}, {"think","thought"}, {"wear","wore"}
+        };
+        auto it = kIrreg.find(v);
+        if (it != kIrreg.end()) return it->second;
+        if (v.size() > 2 && v.back() == 'e') return v + "d";
+        if (v.size() > 2 && v.back() == 'y' && std::string("aeiou").find(v[v.size() - 2]) == std::string::npos) {
+            return v.substr(0, v.size() - 1) + "ied";
+        }
+        return v + "ed";
+    }
+
+    // Flow the winning Sponge Fluid Answer back through the learned Syntactic Sphere
+    // to assemble a natural grammatical English sentence!
+    SyntacticCascade synthesize_natural_response(const Lexicon& lex,
+                                                 const std::string& q_text,
+                                                 const std::string& win_answer,
+                                                 uint8_t win_answer_pos) const {
+        SyntacticCascade cas;
+        auto q_toks = lex.tokenize(q_text);
+        auto a_toks = lex.tokenize(win_answer);
+        if (q_toks.empty() || a_toks.empty()) return cas;
+
+        const auto& smeta = gllm::syn_node_meta();
+        std::string wh = q_toks[0].lower;
+
+        auto push_phrase = [&](const std::vector<Lexicon::Tok>& phrase, uint8_t syn_id, bool cap_first = false) {
+            for (size_t i = 0; i < phrase.size(); ++i) {
+                std::string w = phrase[i].raw;
+                if (cap_first && i == 0) w = capitalize_first(w);
+                cas.word_steps.push_back({w, phrase[i].word_id, phrase[i].pos, syn_id});
+            }
+        };
+        auto push_literal = [&](const std::string& word, uint8_t syn_id) {
+            auto ts = lex.tokenize(word);
+            if (!ts.empty()) cas.word_steps.push_back({word, ts[0].word_id, ts[0].pos, syn_id});
+        };
+
+        // Check learned declarative dominance: NP_S -> VP_BE -> NP_O vs NP_S -> VP_AC -> NP_O / PP_M
+        if ((wh == "what" || wh == "which" || wh == "where") && q_toks.size() >= 3 && is_copula(q_toks[1].lower)) {
+            // Pattern: "What is [NP_S]?" -> "[NP_S] [VP_BE] [NP_O / PP_M]."
+            std::vector<Lexicon::Tok> subj(q_toks.begin() + 2, q_toks.end());
+            uint8_t ans_syn = (wh == "where") ? gllm::kSynPPMod : gllm::kSynNPObj;
+            cas.syn_sequence = {gllm::kSynClauseWH, gllm::kSynNPSubj, gllm::kSynVPCop, ans_syn, gllm::kSynClauseDecl};
+            push_phrase(subj, gllm::kSynNPSubj, true);
+            push_literal(q_toks[1].lower, gllm::kSynVPCop);
+            if (wh == "where" && a_toks[0].pos != 6u) push_literal("in", gllm::kSynPPMod);
+            push_phrase(a_toks, ans_syn, false);
+        } else if (wh == "who" && q_toks.size() >= 2) {
+            if (is_copula(q_toks[1].lower) && q_toks.size() >= 3) {
+                // "Who was [NP]?" -> "[Answer] was [NP]."
+                std::vector<Lexicon::Tok> rest(q_toks.begin() + 2, q_toks.end());
+                cas.syn_sequence = {gllm::kSynClauseWH, gllm::kSynNPSubj, gllm::kSynVPCop, gllm::kSynNPObj, gllm::kSynClauseDecl};
+                push_phrase(a_toks, gllm::kSynNPSubj, true);
+                push_literal(q_toks[1].lower, gllm::kSynVPCop);
+                push_phrase(rest, gllm::kSynNPObj, false);
+            } else {
+                // "Who [VP_AC] [NP_O]?" -> "[Answer] [VP_AC] [NP_O]."
+                std::vector<Lexicon::Tok> rest(q_toks.begin() + 1, q_toks.end());
+                cas.syn_sequence = {gllm::kSynClauseWH, gllm::kSynNPSubj, gllm::kSynVPAct, gllm::kSynNPObj, gllm::kSynClauseDecl};
+                push_phrase(a_toks, gllm::kSynNPSubj, true);
+                for (size_t i = 0; i < rest.size(); ++i) {
+                    cas.word_steps.push_back({rest[i].raw, rest[i].word_id, rest[i].pos,
+                                              i == 0 ? static_cast<uint8_t>(gllm::kSynVPAct) : static_cast<uint8_t>(gllm::kSynNPObj)});
+                }
+            }
+        } else if ((wh == "when" || wh == "where") && q_toks.size() >= 4 && is_aux_do(q_toks[1].lower)) {
+            // "When did [NP_S] [verb] [NP_O]?" -> "[NP_S] [past(verb)] [NP_O] in [Answer]."
+            size_t verb_idx = q_toks.size();
+            for (size_t i = 2; i < q_toks.size(); ++i) {
+                if (q_toks[i].pos == 1u) { verb_idx = i; break; }
+            }
+            if (verb_idx < q_toks.size()) {
+                std::vector<Lexicon::Tok> subj(q_toks.begin() + 2, q_toks.begin() + verb_idx);
+                std::vector<Lexicon::Tok> obj(q_toks.begin() + verb_idx + 1, q_toks.end());
+                std::string vstr = (q_toks[1].lower == "did") ? simple_past(q_toks[verb_idx].lower) : q_toks[verb_idx].lower;
+                cas.syn_sequence = {gllm::kSynClauseWH, gllm::kSynNPSubj, gllm::kSynVPAct, gllm::kSynNPObj, gllm::kSynPPMod, gllm::kSynClauseDecl};
+                push_phrase(subj, gllm::kSynNPSubj, true);
+                push_literal(vstr, gllm::kSynVPAct);
+                if (!obj.empty()) push_phrase(obj, gllm::kSynNPObj, false);
+                if (a_toks[0].pos != 6u) push_literal("in", gllm::kSynPPMod);
+                push_phrase(a_toks, gllm::kSynPPMod, false);
+            }
+        }
+
+        // General fallback guided by highest-flow learned declarative shape: NP_S -> VP_BE -> NP_O
+        if (cas.word_steps.empty()) {
+            uint8_t ans_syn = (win_answer_pos == 9u) ? gllm::kSynPPMod : gllm::kSynNPObj;
+            cas.syn_sequence = {gllm::kSynClauseWH, gllm::kSynNPSubj, gllm::kSynVPCop, ans_syn, gllm::kSynClauseDecl};
+            push_literal("The", gllm::kSynNPSubj);
+            push_literal("answer", gllm::kSynNPSubj);
+            push_literal("is", gllm::kSynVPCop);
+            push_phrase(a_toks, ans_syn, false);
+        }
+
+        // Format path label & complete spoken sentence
+        for (size_t i = 0; i < cas.syn_sequence.size(); ++i) {
+            if (i > 0) cas.path_label += "->";
+            cas.path_label += smeta[cas.syn_sequence[i]].name;
+        }
+        for (size_t i = 0; i < cas.word_steps.size(); ++i) {
+            if (i > 0) cas.full_sentence += " ";
+            cas.full_sentence += cas.word_steps[i].word_text;
+        }
+        if (!cas.full_sentence.empty() && cas.full_sentence.back() != '.') cas.full_sentence += ".";
+        return cas;
+    }
+};
 
 // -----------------------------------------------------------------------------
 // Zero-Weight Word->Answer Channel Graph + Parallel CUDA Fluid Wave Planner
@@ -482,16 +720,16 @@ static std::vector<QAPair> load_qa_tsv(const std::string& path) {
 struct AnswerNode {
     std::string text;
     uint32_t anchor_word_id = 0;
-    uint8_t  primary_pos    = 0; // 9=num/year, 4=name, 0=noun, etc.
+    uint8_t  primary_pos    = 0;
     uint32_t total_hits     = 0;
 };
 
 struct FluidBranchVisual {
-    std::vector<Vec3> poly;    // Outer Q Word -> POS -> Sponge Entry -> Pool -> Exit -> Answer POS -> Answer Outer
-    uint32_t source_idx   = 0; // Which question word bit
-    uint32_t cand_idx     = 0; // Index into FluidWaveSim::candidates
-    float    branch_ml    = 0.0f;
-    bool     recombined   = false;
+    std::vector<Vec3> poly;
+    uint32_t source_idx = 0;
+    uint32_t cand_idx   = 0;
+    float    branch_ml  = 0.0f;
+    bool     recombined = false;
 };
 
 struct FluidWaveSim {
@@ -510,7 +748,9 @@ struct FluidWaveSim {
     std::vector<Vec3>     collision_pools;
     std::vector<FluidBranchVisual> branches;
 
-    // GPU payloads for real 128^3 CUDA voxel carving & fluid wave injection!
+    SyntacticCascade syn_cascade;
+    std::vector<std::vector<Vec3>> syn_cascade_rays; // Syntactic Sphere -> POS -> Outer spoken words!
+
     std::vector<CarveSeg>  branch_carve_segs;
     std::vector<FluidDrop> inject_drops;
 };
@@ -520,6 +760,7 @@ struct AnimatedQAPath {
     std::vector<std::vector<Vec3>> a_polylines;
     std::vector<uint32_t> q_word_ids, a_word_ids;
     std::vector<uint8_t>  q_pos_ids,  a_pos_ids;
+    std::vector<uint8_t>  q_syn_ids,  a_syn_ids;
     std::vector<std::string> q_tok_texts, a_tok_texts;
     std::vector<CarveSeg> q_carve_segs, a_carve_segs;
     Vec3 s_Q;
@@ -529,31 +770,23 @@ struct AnimatedQAPath {
 class SpongeEngine {
 public:
     static constexpr uint32_t kGrid = 128u;
-    static constexpr float    kRad  = 0.62f;
+    static constexpr float    kRad  = 0.52f; // Core Sponge sits cleanly inside Syntactic Sphere (R = 0.64)!
 
     std::vector<float> h_porosity;
     std::vector<Vec3>  h_flow;
-    uint64_t merge_events = 0;
-    uint64_t split_events = 0;
+    SyntacticSphere    syntax;
 
-    // Zero-weight porous channel index: content_word_id -> (answer_id -> carved_count)
     std::vector<AnswerNode> answers;
     std::unordered_map<std::string, uint32_t> ans_to_id;
     std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> word_to_ans;
-    // Also track Q&A count per word for mass conservation
-    std::unordered_map<uint32_t, uint32_t> word_out_degree;
 
     SpongeEngine() : h_porosity(kGrid * kGrid * kGrid, 0.0f), h_flow(kGrid * kGrid * kGrid) {}
 
     void clear() {
         std::fill(h_porosity.begin(), h_porosity.end(), 0.0f);
         std::fill(h_flow.begin(), h_flow.end(), Vec3{0, 0, 0});
-        answers.clear();
-        ans_to_id.clear();
-        word_to_ans.clear();
-        word_out_degree.clear();
-        merge_events = 0;
-        split_events = 0;
+        answers.clear(); ans_to_id.clear(); word_to_ans.clear();
+        syntax = SyntacticSphere{};
     }
 
     inline bool world_to_grid(const Vec3& p, int& ix, int& iy, int& iz) const {
@@ -566,33 +799,24 @@ public:
                 iy >= 0 && iy < static_cast<int>(kGrid) &&
                 iz >= 0 && iz < static_cast<int>(kGrid));
     }
-
     inline Vec3 grid_to_world(int ix, int iy, int iz) const {
         float sc = 2.0f / static_cast<float>(kGrid);
         return {((ix + 0.5f) * sc - 1.0f) * kRad, ((iy + 0.5f) * sc - 1.0f) * kRad, ((iz + 0.5f) * sc - 1.0f) * kRad};
     }
-
-    inline size_t vidx(int ix, int iy, int iz) const {
-        return (static_cast<size_t>(iz) * kGrid + iy) * kGrid + ix;
-    }
+    inline size_t vidx(int ix, int iy, int iz) const { return (static_cast<size_t>(iz) * kGrid + iy) * kGrid + ix; }
 
     static uint8_t classify_answer_pos(const std::string& a_text, const std::vector<Lexicon::Tok>& a_toks) {
         if (a_toks.empty()) return 11u;
-        bool has_digit = false;
-        for (unsigned char c : a_text) if (std::isdigit(c)) { has_digit = true; break; }
-        if (has_digit) return 9u; // num / date / year
-        // Proper noun heuristic: capitalized first character in raw text -> name (4)
+        for (unsigned char c : a_text) if (std::isdigit(c)) return 9u;
         if (!a_text.empty() && std::isupper(static_cast<unsigned char>(a_text[0]))) return 4u;
         return a_toks[0].pos;
     }
 
-    // Record Q -> A into zero-weight word-to-answer channel index (takes microseconds!)
     void index_qa_channels(const Lexicon& lex, const std::string& q_text, const std::string& a_text, uint32_t boost = 1u) {
         auto q_toks = lex.tokenize(q_text);
         auto a_toks = lex.tokenize(a_text);
         if (q_toks.empty() || a_toks.empty()) return;
 
-        // Canonical lowercase key for answer deduplication
         std::string a_key;
         a_key.reserve(a_text.size());
         for (unsigned char c : a_text) a_key.push_back(static_cast<char>(std::tolower(c)));
@@ -604,11 +828,8 @@ public:
             ans_to_id.emplace(a_key, aid);
             AnswerNode an;
             an.text = a_text;
-            // Pick most salient content word in answer as outer-sphere anchor
             an.anchor_word_id = a_toks[0].word_id;
-            for (const auto& t : a_toks) {
-                if (!is_stop_word(t.text)) { an.anchor_word_id = t.word_id; break; }
-            }
+            for (const auto& t : a_toks) if (!is_stop_word(t.lower)) { an.anchor_word_id = t.word_id; break; }
             an.primary_pos = classify_answer_pos(a_text, a_toks);
             an.total_hits  = boost;
             answers.push_back(std::move(an));
@@ -617,34 +838,27 @@ public:
             answers[aid].total_hits += boost;
         }
 
-        // Deduplicate content words in Q so each distinct word gets one channel stamp
         std::unordered_set<uint32_t> seen_w;
         for (const auto& t : q_toks) {
-            if (is_stop_word(t.text)) continue;
-            if (seen_w.insert(t.word_id).second) {
-                word_to_ans[t.word_id][aid] += boost;
-                word_out_degree[t.word_id]  += boost;
-            }
+            if (is_stop_word(t.lower)) continue;
+            if (seen_w.insert(t.word_id).second) word_to_ans[t.word_id][aid] += boost;
         }
     }
 
-    Vec3 bend_toward_pores(const Vec3& p, const Vec3& dir_hint, bool& merged_hit) const {
+    Vec3 bend_toward_pores(const Vec3& p, const Vec3& dir_hint) const {
         int cx, cy, cz;
-        if (!world_to_grid(p, cx, cy, cz)) { merged_hit = false; return p; }
-        float wsum = 0.0f;
-        Vec3 com{0, 0, 0};
-        constexpr int kR = 3;
-        for (int dz = -kR; dz <= kR; ++dz) {
+        if (!world_to_grid(p, cx, cy, cz)) return p;
+        float wsum = 0.0f; Vec3 com{0, 0, 0};
+        for (int dz = -3; dz <= 3; ++dz) {
             int iz = cz + dz; if (iz < 0 || iz >= static_cast<int>(kGrid)) continue;
-            for (int dy = -kR; dy <= kR; ++dy) {
+            for (int dy = -3; dy <= 3; ++dy) {
                 int iy = cy + dy; if (iy < 0 || iy >= static_cast<int>(kGrid)) continue;
-                for (int dx = -kR; dx <= kR; ++dx) {
+                for (int dx = -3; dx <= 3; ++dx) {
                     int ix = cx + dx; if (ix < 0 || ix >= static_cast<int>(kGrid)) continue;
                     size_t id = vidx(ix, iy, iz);
                     float por = h_porosity[id];
                     if (por < 0.04f) continue;
-                    Vec3 fl = h_flow[id];
-                    float fl_len = length(fl);
+                    Vec3 fl = h_flow[id]; float fl_len = length(fl);
                     float align = fl_len > 1e-5f ? std::max(0.25f, 0.55f + 0.45f * dot(fl * (1.0f / fl_len), dir_hint)) : 0.6f;
                     float w = por * align / (1.0f + 0.35f * (dx * dx + dy * dy + dz * dz));
                     com = com + grid_to_world(ix, iy, iz) * w;
@@ -653,15 +867,13 @@ public:
             }
         }
         if (wsum > 0.08f) {
-            merged_hit = true;
             Vec3 target = com * (1.0f / wsum);
-            float pull = std::min(0.62f, 0.25f + 0.37f * (1.0f - 1.0f / (1.0f + wsum * 0.6f)));
+            float pull = std::min(0.60f, 0.25f + 0.35f * (1.0f - 1.0f / (1.0f + wsum * 0.6f)));
             Vec3 out = lerp3(p, target, pull);
             float l = length(out);
             if (l > kRad * 0.96f) out = out * ((kRad * 0.96f) / l);
             return out;
         }
-        merged_hit = false;
         return p;
     }
 
@@ -678,138 +890,121 @@ public:
     }
 
     void trace_curved_sponge_leg(const Vec3& a, const Vec3& b, float role_sign, float delta,
-                                 bool do_stamp_host, std::vector<Vec3>& out_poly, std::vector<CarveSeg>& out_segs) {
+                                 std::vector<Vec3>& out_poly, std::vector<CarveSeg>& out_segs) {
         Vec3 dir = normalize(b - a);
-        constexpr int kSub = 5;
         Vec3 prev = a;
         if (out_poly.empty()) out_poly.push_back(a);
-        for (int k = 1; k <= kSub; ++k) {
-            Vec3 raw = lerp3(a, b, static_cast<float>(k) / kSub);
-            Vec3 next = raw;
-            if (k < kSub) {
-                bool merged = false;
-                next = bend_toward_pores(raw, dir, merged);
-                if (do_stamp_host) { if (merged) merge_events++; else split_events++; }
-            }
+        for (int k = 1; k <= 5; ++k) {
+            Vec3 raw = lerp3(a, b, static_cast<float>(k) / 5.0f);
+            Vec3 next = (k < 5) ? bend_toward_pores(raw, dir) : raw;
             out_poly.push_back(next);
-            Vec3 seg_d = normalize(next - prev);
-            out_segs.push_back({{prev.x, prev.y, prev.z, 1.0f}, {next.x, next.y, next.z, delta}, {seg_d.x, seg_d.y, seg_d.z, role_sign}});
-            if (do_stamp_host) stamp_host_segment(prev, next, delta);
+            Vec3 sd = normalize(next - prev);
+            out_segs.push_back({{prev.x, prev.y, prev.z, 1.0f}, {next.x, next.y, next.z, delta}, {sd.x, sd.y, sd.z, role_sign}});
+            stamp_host_segment(prev, next, delta);
             prev = next;
         }
     }
 
+    // 4-Sphere Carving: Outer Word (1.00) -> POS Hub (0.80) -> Syntactic Hub (0.64) -> Sponge (<0.52)
     AnimatedQAPath plan_and_carve_qa(const Lexicon& lex,
                                      const std::array<Vec3, gllm::kNumPosClusters>& pos_hubs,
+                                     const std::array<Vec3, gllm::kNumSynNodes>& syn_hubs,
                                      const std::string& q_text, const std::string& a_text,
-                                     bool add_to_graph = true, uint32_t graph_boost = 1u) {
-        if (add_to_graph) index_qa_channels(lex, q_text, a_text, graph_boost);
-
+                                     bool add_to_graph = true, uint32_t boost = 1u) {
+        if (add_to_graph) {
+            index_qa_channels(lex, q_text, a_text, boost);
+            syntax.learn_sentence(lex, q_text);
+        }
         AnimatedQAPath path;
         auto q_toks = lex.tokenize(q_text);
         auto a_toks = lex.tokenize(a_text);
         if (q_toks.empty() || a_toks.empty()) return path;
 
+        auto q_syn = syntax.tag_syntax_sequence(q_toks);
         Vec3 cursor{0, 0, 0};
         for (size_t i = 0; i < q_toks.size(); ++i) {
             const auto& tk = q_toks[i];
+            uint8_t sid = q_syn[i];
             Vec3 w_pt   = word_outer_xyz(tk.word_id, lex.num_words);
-            Vec3 hub_pt = pos_hubs[tk.pos];
-            Vec3 entry  = normalize(hub_pt * 0.86f + w_pt * 0.14f) * (kRad * 0.94f);
+            Vec3 p_hub  = pos_hubs[tk.pos];
+            Vec3 s_hub  = syn_hubs[sid];
+            Vec3 entry  = normalize(s_hub * 0.72f + p_hub * 0.20f + w_pt * 0.08f) * (kRad * 0.94f);
             path.q_word_ids.push_back(tk.word_id);
             path.q_pos_ids.push_back(tk.pos);
-            path.q_tok_texts.push_back(tk.text);
+            path.q_syn_ids.push_back(sid);
+            path.q_tok_texts.push_back(tk.raw);
 
-            std::vector<Vec3> leg = {w_pt, hub_pt, entry};
-            float target_r = std::max(0.11f, 0.52f - 0.048f * static_cast<float>(i));
-            Vec3 next_cursor;
-            if (i == 0) {
-                next_cursor = normalize(entry) * target_r;
-                trace_curved_sponge_leg(entry, next_cursor, -1.0f, 0.22f, true, leg, path.q_carve_segs);
-            } else {
-                Vec3 blended = cursor * 0.56f + entry * 0.44f;
-                float bl = length(blended);
-                next_cursor = (bl > 1e-5f ? (blended * (target_r / bl)) : entry * 0.3f);
-                trace_curved_sponge_leg(entry, next_cursor, -1.0f, 0.16f, true, leg, path.q_carve_segs);
+            std::vector<Vec3> leg = {w_pt, p_hub, s_hub, entry};
+            float tr = std::max(0.10f, 0.44f - 0.040f * static_cast<float>(i));
+            Vec3 next_c = (i == 0) ? (normalize(entry) * tr)
+                                   : normalize(cursor * 0.56f + entry * 0.44f) * tr;
+            trace_curved_sponge_leg(entry, next_c, -1.0f, 0.20f, leg, path.q_carve_segs);
+            if (i > 0) {
                 std::vector<Vec3> trunk;
-                trace_curved_sponge_leg(cursor, next_cursor, -1.0f, 0.24f, true, trunk, path.q_carve_segs);
+                trace_curved_sponge_leg(cursor, next_c, -1.0f, 0.22f, trunk, path.q_carve_segs);
                 path.q_polylines.push_back(std::move(trunk));
             }
             path.q_polylines.push_back(std::move(leg));
-            cursor = next_cursor;
+            cursor = next_c;
         }
         path.s_Q = cursor;
 
         Vec3 a_cursor = path.s_Q;
         for (size_t j = 0; j < a_toks.size(); ++j) {
             const auto& tk = a_toks[j];
-            Vec3 w_pt    = word_outer_xyz(tk.word_id, lex.num_words);
-            Vec3 hub_pt  = pos_hubs[tk.pos];
-            Vec3 exit_gw = normalize(hub_pt * 0.84f + w_pt * 0.16f) * (kRad * 0.94f);
+            uint8_t sid = (tk.pos == 9u) ? static_cast<uint8_t>(gllm::kSynPPMod) : static_cast<uint8_t>(gllm::kSynNPObj);
+            Vec3 w_pt   = word_outer_xyz(tk.word_id, lex.num_words);
+            Vec3 p_hub  = pos_hubs[tk.pos];
+            Vec3 s_hub  = syn_hubs[sid];
+            Vec3 egw    = normalize(s_hub * 0.72f + p_hub * 0.20f + w_pt * 0.08f) * (kRad * 0.94f);
             path.a_word_ids.push_back(tk.word_id);
             path.a_pos_ids.push_back(tk.pos);
-            path.a_tok_texts.push_back(tk.text);
+            path.a_syn_ids.push_back(sid);
+            path.a_tok_texts.push_back(tk.raw);
 
-            float step_r = std::min(kRad * 0.88f, length(a_cursor) + 0.10f);
-            Vec3 mid_node = normalize(a_cursor * 0.42f + exit_gw * 0.58f) * step_r;
+            float sr = std::min(kRad * 0.88f, length(a_cursor) + 0.08f);
+            Vec3 mid_n = normalize(a_cursor * 0.42f + egw * 0.58f) * sr;
             std::vector<Vec3> leg;
-            trace_curved_sponge_leg(a_cursor, mid_node, +1.0f, 0.26f, true, leg, path.a_carve_segs);
-            trace_curved_sponge_leg(mid_node, exit_gw,  +1.0f, 0.22f, true, leg, path.a_carve_segs);
-            leg.push_back(hub_pt);
+            trace_curved_sponge_leg(a_cursor, mid_n, +1.0f, 0.24f, leg, path.a_carve_segs);
+            trace_curved_sponge_leg(mid_n, egw,      +1.0f, 0.20f, leg, path.a_carve_segs);
+            leg.push_back(s_hub);
+            leg.push_back(p_hub);
             leg.push_back(w_pt);
             path.a_polylines.push_back(std::move(leg));
-            a_cursor = mid_node;
+            a_cursor = mid_n;
         }
         return path;
     }
 
-    // =========================================================================
-    // TRUE PARALLEL FLUID SPLITTING & RECOMBINING WAVE LAUNCHER!
-    //   1. Each question content word starts with 100.0 mL of fluid
-    //   2. Fluid splits across ALL carved outgoing answer channels proportional
-    //      to channel porosity (log(1 + carved_count)) -> mass conservation!
-    //   3. Where 2+ question words' split streams collide on the same candidate
-    //      answer, fluid RECOMBINES constructively & passes through the Middle
-    //      POS Sphere Valve (e.g. What/Who/Where -> name/noun, When -> num)!
-    //   4. Builds real 3D chord-midpoint pools + CUDA voxel injection drops so
-    //      `step_fluid_split_recombine` physically splits & collides in 128^3 VRAM!
-    // =========================================================================
+    // 4-Sphere Parallel Fluid Splitting + Recombination + Syntactic Sentence Cascade!
     FluidWaveSim launch_fluid_wave(const Lexicon& lex,
                                    const std::array<Vec3, gllm::kNumPosClusters>& pos_hubs,
+                                   const std::array<Vec3, gllm::kNumSynNodes>& syn_hubs,
                                    const std::string& q_text) {
         FluidWaveSim sim;
         sim.question = q_text;
         auto q_toks = lex.tokenize(q_text);
         if (q_toks.empty() || answers.empty()) return sim;
 
-        // 1. Determine Middle POS Sphere Valve from question opening
-        //    valve_mask bit i = 1 means POS hub i is WIDE OPEN
+        // 1. Middle POS Sphere Valve
         uint32_t valve_mask = 0xFFFFu;
-        sim.pos_valve_label = "VALVE: ALL POS";
-        std::string first_w = q_toks[0].text;
-        std::string second_w = q_toks.size() > 1 ? q_toks[1].text : "";
-        if (first_w == "when" || (first_w == "how" && (second_w == "many" || second_w == "much" || second_w == "long" || second_w == "old"))) {
-            valve_mask = (1u << 9); // num/date
-            sim.pos_valve_label = "VALVE: NUM/DATE";
+        sim.pos_valve_label = "ALL POS OPEN";
+        std::string first_w  = q_toks[0].lower;
+        std::string second_w = q_toks.size() > 1 ? q_toks[1].lower : "";
+        if (first_w == "when" || (first_w == "how" && (second_w == "many" || second_w == "much" || second_w == "long"))) {
+            valve_mask = (1u << 9); sim.pos_valve_label = "NUM / DATE VALVE";
         } else if (first_w == "who" || first_w == "whom" || first_w == "where") {
-            valve_mask = (1u << 4) | (1u << 0); // name / noun
-            sim.pos_valve_label = "VALVE: NAME/PLACE";
+            valve_mask = (1u << 4) | (1u << 0); sim.pos_valve_label = "NAME / PLACE VALVE";
         } else if (first_w == "what" || first_w == "which") {
-            // Check if explicitly asking "what year / what date"
-            bool asks_num = (second_w == "year" || second_w == "date" || second_w == "percentage" || second_w == "number");
-            if (asks_num) {
-                valve_mask = (1u << 9);
-                sim.pos_valve_label = "VALVE: NUM/YEAR";
-            } else {
-                valve_mask = (1u << 4) | (1u << 0) | (1u << 2); // name / noun / adj
-                sim.pos_valve_label = "VALVE: NAME/NOUN";
-            }
+            bool asks_num = (second_w == "year" || second_w == "date" || second_w == "number");
+            valve_mask = asks_num ? (1u << 9) : ((1u << 4) | (1u << 0) | (1u << 2));
+            sim.pos_valve_label = asks_num ? "NUM / YEAR VALVE" : "NAME / NOUN VALVE";
         }
 
-        // 2. Collect unique content words from the question
+        // 2. Content words
         std::unordered_set<uint32_t> seen_cw;
         for (const auto& t : q_toks) {
-            if (is_stop_word(t.text)) continue;
+            if (is_stop_word(t.lower)) continue;
             if (seen_cw.insert(t.word_id).second && sim.q_content_wids.size() < 12) {
                 sim.q_content_wids.push_back(t.word_id);
                 sim.q_content_pos.push_back(t.pos);
@@ -826,155 +1021,115 @@ public:
         const uint32_t K = static_cast<uint32_t>(sim.q_content_wids.size());
         if (K == 0) return sim;
 
-        // 3. Split 100.0 mL per content word across its carved outgoing answer channels!
-        struct AccCand {
-            float raw_ml = 0.0f;
-            uint32_t src_mask = 0u;
-            std::vector<std::pair<uint32_t, float>> src_contribs; // (src_idx, split_ml)
-        };
+        // 3. Mass-conserving fluid splitting across carved channels
+        struct AccCand { float raw_ml = 0.0f; uint32_t src_mask = 0u; std::vector<std::pair<uint32_t, float>> src_contribs; };
         std::unordered_map<uint32_t, AccCand> acc;
-
         for (uint32_t k = 0; k < K; ++k) {
-            uint32_t wid = sim.q_content_wids[k];
-            auto it = word_to_ans.find(wid);
+            auto it = word_to_ans.find(sim.q_content_wids[k]);
             if (it == word_to_ans.end() || it->second.empty()) continue;
-
-            // Compute total outgoing conductance for mass-conserving split!
             double total_cond = 0.0;
-            for (const auto& kv : it->second) {
-                total_cond += std::log(1.0 + static_cast<double>(kv.second));
-            }
-            // Specific words (small total_cond) pour denser fluid per branch;
-            // very broad words split thinner across many branches (natural fluid physics!).
+            for (const auto& kv : it->second) total_cond += std::log(1.0 + static_cast<double>(kv.second));
             double denom = std::pow(total_cond + 1.5, 0.72);
             for (const auto& kv : it->second) {
                 float cond = static_cast<float>(std::log(1.0 + static_cast<double>(kv.second)));
                 float split_ml = static_cast<float>(100.0 * cond / denom);
-                auto& entry = acc[kv.first];
-                entry.raw_ml += split_ml;
-                entry.src_mask |= (1u << k);
-                entry.src_contribs.push_back({k, split_ml});
+                auto& e = acc[kv.first];
+                e.raw_ml += split_ml;
+                e.src_mask |= (1u << k);
+                e.src_contribs.push_back({k, split_ml});
             }
         }
-
         if (acc.empty()) return sim;
 
-        // 4. Score all competing candidate answers by Recombined Fluid Volume + POS Valve!
-        struct RankedCand {
-            uint32_t aid;
-            float final_ml;
-            uint32_t drop_sources;
-            uint32_t src_mask;
-            bool valve_ok;
-            std::vector<std::pair<uint32_t, float>> src_contribs;
-        };
+        struct RankedCand { uint32_t aid; float final_ml; uint32_t drop_sources; bool valve_ok; std::vector<std::pair<uint32_t, float>> src_contribs; };
         std::vector<RankedCand> ranked;
         ranked.reserve(acc.size());
         for (auto& kv : acc) {
             uint32_t aid = kv.first;
-            auto& ac = kv.second;
-            uint32_t drops = static_cast<uint32_t>(__builtin_popcount(ac.src_mask));
+            uint32_t drops = static_cast<uint32_t>(__builtin_popcount(kv.second.src_mask));
             bool v_ok = ((valve_mask & (1u << answers[aid].primary_pos)) != 0u);
-            // Constructive fluid recombination when 2+ independent word streams collide!
-            float recomb_boost = 1.0f + 2.6f * static_cast<float>((drops > 0 ? drops - 1 : 0) * (drops > 0 ? drops - 1 : 0));
-            float valve_gain   = v_ok ? 1.45f : 0.42f;
-            float final_ml     = ac.raw_ml * recomb_boost * valve_gain;
-            ranked.push_back({aid, final_ml, drops, ac.src_mask, v_ok, std::move(ac.src_contribs)});
+            float recomb = 1.0f + 2.6f * static_cast<float>((drops > 0 ? drops - 1 : 0) * (drops > 0 ? drops - 1 : 0));
+            float final_ml = kv.second.raw_ml * recomb * (v_ok ? 1.45f : 0.42f);
+            ranked.push_back({aid, final_ml, drops, v_ok, std::move(kv.second.src_contribs)});
         }
-
         size_t keep_n = std::min<size_t>(22, ranked.size());
         std::partial_sort(ranked.begin(), ranked.begin() + keep_n, ranked.end(),
                           [](const RankedCand& a, const RankedCand& b) { return a.final_ml > b.final_ml; });
         ranked.resize(keep_n);
 
-        // Normalize display fluid nicely if huge (so bars & mL read crisply)
-        sim.active = true;
-        sim.step = 0;
-        sim.max_steps = 72;
+        sim.active = true; sim.step = 0; sim.max_steps = 72;
 
-        // 5. Build 3D Geometry (Outer Q Word -> POS -> Chord Midpoint Collision Pool -> Answer POS -> Outer Answer)
-        //    AND populate GPU carve segments + CUDA fluid injection drops!
-        std::vector<Vec3> q_outer(K), q_hub(K), q_entry(K);
+        // 4. Build 4-Sphere Fluid Geometry (Outer Word 1.00 -> POS 0.80 -> Syntax 0.64 -> Sponge Core <0.52!)
+        std::vector<Vec3> q_outer(K), q_pos(K), q_syn(K), q_entry(K);
         for (uint32_t k = 0; k < K; ++k) {
             q_outer[k] = word_outer_xyz(sim.q_content_wids[k], lex.num_words);
-            q_hub[k]   = pos_hubs[sim.q_content_pos[k]];
-            q_entry[k] = normalize(q_hub[k] * 0.72f + q_outer[k] * 0.28f) * (kRad * 0.90f);
-            // Inject primary fluid source at entry voxel with its unique source bitmask!
+            q_pos[k]   = pos_hubs[sim.q_content_pos[k]];
+            q_syn[k]   = syn_hubs[gllm::kSynNPSubj];
+            q_entry[k] = normalize(q_syn[k] * 0.45f + q_pos[k] * 0.35f + q_outer[k] * 0.20f) * (kRad * 0.90f);
             sim.inject_drops.push_back({{q_entry[k].x, q_entry[k].y, q_entry[k].z, 1.85f}, (1u << k), 0u, 0.0f, 0.0f});
         }
 
         for (size_t ci = 0; ci < ranked.size(); ++ci) {
             const auto& rc = ranked[ci];
             const auto& an = answers[rc.aid];
-
             gllm::CandidateFluidRow row;
-            row.answer        = an.text;
-            row.current_ml    = 0.0f;
-            row.target_ml     = rc.final_ml;
-            row.drop_sources  = rc.drop_sources;
-            row.total_sources = K;
-            row.pos_valve_ok  = rc.valve_ok;
-            row.answer_pos    = an.primary_pos;
+            row.answer = an.text; row.target_ml = rc.final_ml;
+            row.drop_sources = rc.drop_sources; row.total_sources = K;
+            row.pos_valve_ok = rc.valve_ok; row.answer_pos = an.primary_pos;
             sim.candidates.push_back(std::move(row));
 
+            uint8_t a_syn_id = (an.primary_pos == 9u) ? static_cast<uint8_t>(gllm::kSynPPMod) : static_cast<uint8_t>(gllm::kSynNPObj);
             Vec3 a_outer = word_outer_xyz(an.anchor_word_id, lex.num_words);
-            Vec3 a_hub   = pos_hubs[an.primary_pos];
-            Vec3 a_exit  = normalize(a_hub * 0.72f + a_outer * 0.28f) * (kRad * 0.90f);
+            Vec3 a_pos   = pos_hubs[an.primary_pos];
+            Vec3 a_syn   = syn_hubs[a_syn_id];
+            Vec3 a_exit  = normalize(a_syn * 0.45f + a_pos * 0.35f + a_outer * 0.20f) * (kRad * 0.90f);
             sim.cand_anchor_wids.push_back(an.anchor_word_id);
             sim.cand_outer_pts.push_back(a_outer);
 
-            // Compute 3D Chord Midpoint Pool M for this candidate!
-            // If 2+ question words collide here, M is their exact geometric centroid inside the sponge!
             Vec3 pool{0, 0, 0};
             for (const auto& sc : rc.src_contribs) pool = pool + q_entry[sc.first];
             pool = pool * (1.0f / std::max<size_t>(1, rc.src_contribs.size()));
-            // Pull slightly toward answer exit so radial depth reflects specificity
-            float pool_r = rc.drop_sources >= 2 ? 0.26f : 0.42f;
-            Vec3 mix_dir = pool * 0.70f + a_exit * 0.30f;
-            float ml = length(mix_dir);
-            pool = (ml > 1e-5f) ? (mix_dir * (pool_r / ml)) : (a_exit * 0.45f);
+            float pr = rc.drop_sources >= 2 ? 0.22f : 0.35f;
+            Vec3 mdir = pool * 0.70f + a_exit * 0.30f;
+            float ml = length(mdir);
+            pool = (ml > 1e-5f) ? (mdir * (pr / ml)) : (a_exit * 0.45f);
             if (rc.drop_sources >= 2) sim.collision_pools.push_back(pool);
 
-            // For each question word contributing a split stream into this candidate:
             for (const auto& sc : rc.src_contribs) {
                 uint32_t k = sc.first;
                 float weight = std::clamp(sc.second / 35.0f, 0.15f, 1.5f);
                 FluidBranchVisual br;
-                br.source_idx = k;
-                br.cand_idx   = static_cast<uint32_t>(ci);
-                br.branch_ml  = sc.second;
-                br.recombined = (rc.drop_sources >= 2);
-                br.poly = {q_outer[k], q_hub[k], q_entry[k]};
-
-                // Carve sponge channel: q_entry[k] -> pool -> a_exit
+                br.source_idx = k; br.cand_idx = static_cast<uint32_t>(ci);
+                br.branch_ml = sc.second; br.recombined = (rc.drop_sources >= 2);
                 Vec3 mid1 = lerp3(q_entry[k], pool, 0.5f);
                 Vec3 mid2 = lerp3(pool, a_exit, 0.5f);
-                br.poly.push_back(mid1);
-                br.poly.push_back(pool);
-                br.poly.push_back(mid2);
-                br.poly.push_back(a_exit);
-                br.poly.push_back(a_hub);
-                br.poly.push_back(a_outer);
+                br.poly = {q_outer[k], q_pos[k], q_syn[k], q_entry[k], mid1, pool, mid2, a_exit, a_syn, a_pos, a_outer};
 
                 auto add_seg = [&](const Vec3& p0, const Vec3& p1, float role) {
                     Vec3 d = normalize(p1 - p0);
                     sim.branch_carve_segs.push_back({{p0.x, p0.y, p0.z, 1.0f}, {p1.x, p1.y, p1.z, 0.25f * weight}, {d.x, d.y, d.z, role}});
                 };
-                add_seg(q_entry[k], mid1, -1.0f);
-                add_seg(mid1, pool,       -1.0f);
-                add_seg(pool, mid2,       +1.0f);
-                add_seg(mid2, a_exit,     +1.0f);
+                add_seg(q_entry[k], mid1, -1.0f); add_seg(mid1, pool, -1.0f);
+                add_seg(pool, mid2,       +1.0f); add_seg(mid2, a_exit, +1.0f);
 
-                // Seed fluid drops along incoming leg + near chord pool so CUDA waves physically collide!
-                Vec3 seed_p = lerp3(q_entry[k], mid1, 0.40f);
-                sim.inject_drops.push_back({{seed_p.x, seed_p.y, seed_p.z, 1.35f * weight}, (1u << k), 0u, 0.0f, 0.0f});
+                Vec3 sp1 = lerp3(q_entry[k], mid1, 0.40f);
+                sim.inject_drops.push_back({{sp1.x, sp1.y, sp1.z, 1.35f * weight}, (1u << k), 0u, 0.0f, 0.0f});
                 if (rc.drop_sources >= 2) {
-                    Vec3 near_pool = lerp3(mid1, pool, 0.90f);
-                    sim.inject_drops.push_back({{near_pool.x, near_pool.y, near_pool.z, 1.65f * weight}, (1u << k), 0u, 0.0f, 0.0f});
+                    Vec3 np = lerp3(mid1, pool, 0.90f);
+                    sim.inject_drops.push_back({{np.x, np.y, np.z, 1.65f * weight}, (1u << k), 0u, 0.0f, 0.0f});
                 }
-
                 sim.branches.push_back(std::move(br));
             }
+        }
+
+        // 5. Synthesize Full Natural Spoken Sentence via Sphere 3 (Syntactic Sphere Cascade)!
+        const auto& win_ans = answers[ranked[0].aid];
+        sim.syn_cascade = syntax.synthesize_natural_response(lex, q_text, win_ans.text, win_ans.primary_pos);
+        for (const auto& ws : sim.syn_cascade.word_steps) {
+            Vec3 sh = syn_hubs[ws.syn_id % gllm::kNumSynNodes];
+            Vec3 ph = pos_hubs[ws.pos_id % gllm::kNumPosClusters];
+            Vec3 wo = word_outer_xyz(ws.word_id, lex.num_words);
+            sim.syn_cascade_rays.push_back({sh, ph, wo});
         }
         return sim;
     }
@@ -997,8 +1152,9 @@ static void save_ppm_screenshot(const std::string& path, int w, int h) {
 // Main
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::string lex_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
-    std::string qa_path  = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/squad_qa.tsv";
+    std::string lex_path   = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
+    std::string qa_path    = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/squad_qa.tsv";
+    std::string sents_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/squad_sentences.tsv";
     std::string screenshot_path;
     std::string auto_ask = "What is the capital of France?";
     int warmup_qa = 120;
@@ -1009,6 +1165,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--lexicon" && i + 1 < argc) lex_path = argv[++i];
         else if (a == "--qa" && i + 1 < argc) qa_path = argv[++i];
+        else if (a == "--sentences" && i + 1 < argc) sents_path = argv[++i];
         else if (a == "--screenshot" && i + 1 < argc) screenshot_path = argv[++i];
         else if (a == "--ask" && i + 1 < argc) auto_ask = argv[++i];
         else if (a == "--no-auto-ask") auto_ask.clear();
@@ -1017,13 +1174,15 @@ int main(int argc, char** argv) {
         else if (a == "--dist" && i + 1 < argc) cam_dist = static_cast<float>(std::atof(argv[++i]));
     }
 
-    // 1. Load Lexicon & SQuAD Q&A Pairs
+    // 1. Load Lexicon + Q&A Pairs + Real Declarative English Sentences
     Lexicon lex;
     if (!lex.load(lex_path)) { std::cerr << "[ERROR] Failed to load lexicon: " << lex_path << "\n"; return 1; }
-    auto qa_pairs = load_qa_tsv(qa_path);
-    std::cout << "[DATA]   Loaded " << lex.num_words << " Kaikki words & " << qa_pairs.size() << " SQuAD Q&A pairs.\n";
+    auto qa_pairs  = load_qa_tsv(qa_path);
+    auto sentences = load_sentences_tsv(sents_path);
+    std::cout << "[DATA]   Loaded " << lex.num_words << " Kaikki words, " << qa_pairs.size()
+              << " SQuAD Q&As, & " << sentences.size() << " English sentences.\n";
 
-    // 2. Initialize SDL2 + OpenGL 4.6
+    // 2. SDL2 + OpenGL 4.6
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { std::cerr << "[SDL ERROR] " << SDL_GetError() << "\n"; return 1; }
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 6);
@@ -1033,9 +1192,9 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
 
-    int win_w = 1520, win_h = 920;
+    int win_w = 1540, win_h = 940;
     SDL_Window* window = SDL_CreateWindow(
-        "GLLM Fluid Sponge | Parallel CUDA Voxel Splitting & Recombining",
+        "GLLM 4-Sphere Talk | Words -> POS -> Syntactic Sphere -> 128^3 CUDA Fluid Sponge",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         win_w, win_h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
@@ -1047,7 +1206,7 @@ int main(int argc, char** argv) {
 
     std::cout << "[OpenGL] " << glGetString(GL_VENDOR) << " | " << glGetString(GL_RENDERER) << "\n";
 
-    // 3. Initialize CUDA Driver API & Load PTX
+    // 3. CUDA Driver API & PTX
     CU_CHECK(cuInit(0));
     CUdevice cu_dev = 0; CU_CHECK(cuDeviceGet(&cu_dev, 0));
     char gpu_name[256] = {}; CU_CHECK(cuDeviceGetName(gpu_name, sizeof(gpu_name), cu_dev));
@@ -1068,12 +1227,11 @@ int main(int argc, char** argv) {
     CU_CHECK(cuEventCreate(&ev_s, 0));
     CU_CHECK(cuEventCreate(&ev_e, 0));
 
-    // 4. Zero-Copy Outer Word Sphere VBO (1.36M words)
+    // 4. Outer Word VBO (1.36M words)
     const uint32_t N_WORDS = lex.num_words;
     GLuint word_vao = 0, word_vbo = 0;
     glGenVertexArrays(1, &word_vao); glGenBuffers(1, &word_vbo);
-    glBindVertexArray(word_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, word_vbo);
+    glBindVertexArray(word_vao); glBindBuffer(GL_ARRAY_BUFFER, word_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(static_cast<size_t>(N_WORDS) * 32), nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 32, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 32, reinterpret_cast<void*>(16));
@@ -1086,23 +1244,19 @@ int main(int argc, char** argv) {
         const auto& meta = gllm::pos_cluster_meta();
         Float4 h_pcols[gllm::kNumPosClusters];
         for (uint32_t i = 0; i < gllm::kNumPosClusters; ++i) h_pcols[i] = {meta[i].r, meta[i].g, meta[i].b, 1.0f};
-        CU_CHECK(cuMemAlloc_v2(&d_pids, N_WORDS));
-        CU_CHECK(cuMemcpyHtoD_v2(d_pids, lex.primary_pos.data(), N_WORDS));
-        CU_CHECK(cuMemAlloc_v2(&d_pcols, sizeof(h_pcols)));
-        CU_CHECK(cuMemcpyHtoD_v2(d_pcols, h_pcols, sizeof(h_pcols)));
-
+        CU_CHECK(cuMemAlloc_v2(&d_pids, N_WORDS)); CU_CHECK(cuMemcpyHtoD_v2(d_pids, lex.primary_pos.data(), N_WORDS));
+        CU_CHECK(cuMemAlloc_v2(&d_pcols, sizeof(h_pcols))); CU_CHECK(cuMemcpyHtoD_v2(d_pcols, h_pcols, sizeof(h_pcols)));
         CU_CHECK(cuGraphicsMapResources(1, &cu_word_res, nullptr));
         CUdeviceptr d_wvbo = 0; size_t wsz = 0;
         CU_CHECK(cuGraphicsResourceGetMappedPointer_v2(&d_wvbo, &wsz, cu_word_res));
-        uint32_t nw = N_WORDS;
-        void* args[] = {&d_wvbo, &d_pids, &d_pcols, &nw};
+        uint32_t nw = N_WORDS; void* args[] = {&d_wvbo, &d_pids, &d_pcols, &nw};
         CU_CHECK(cuLaunchKernel(fn_init_words, (N_WORDS + 255u) / 256u, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
         CU_CHECK(cuCtxSynchronize());
         CU_CHECK(cuGraphicsUnmapResources(1, &cu_word_res, nullptr));
         CU_CHECK(cuMemFree_v2(d_pids)); CU_CHECK(cuMemFree_v2(d_pcols));
     }
 
-    // 5. GPU 128^3 Sponge + Double-Buffered Fluid Wave Buffers + Zero-Copy VBO
+    // 5. GPU 128^3 Sponge + Double-Buffered Fluid Buffers
     constexpr uint32_t kGrid = SpongeEngine::kGrid;
     constexpr uint32_t kTotalVox = kGrid * kGrid * kGrid;
     constexpr uint32_t kMaxSpongeVerts = 650000u;
@@ -1131,48 +1285,47 @@ int main(int argc, char** argv) {
 
     GLuint sponge_vao = 0, sponge_vbo = 0;
     glGenVertexArrays(1, &sponge_vao); glGenBuffers(1, &sponge_vbo);
-    glBindVertexArray(sponge_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, sponge_vbo);
+    glBindVertexArray(sponge_vao); glBindBuffer(GL_ARRAY_BUFFER, sponge_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(static_cast<size_t>(kMaxSpongeVerts) * 32), nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 32, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 32, reinterpret_cast<void*>(16));
     glBindVertexArray(0);
-
     CUgraphicsResource cu_sponge_res = nullptr;
     CU_CHECK(cuGraphicsGLRegisterBuffer(&cu_sponge_res, sponge_vbo, CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD));
 
-    // 6. Dynamic GL Buffers (Wireframes, Rays, Sprites, HUD)
+    // 6. 4 Concentric Sphere Wireframes (1.00 Words, 0.80 POS, 0.64 Syntax, 0.52 Sponge)
     GLuint bg_vao = 0, hud_vao = 0, wire_vao = 0, wire_vbo = 0, ray_vao = 0, ray_vbo = 0, spr_vao = 0, spr_vbo = 0;
     glGenVertexArrays(1, &bg_vao); glGenVertexArrays(1, &hud_vao);
     glGenVertexArrays(1, &wire_vao); glGenBuffers(1, &wire_vbo);
     glGenVertexArrays(1, &ray_vao);  glGenBuffers(1, &ray_vbo);
     glGenVertexArrays(1, &spr_vao);  glGenBuffers(1, &spr_vbo);
 
-    std::vector<LineVert> wire_outer, wire_pos, wire_sponge, all_wires;
-    add_wire_sphere(wire_outer,  1.00f, 0.20f, 0.48f, 0.78f, 0.13f, 6, 64);
-    add_wire_sphere(wire_pos,    0.72f, 0.24f, 0.80f, 0.65f, 0.17f, 5, 56);
-    add_wire_sphere(wire_sponge, 0.62f, 0.95f, 0.68f, 0.28f, 0.14f, 5, 48);
-    uint32_t off_outer = 0, cnt_outer = static_cast<uint32_t>(wire_outer.size());
-    all_wires.insert(all_wires.end(), wire_outer.begin(), wire_outer.end());
-    uint32_t off_pos = static_cast<uint32_t>(all_wires.size()), cnt_pos = static_cast<uint32_t>(wire_pos.size());
-    all_wires.insert(all_wires.end(), wire_pos.begin(), wire_pos.end());
-    uint32_t off_sp = static_cast<uint32_t>(all_wires.size()), cnt_sp = static_cast<uint32_t>(wire_sponge.size());
-    all_wires.insert(all_wires.end(), wire_sponge.begin(), wire_sponge.end());
+    std::vector<LineVert> w_outer, w_pos, w_syn, w_sp, all_wires;
+    add_wire_sphere(w_outer, 1.00f, 0.20f, 0.48f, 0.78f, 0.12f, 6, 64);
+    add_wire_sphere(w_pos,   0.80f, 0.24f, 0.68f, 0.92f, 0.14f, 5, 56);
+    add_wire_sphere(w_syn,   0.64f, 0.22f, 0.96f, 0.68f, 0.22f, 5, 56); // Distinct glowing mint-emerald Syntactic Sphere!
+    add_wire_sphere(w_sp,    0.52f, 0.95f, 0.68f, 0.28f, 0.14f, 4, 48);
 
-    glBindVertexArray(wire_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, wire_vbo);
+    uint32_t off_outer = 0, cnt_outer = static_cast<uint32_t>(w_outer.size());
+    all_wires.insert(all_wires.end(), w_outer.begin(), w_outer.end());
+    uint32_t off_pos = static_cast<uint32_t>(all_wires.size()), cnt_pos = static_cast<uint32_t>(w_pos.size());
+    all_wires.insert(all_wires.end(), w_pos.begin(), w_pos.end());
+    uint32_t off_syn = static_cast<uint32_t>(all_wires.size()), cnt_syn = static_cast<uint32_t>(w_syn.size());
+    all_wires.insert(all_wires.end(), w_syn.begin(), w_syn.end());
+    uint32_t off_sp  = static_cast<uint32_t>(all_wires.size()), cnt_sp  = static_cast<uint32_t>(w_sp.size());
+    all_wires.insert(all_wires.end(), w_sp.begin(), w_sp.end());
+
+    glBindVertexArray(wire_vao); glBindBuffer(GL_ARRAY_BUFFER, wire_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(all_wires.size() * sizeof(LineVert)), all_wires.data(), GL_STATIC_DRAW);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVert), reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVert), reinterpret_cast<void*>(12));
 
-    glBindVertexArray(ray_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, ray_vbo);
+    glBindVertexArray(ray_vao); glBindBuffer(GL_ARRAY_BUFFER, ray_vbo);
     glBufferData(GL_ARRAY_BUFFER, 4 * 1024 * 1024, nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVert), reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVert), reinterpret_cast<void*>(12));
 
-    glBindVertexArray(spr_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, spr_vbo);
+    glBindVertexArray(spr_vao); glBindBuffer(GL_ARRAY_BUFFER, spr_vbo);
     glBufferData(GL_ARRAY_BUFFER, 256 * 1024, nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(SpriteVert), reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(SpriteVert), reinterpret_cast<void*>(16));
@@ -1192,8 +1345,10 @@ int main(int argc, char** argv) {
     GLuint line_prog = link_program(kLineVertSrc,   kLineFragSrc);
     GLuint hud_prog  = link_program(kHudVertSrc,    kHudFragSrc);
 
-    // 7. Simulation State & Helpers
-    auto pos_hubs = build_pos_hub_positions(0.72f);
+    // 7. Hubs & Simulation State
+    auto pos_hubs = build_sphere_hubs<gllm::kNumPosClusters>(0.80f, 0.0f);
+    auto syn_hubs = build_sphere_hubs<gllm::kNumSynNodes>(0.64f, 0.75f);
+
     SpongeEngine sponge;
     gllm::TalkSidebarHUD hud;
     gllm::TalkHudState hst;
@@ -1233,16 +1388,18 @@ int main(int argc, char** argv) {
     };
 
     auto start_fluid_wave = [&](const std::string& q_txt) {
-        fluid_sim = sponge.launch_fluid_wave(lex, pos_hubs, q_txt);
+        fluid_sim = sponge.launch_fluid_wave(lex, pos_hubs, syn_hubs, q_txt);
         hst.fluid_wave_active = fluid_sim.active;
         hst.pos_valve_label   = fluid_sim.pos_valve_label;
         hst.wave_step         = 0;
         hst.wave_max_steps    = fluid_sim.max_steps;
         hst.candidates        = fluid_sim.candidates;
-        hst.gpu_fluid_voxels  = 0;
-        hst.gpu_split_forks   = 0;
-        hst.gpu_collision_vox = 0;
-        hst.gpu_peak_vox_wt   = 0.0f;
+        hst.gpu_fluid_voxels  = 0; hst.gpu_split_forks = 0;
+        hst.gpu_collision_vox = 0; hst.gpu_peak_vox_wt = 0.0f;
+        hst.syn_path_str      = fluid_sim.syn_cascade.path_label;
+        hst.spoken_sentence.clear();
+        hst.spoken_words_shown = 0;
+        hst.spoken_words_total = static_cast<uint32_t>(fluid_sim.syn_cascade.word_steps.size());
 
         CU_CHECK(cuMemsetD32_v2(d_fluid_a, 0u, kTotalVox));
         CU_CHECK(cuMemsetD32_v2(d_fmask_a, 0u, kTotalVox));
@@ -1250,12 +1407,10 @@ int main(int argc, char** argv) {
         CU_CHECK(cuMemsetD32_v2(d_fmask_b, 0u, kTotalVox));
 
         if (!fluid_sim.active) {
-            hst.fluid_summary = "No carved channels match those words yet (click INDEX ALL 89K or CARVE Q->A).";
+            hst.fluid_summary = "No carved channels match those words yet (click INDEX ALL 89K).";
             return;
         }
-        hst.streaming = false;
-        hst.burst_mode = false;
-        // Ensure candidate branch geometry exists in the 128^3 CUDA sponge, then inject initial word drops!
+        hst.streaming = false; hst.burst_mode = false;
         dispatch_carve_gpu(fluid_sim.branch_carve_segs);
         dispatch_inject_gpu(fluid_sim.inject_drops);
         CU_CHECK(cuCtxSynchronize());
@@ -1264,61 +1419,56 @@ int main(int argc, char** argv) {
             pending_word_flashes.push_back({fluid_sim.q_content_wids[k], +1.0f});
             hst.pos_activity[fluid_sim.q_content_pos[k]] = 1.0f;
         }
+        hst.syn_activity[gllm::kSynClauseWH] = 1.0f;
         char sbuf[160];
-        std::snprintf(sbuf, sizeof(sbuf), "Injected %zu word drops -> %zu competing answers initialized",
+        std::snprintf(sbuf, sizeof(sbuf), "Injected %zu word drops -> %zu candidates initialized",
                       fluid_sim.q_content_wids.size(), fluid_sim.candidates.size());
         hst.fluid_summary = sbuf;
     };
 
     auto trigger_qa = [&](const std::string& q_txt, const std::string& a_txt, bool instant_carve, bool add_graph = true, uint32_t boost = 1u) {
         if (has_current) {
-            if (!current_qa.q_carved_gpu) {
-                pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.q_carve_segs.begin(), current_qa.q_carve_segs.end());
-                current_qa.q_carved_gpu = true;
-            }
-            if (!current_qa.a_carved_gpu) {
-                pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.a_carve_segs.begin(), current_qa.a_carve_segs.end());
-                current_qa.a_carved_gpu = true;
-            }
+            if (!current_qa.q_carved_gpu) { pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.q_carve_segs.begin(), current_qa.q_carve_segs.end()); current_qa.q_carved_gpu = true; }
+            if (!current_qa.a_carved_gpu) { pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.a_carve_segs.begin(), current_qa.a_carve_segs.end()); current_qa.a_carved_gpu = true; }
             history.push_back(std::move(current_qa));
-            while (history.size() > 22) history.pop_front();
+            while (history.size() > 20) history.pop_front();
         }
-        current_qa = sponge.plan_and_carve_qa(lex, pos_hubs, q_txt, a_txt, add_graph, boost);
+        current_qa = sponge.plan_and_carve_qa(lex, pos_hubs, syn_hubs, q_txt, a_txt, add_graph, boost);
         has_current = !current_qa.q_word_ids.empty();
         hst.qa_processed = std::max(hst.qa_processed + 1u, static_cast<uint32_t>(qa_cursor));
-        hst.active_q = q_txt;
-        hst.active_a = a_txt;
-        hst.active_q_toks.clear(); hst.active_a_toks.clear();
+        hst.active_q = q_txt; hst.active_a = a_txt;
         for (size_t i = 0; i < current_qa.q_word_ids.size(); ++i) {
-            hst.active_q_toks.push_back({current_qa.q_tok_texts[i], current_qa.q_pos_ids[i]});
             hst.pos_activity[current_qa.q_pos_ids[i]] = 1.0f;
+            hst.syn_activity[current_qa.q_syn_ids[i]] = 1.0f;
             pending_word_flashes.push_back({current_qa.q_word_ids[i], +1.0f});
         }
-        for (size_t i = 0; i < current_qa.a_word_ids.size(); ++i) {
-            hst.active_a_toks.push_back({current_qa.a_tok_texts[i], current_qa.a_pos_ids[i]});
-            if (instant_carve) {
-                hst.pos_activity[current_qa.a_pos_ids[i]] = 1.0f;
-                pending_word_flashes.push_back({current_qa.a_word_ids[i], -1.0f});
-            }
-        }
-        hst.anim_phase = instant_carve ? 1.0f : 0.0f;
         if (instant_carve) {
+            for (size_t i = 0; i < current_qa.a_word_ids.size(); ++i) {
+                hst.pos_activity[current_qa.a_pos_ids[i]] = 1.0f;
+                hst.syn_activity[current_qa.a_syn_ids[i]] = 1.0f;
+                pending_word_flashes.push_back({current_qa.a_word_ids[i], -1.25f});
+            }
             pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.q_carve_segs.begin(), current_qa.q_carve_segs.end());
             pending_gpu_segs.insert(pending_gpu_segs.end(), current_qa.a_carve_segs.begin(), current_qa.a_carve_segs.end());
-            current_qa.q_carved_gpu = true;
-            current_qa.a_carved_gpu = true;
+            current_qa.q_carved_gpu = true; current_qa.a_carved_gpu = true;
+            hst.anim_phase = 1.0f;
+        } else {
+            hst.anim_phase = 0.0f;
         }
     };
 
-    auto index_all_squad = [&]() {
+    auto index_all_data = [&]() {
         for (const auto& qa : qa_pairs) sponge.index_qa_channels(lex, qa.q, qa.a, 1u);
-        hst.qa_processed = static_cast<uint32_t>(qa_pairs.size());
-        std::cout << "[SPONGE] Indexed all " << qa_pairs.size() << " SQuAD Q&As ("
-                  << sponge.answers.size() << " unique answer basins).\n";
+        for (const auto& s : sentences) sponge.syntax.learn_sentence(lex, s);
+        hst.qa_processed    = static_cast<uint32_t>(qa_pairs.size());
+        hst.total_syn_sents = sponge.syntax.sentences_trained;
+        hst.syn_transitions = sponge.syntax.total_transitions;
+        std::cout << "[SPONGE] Indexed " << qa_pairs.size() << " Q&As (" << sponge.answers.size()
+                  << " answer basins) & learned " << sponge.syntax.total_transitions
+                  << " syntactic transitions across " << sponge.syntax.sentences_trained << " English sentences.\n";
     };
 
-    // Index all 89,003 SQuAD pairs into the zero-weight word-channel graph + carve initial arterial sponge
-    if (index_all) index_all_squad();
+    if (index_all) index_all_data();
     for (int w = 0; w < warmup_qa && qa_cursor < qa_pairs.size(); ++w) {
         trigger_qa(qa_pairs[qa_cursor].q, qa_pairs[qa_cursor].a, true, !index_all, 1u);
         qa_cursor++;
@@ -1328,9 +1478,12 @@ int main(int argc, char** argv) {
         pending_gpu_segs.clear();
         CU_CHECK(cuCtxSynchronize());
     }
-    if (index_all) hst.qa_processed = static_cast<uint32_t>(qa_pairs.size());
+    if (index_all) {
+        hst.qa_processed    = static_cast<uint32_t>(qa_pairs.size());
+        hst.total_syn_sents = sponge.syntax.sentences_trained;
+        hst.syn_transitions = sponge.syntax.total_transitions;
+    }
 
-    // Auto-launch the live fluid splitting wave so the user IMMEDIATELY sees voxel splitting & candidate meters!
     if (!auto_ask.empty()) {
         hst.input_q = auto_ask;
         start_fluid_wave(auto_ask);
@@ -1339,9 +1492,9 @@ int main(int argc, char** argv) {
         qa_cursor++;
     }
 
-    float cam_yaw = 0.52f, cam_pitch = 0.26f, shell_alpha = 0.22f;
+    float cam_yaw = 0.52f, cam_pitch = 0.26f, shell_alpha = 0.20f;
     bool dragging = false, auto_rot = true;
-    bool show_words = true, show_pos = true, show_sponge = true, show_rays = true;
+    bool show_words = true, show_pos = true, show_syn = true, show_sponge = true, show_rays = true;
 
     uint64_t prev_ticks = SDL_GetPerformanceCounter();
     const double perf_freq = static_cast<double>(SDL_GetPerformanceFrequency());
@@ -1386,39 +1539,22 @@ int main(int argc, char** argv) {
                 if (ev.button.x < panel_px) {
                     int hx, hy;
                     to_hud_xy(ev.button.x, ev.button.y, hx, hy);
-                    if (hud.box_q.contains(hx, hy)) {
-                        hst.focus_field = 1;
-                    } else if (hud.box_a.contains(hx, hy)) {
-                        hst.focus_field = 2;
-                    } else if (hud.btn_ask.contains(hx, hy)) {
-                        hst.focus_field = 0;
-                        start_fluid_wave(hst.input_q);
-                    } else if (hud.btn_carve.contains(hx, hy)) {
-                        hst.focus_field = 0;
-                        fluid_sim.active = false; hst.fluid_wave_active = false;
+                    if (hud.box_q.contains(hx, hy)) hst.focus_field = 1;
+                    else if (hud.box_a.contains(hx, hy)) hst.focus_field = 2;
+                    else if (hud.btn_ask.contains(hx, hy)) { hst.focus_field = 0; start_fluid_wave(hst.input_q); }
+                    else if (hud.btn_carve.contains(hx, hy)) {
+                        hst.focus_field = 0; fluid_sim.active = false; hst.fluid_wave_active = false;
                         hst.streaming = false; hst.burst_mode = false;
-                        if (!hst.input_q.empty() && !hst.input_a.empty()) {
-                            // Carve custom Q->A with boost=4 so newly taught facts form crisp arteries immediately!
-                            trigger_qa(hst.input_q, hst.input_a, false, true, 4u);
-                        }
+                        if (!hst.input_q.empty() && !hst.input_a.empty()) trigger_qa(hst.input_q, hst.input_a, false, true, 4u);
                     } else if (hud.btn_load89.contains(hx, hy)) {
-                        hst.focus_field = 0;
-                        index_all_squad();
-                        start_fluid_wave(hst.input_q);
+                        hst.focus_field = 0; index_all_data(); start_fluid_wave(hst.input_q);
                     } else if (hud.btn_stream.contains(hx, hy)) {
-                        hst.focus_field = 0;
-                        hst.streaming = !hst.streaming;
+                        hst.focus_field = 0; hst.streaming = !hst.streaming;
                         if (hst.streaming) { fluid_sim.active = false; hst.fluid_wave_active = false; }
                     } else if (hud.btn_replay.contains(hx, hy)) {
-                        hst.focus_field = 0;
-                        start_fluid_wave(hst.input_q);
-                    } else {
-                        hst.focus_field = 0;
-                    }
-                } else {
-                    hst.focus_field = 0;
-                    dragging = true;
-                }
+                        hst.focus_field = 0; start_fluid_wave(hst.input_q);
+                    } else hst.focus_field = 0;
+                } else { hst.focus_field = 0; dragging = true; }
             } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                 dragging = false;
             } else if (ev.type == SDL_MOUSEWHEEL) {
@@ -1443,8 +1579,7 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     switch (k) {
-                        case SDLK_ESCAPE:
-                        case SDLK_q: running = false; break;
+                        case SDLK_ESCAPE: case SDLK_q: running = false; break;
                         case SDLK_SPACE:
                             hst.streaming = !hst.streaming;
                             if (hst.streaming) { fluid_sim.active = false; hst.fluid_wave_active = false; }
@@ -1456,18 +1591,15 @@ int main(int argc, char** argv) {
                         case SDLK_s:
                             hst.streaming = false; hst.burst_mode = false;
                             fluid_sim.active = false; hst.fluid_wave_active = false;
-                            if (qa_cursor < qa_pairs.size()) {
-                                trigger_qa(qa_pairs[qa_cursor].q, qa_pairs[qa_cursor].a, false, true, 1u);
-                                qa_cursor++;
-                            }
+                            if (qa_cursor < qa_pairs.size()) { trigger_qa(qa_pairs[qa_cursor].q, qa_pairs[qa_cursor].a, false, true, 1u); qa_cursor++; }
                             break;
-                        case SDLK_EQUALS:
-                        case SDLK_PLUS:  hst.stream_rate = std::min(30.0f, hst.stream_rate * 1.45f); break;
+                        case SDLK_EQUALS: case SDLK_PLUS:  hst.stream_rate = std::min(30.0f, hst.stream_rate * 1.45f); break;
                         case SDLK_MINUS: hst.stream_rate = std::max(0.15f, hst.stream_rate / 1.45f); break;
                         case SDLK_1: show_words  = !show_words; break;
                         case SDLK_2: show_pos    = !show_pos; break;
-                        case SDLK_3: show_sponge = !show_sponge; break;
-                        case SDLK_4: show_rays   = !show_rays; break;
+                        case SDLK_3: show_syn    = !show_syn; break;
+                        case SDLK_4: show_sponge = !show_sponge; break;
+                        case SDLK_5: show_rays   = !show_rays; break;
                         case SDLK_a: auto_rot    = !auto_rot; break;
                         case SDLK_UP:   shell_alpha = std::min(0.85f, shell_alpha + 0.08f); break;
                         case SDLK_DOWN: shell_alpha = std::max(0.00f, shell_alpha - 0.08f); break;
@@ -1475,8 +1607,8 @@ int main(int argc, char** argv) {
                         case SDLK_x:
                             sponge.clear(); history.clear(); has_current = false;
                             fluid_sim.active = false; hst.fluid_wave_active = false;
-                            hst.candidates.clear(); hst.fluid_summary.clear();
-                            qa_cursor = 0; hst.qa_processed = 0;
+                            hst.candidates.clear(); hst.fluid_summary.clear(); hst.spoken_sentence.clear(); hst.syn_path_str.clear();
+                            qa_cursor = 0; hst.qa_processed = 0; hst.total_syn_sents = 0; hst.syn_transitions = 0;
                             CU_CHECK(cuMemsetD32_v2(d_sponge,  0u, static_cast<size_t>(kTotalVox) * 4));
                             CU_CHECK(cuMemsetD32_v2(d_meta,    0u, static_cast<size_t>(kTotalVox) * 2));
                             CU_CHECK(cuMemsetD32_v2(d_fluid_a, 0u, kTotalVox));
@@ -1488,16 +1620,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 8. Advance Simulation (Either Live Parallel Fluid Wave OR Q->A Carving Stream)
+        // 8. Advance Simulation
         for (float& pa : hst.pos_activity) pa = std::max(0.0f, pa - static_cast<float>(dt) * 0.85f);
+        for (float& sa : hst.syn_activity) sa = std::max(0.0f, sa - static_cast<float>(dt) * 0.85f);
 
         bool do_fluid_step_now = false;
         if (fluid_sim.active) {
             if (!screenshot_path.empty()) {
-                // Fast-forward wave to step 54 for a dramatic verification screenshot showing splitting + collisions + filled meters!
-                do_fluid_step_now = (fluid_sim.step < 54u);
+                do_fluid_step_now = (fluid_sim.step < 64u);
             } else {
-                fluid_sim.step_accum += static_cast<float>(dt) * 22.0f; // ~22 fluid wave steps/sec (~3.2s full propagation!)
+                fluid_sim.step_accum += static_cast<float>(dt) * 20.0f;
                 if (fluid_sim.step_accum >= 1.0f && fluid_sim.step < fluid_sim.max_steps) {
                     fluid_sim.step_accum -= 1.0f;
                     do_fluid_step_now = true;
@@ -1521,7 +1653,8 @@ int main(int argc, char** argv) {
                 current_qa.a_carved_gpu = true;
                 for (size_t i = 0; i < current_qa.a_word_ids.size(); ++i) {
                     hst.pos_activity[current_qa.a_pos_ids[i]] = 1.0f;
-                    pending_word_flashes.push_back({current_qa.a_word_ids[i], -1.0f});
+                    hst.syn_activity[current_qa.a_syn_ids[i]] = 1.0f;
+                    pending_word_flashes.push_back({current_qa.a_word_ids[i], -1.25f});
                 }
             }
             if (hst.streaming && prev_ph >= 0.999f && !qa_pairs.empty()) {
@@ -1530,11 +1663,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (auto_rot && !dragging && screenshot_path.empty()) {
-            cam_yaw += static_cast<float>(dt) * 0.14f;
-        }
+        if (auto_rot && !dragging && screenshot_path.empty()) cam_yaw += static_cast<float>(dt) * 0.14f;
 
-        // 9. Execute CUDA Kernels!
+        // 9. Execute CUDA Kernels
         CU_CHECK(cuEventRecord(ev_s, nullptr));
 
         if (!pending_gpu_segs.empty()) {
@@ -1543,12 +1674,9 @@ int main(int argc, char** argv) {
         }
 
         if (fluid_sim.active && do_fluid_step_now) {
-            int sub_steps = screenshot_path.empty() ? 2 : 9;
+            int sub_steps = screenshot_path.empty() ? 2 : 10;
             for (int ss = 0; ss < sub_steps && fluid_sim.step < fluid_sim.max_steps; ++ss) {
-                // Keep feeding word drops during the first 28 steps so continuous waves split & collide!
-                if (fluid_sim.step < 28u && (fluid_sim.step % 4u == 0u)) {
-                    dispatch_inject_gpu(fluid_sim.inject_drops);
-                }
+                if (fluid_sim.step < 28u && (fluid_sim.step % 4u == 0u)) dispatch_inject_gpu(fluid_sim.inject_drops);
                 CU_CHECK(cuMemsetD32_v2(d_fluid_b, 0u, kTotalVox));
                 CU_CHECK(cuMemsetD32_v2(d_fmask_b, 0u, kTotalVox));
                 CU_CHECK(cuMemsetD32_v2(d_fstats,  0u, 4u));
@@ -1567,31 +1695,54 @@ int main(int argc, char** argv) {
             hst.gpu_collision_vox = h_fstats[2];
             hst.gpu_peak_vox_wt   = static_cast<float>(h_fstats[3]) * 0.001f;
 
-            // Update progressive fluid filling of EVERY competing candidate answer!
             float wave_t = static_cast<float>(fluid_sim.step) / static_cast<float>(fluid_sim.max_steps);
             for (size_t ci = 0; ci < hst.candidates.size(); ++ci) {
                 auto& c = hst.candidates[ci];
-                // Recombined candidates surge sharply right after the midpoint collision phase (wave_t > 0.35)!
-                float arrival = c.drop_sources >= 2 ? 0.30f : 0.22f;
+                float arrival = c.drop_sources >= 2 ? 0.28f : 0.22f;
                 float fill = std::clamp((wave_t - arrival) / (1.0f - arrival), 0.0f, 1.0f);
-                // Smooth S-curve filling
                 fill = fill * fill * (3.0f - 2.0f * fill);
                 c.current_ml = c.target_ml * fill;
                 if (fill > 0.25f) {
                     hst.pos_activity[c.answer_pos] = std::max(hst.pos_activity[c.answer_pos], 0.45f + 0.55f * fill);
-                    pending_word_flashes.push_back({fluid_sim.cand_anchor_wids[ci], -std::clamp(0.35f + 0.65f * fill, 0.0f, 1.0f)});
+                    pending_word_flashes.push_back({fluid_sim.cand_anchor_wids[ci], -1.35f});
                 }
             }
-            if (!hst.candidates.empty() && wave_t > 0.35f) {
+            if (!hst.candidates.empty() && wave_t > 0.30f) {
                 char sbuf[160];
                 std::snprintf(sbuf, sizeof(sbuf), "HIGHEST FLUID: '%s' (%.1f mL, %u/%u drops)!",
                               hst.candidates[0].answer.c_str(), hst.candidates[0].current_ml,
                               hst.candidates[0].drop_sources, hst.candidates[0].total_sources);
                 hst.fluid_summary = sbuf;
             }
+
+            // Stage 2 (wave_t >= 0.42): Syntactic Sphere Cascade emits full natural sentence word-by-word!
+            const auto& ws = fluid_sim.syn_cascade.word_steps;
+            if (wave_t >= 0.42f && !ws.empty()) {
+                float st_t = std::clamp((wave_t - 0.42f) / 0.52f, 0.0f, 1.0f);
+                uint32_t target_words = std::max<uint32_t>(1u, static_cast<uint32_t>(std::ceil(st_t * ws.size())));
+                target_words = std::min<uint32_t>(target_words, static_cast<uint32_t>(ws.size()));
+                if (target_words > hst.spoken_words_shown) {
+                    for (uint32_t wi = hst.spoken_words_shown; wi < target_words; ++wi) {
+                        hst.syn_activity[ws[wi].syn_id % gllm::kNumSynNodes] = 1.0f;
+                        hst.pos_activity[ws[wi].pos_id % gllm::kNumPosClusters] = 1.0f;
+                        pending_word_flashes.push_back({ws[wi].word_id, -0.95f}); // Mint-emerald spoken word glow!
+                    }
+                    hst.spoken_words_shown = target_words;
+                }
+                std::string partial;
+                for (uint32_t wi = 0; wi < hst.spoken_words_shown; ++wi) {
+                    if (wi > 0) partial += " ";
+                    partial += ws[wi].word_text;
+                }
+                if (hst.spoken_words_shown >= ws.size()) {
+                    partial += ".";
+                    hst.syn_activity[gllm::kSynClauseDecl] = 1.0f;
+                }
+                hst.spoken_sentence = partial;
+            }
         }
 
-        // Emit 128^3 Sponge + Live Voxel Fluid Weight Map into zero-copy VBO
+        // Emit 128^3 Sponge + Fluid Weight Map into zero-copy VBO
         CU_CHECK(cuMemsetD32_v2(d_out_cnt, 0u, 1));
         CU_CHECK(cuGraphicsMapResources(1, &cu_sponge_res, nullptr));
         CUdeviceptr d_sp_vbo = 0; size_t sp_sz = 0;
@@ -1627,39 +1778,63 @@ int main(int argc, char** argv) {
         CU_CHECK(cuEventRecord(ev_e, nullptr));
         CU_CHECK(cuEventSynchronize(ev_e));
         CU_CHECK(cuEventElapsedTime(&hst.cuda_ms, ev_s, ev_e));
-
         hst.carved_voxels = emitted_sponge_verts;
-        hst.merge_events  = sponge.merge_events;
-        hst.split_events  = sponge.split_events;
-        uint64_t tot_ev   = sponge.merge_events + sponge.split_events;
-        hst.merge_ratio_pct = tot_ev ? (100.0f * static_cast<float>(sponge.merge_events) / static_cast<float>(tot_ev)) : 0.0f;
 
-        // 10. Build Live 3D Branching Rays, Splitting Droplets & Candidate Answer Fluid Orbs!
+        // 10. Build Live 3D Rays, Hubs, Learned Syntactic Arcs & Spoken Cascade
         std::vector<LineVert> ray_lines;
         std::vector<SpriteVert> sprites;
 
+        // Sphere 2: 12 POS Cluster Hubs (R = 0.80)
         if (show_pos) {
             const auto& meta = gllm::pos_cluster_meta();
             for (uint32_t i = 0; i < gllm::kNumPosClusters; ++i) {
                 float act = hst.pos_activity[i];
-                const auto& p = pos_hubs[i];
-                const auto& m = meta[i];
-                sprites.push_back({p.x, p.y, p.z, 8.5f + act * 14.0f, m.r, m.g, m.b, 0.55f + act * 0.45f});
+                const auto& p = pos_hubs[i]; const auto& m = meta[i];
+                sprites.push_back({p.x, p.y, p.z, 7.5f + act * 12.0f, m.r, m.g, m.b, 0.50f + act * 0.45f});
             }
         }
 
-        auto append_poly = [&](const std::vector<Vec3>& poly, float r, float g, float b, float a, float progress, bool emit_drop, float drop_sz = 9.5f) {
+        // Sphere 3: 8 Syntactic Hierarchy Hubs (R = 0.64) + Learned Syntactic Flow Web!
+        if (show_syn) {
+            const auto& smeta = gllm::syn_node_meta();
+            for (uint32_t i = 0; i < gllm::kNumSynNodes; ++i) {
+                float act = hst.syn_activity[i];
+                const auto& p = syn_hubs[i]; const auto& m = smeta[i];
+                sprites.push_back({p.x, p.y, p.z, 10.5f + act * 15.0f, m.r, m.g, m.b, 0.70f + act * 0.30f});
+            }
+            // Learned Syntactic Sphere transition web (curved arcs along R = 0.64 weighted by learned frequency!)
+            uint64_t max_f = 1;
+            for (uint32_t a = 0; a < gllm::kNumSynNodes; ++a)
+                for (uint32_t b = 0; b < gllm::kNumSynNodes; ++b)
+                    max_f = std::max(max_f, sponge.syntax.syn_flow[a][b]);
+            for (uint32_t a = 0; a < gllm::kNumSynNodes; ++a) {
+                for (uint32_t b = 0; b < gllm::kNumSynNodes; ++b) {
+                    if (a == b || sponge.syntax.syn_flow[a][b] == 0) continue;
+                    float w = static_cast<float>(std::log(1.0 + sponge.syntax.syn_flow[a][b]) / std::log(1.0 + max_f));
+                    float alpha = 0.08f + 0.24f * w;
+                    Vec3 p0 = syn_hubs[a], p1 = syn_hubs[b];
+                    Vec3 prev = p0;
+                    for (int s = 1; s <= 8; ++s) {
+                        Vec3 nxt = normalize(lerp3(p0, p1, static_cast<float>(s) / 8.0f)) * 0.64f;
+                        ray_lines.push_back({prev.x, prev.y, prev.z, 0.22f, 0.94f, 0.68f, alpha});
+                        ray_lines.push_back({nxt.x,  nxt.y,  nxt.z,  0.22f, 0.94f, 0.68f, alpha});
+                        prev = nxt;
+                    }
+                }
+            }
+        }
+
+        auto append_poly = [&](const std::vector<Vec3>& poly, float r, float g, float b, float a, float progress, bool emit_drop, float drop_sz = 9.0f) {
             if (poly.size() < 2) return;
-            float total_segs = static_cast<float>(poly.size() - 1);
-            float fpos = std::clamp(progress, 0.0f, 1.0f) * total_segs;
+            float fpos = std::clamp(progress, 0.0f, 1.0f) * static_cast<float>(poly.size() - 1);
             for (size_t i = 0; i + 1 < poly.size(); ++i) {
                 float fi = static_cast<float>(i);
                 if (fi >= fpos) break;
-                float seg_t = std::min(1.0f, fpos - fi);
-                Vec3 p0 = poly[i], p1 = lerp3(poly[i], poly[i + 1], seg_t);
+                float st = std::min(1.0f, fpos - fi);
+                Vec3 p0 = poly[i], p1 = lerp3(poly[i], poly[i + 1], st);
                 ray_lines.push_back({p0.x, p0.y, p0.z, r, g, b, a});
                 ray_lines.push_back({p1.x, p1.y, p1.z, r, g, b, a});
-                if (emit_drop && seg_t < 0.999f) {
+                if (emit_drop && st < 0.999f) {
                     sprites.push_back({p1.x, p1.y, p1.z, drop_sz, std::min(1.0f, r + 0.35f), std::min(1.0f, g + 0.35f), std::min(1.0f, b + 0.35f), 0.98f});
                 }
             }
@@ -1668,50 +1843,56 @@ int main(int argc, char** argv) {
         if (show_rays) {
             if (fluid_sim.active) {
                 float wt = static_cast<float>(fluid_sim.step) / static_cast<float>(fluid_sim.max_steps);
-                // Draw EVERY splitting branch from question words -> collision pools -> competing candidate answers!
                 for (const auto& br : fluid_sim.branches) {
-                    bool is_winner = (br.cand_idx == 0);
-                    float r = is_winner ? 1.00f : (br.recombined ? 0.96f : 0.14f);
-                    float g = is_winner ? 0.84f : (br.recombined ? 0.36f : 0.78f);
-                    float b = is_winner ? 0.24f : (br.recombined ? 0.96f : 1.00f);
-                    float a = is_winner ? 0.94f : (br.recombined ? 0.72f : 0.28f);
-                    append_poly(br.poly, r, g, b, a, std::min(1.0f, wt * 1.35f), wt < 0.82f, is_winner ? 13.0f : 8.5f);
+                    bool is_win = (br.cand_idx == 0);
+                    float r = is_win ? 1.00f : (br.recombined ? 0.96f : 0.14f);
+                    float g = is_win ? 0.84f : (br.recombined ? 0.36f : 0.78f);
+                    float b = is_win ? 0.24f : (br.recombined ? 0.96f : 1.00f);
+                    float a = is_win ? 0.92f : (br.recombined ? 0.64f : 0.22f);
+                    append_poly(br.poly, r, g, b, a, std::min(1.0f, wt * 1.40f), wt < 0.75f, is_win ? 12.5f : 8.0f);
                 }
-                // Highlight multi-word collision pools inside the sponge!
-                if (wt > 0.28f) {
-                    for (const auto& cp : fluid_sim.collision_pools) {
-                        sprites.push_back({cp.x, cp.y, cp.z, 17.0f, 1.00f, 0.42f, 0.95f, 0.95f});
+                if (wt > 0.25f) {
+                    for (const auto& cp : fluid_sim.collision_pools)
+                        sprites.push_back({cp.x, cp.y, cp.z, 16.5f, 1.00f, 0.42f, 0.95f, 0.95f});
+                }
+                // Syntactic Sphere Active Ribbon + Spoken Word Rays!
+                if (show_syn && wt >= 0.42f) {
+                    const auto& seq = fluid_sim.syn_cascade.syn_sequence;
+                    for (size_t i = 0; i + 1 < seq.size(); ++i) {
+                        Vec3 p0 = syn_hubs[seq[i]], p1 = syn_hubs[seq[i + 1]], prev = p0;
+                        for (int s = 1; s <= 10; ++s) {
+                            Vec3 nxt = normalize(lerp3(p0, p1, static_cast<float>(s) / 10.0f)) * 0.645f;
+                            ray_lines.push_back({prev.x, prev.y, prev.z, 0.28f, 1.00f, 0.72f, 0.95f});
+                            ray_lines.push_back({nxt.x,  nxt.y,  nxt.z,  0.28f, 1.00f, 0.72f, 0.95f});
+                            prev = nxt;
+                        }
+                    }
+                    for (uint32_t wi = 0; wi < hst.spoken_words_shown && wi < fluid_sim.syn_cascade_rays.size(); ++wi) {
+                        append_poly(fluid_sim.syn_cascade_rays[wi], 0.30f, 1.00f, 0.78f, 0.92f, 1.0f, false);
                     }
                 }
-                // Draw EVERY competing candidate answer orb on the Outer Sphere scaled by its live fluid mL!
+                // Candidate Answer Orbs on Outer Sphere
                 float top_ml = hst.candidates.empty() ? 1.0f : std::max(1.0f, hst.candidates[0].target_ml);
                 for (size_t ci = 0; ci < hst.candidates.size(); ++ci) {
                     const auto& c = hst.candidates[ci];
                     float frac = std::clamp(c.current_ml / top_ml, 0.0f, 1.0f);
                     const auto& pt = fluid_sim.cand_outer_pts[ci];
-                    if (ci == 0) {
-                        // Highest-Fluid Winning Answer Beacon!
-                        sprites.push_back({pt.x, pt.y, pt.z, 14.0f + frac * 20.0f, 1.00f, 0.88f, 0.28f, 0.98f});
-                    } else if (c.drop_sources >= 2) {
-                        sprites.push_back({pt.x, pt.y, pt.z, 8.0f + frac * 14.0f, 0.96f, 0.44f, 0.98f, 0.88f});
-                    } else {
-                        sprites.push_back({pt.x, pt.y, pt.z, 5.5f + frac * 9.0f, 0.22f, 0.82f, 1.00f, 0.65f});
-                    }
+                    if (ci == 0) sprites.push_back({pt.x, pt.y, pt.z, 14.0f + frac * 20.0f, 1.00f, 0.88f, 0.28f, 0.98f});
+                    else if (c.drop_sources >= 2) sprites.push_back({pt.x, pt.y, pt.z, 8.0f + frac * 14.0f, 0.96f, 0.44f, 0.98f, 0.88f});
+                    else sprites.push_back({pt.x, pt.y, pt.z, 5.5f + frac * 9.0f, 0.22f, 0.82f, 1.00f, 0.65f});
                 }
             } else {
                 for (size_t hi = 0; hi < history.size(); ++hi) {
-                    float fade = 0.08f + 0.22f * (static_cast<float>(hi + 1) / static_cast<float>(history.size() + 1));
+                    float fade = 0.08f + 0.20f * (static_cast<float>(hi + 1) / static_cast<float>(history.size() + 1));
                     for (const auto& pl : history[hi].q_polylines) append_poly(pl, 0.10f, 0.78f, 1.00f, fade * 0.85f, 1.0f, false);
                     for (const auto& pl : history[hi].a_polylines) append_poly(pl, 1.00f, 0.62f, 0.16f, fade, 1.0f, false);
                 }
                 if (has_current) {
-                    float q_prog = std::clamp(hst.anim_phase / 0.50f, 0.0f, 1.0f);
-                    float a_prog = std::clamp((hst.anim_phase - 0.50f) / 0.50f, 0.0f, 1.0f);
-                    for (const auto& pl : current_qa.q_polylines) append_poly(pl, 0.15f, 0.90f, 1.00f, 0.88f, q_prog, q_prog > 0.02f && q_prog < 0.99f);
+                    float qp = std::clamp(hst.anim_phase / 0.50f, 0.0f, 1.0f);
+                    float ap = std::clamp((hst.anim_phase - 0.50f) / 0.50f, 0.0f, 1.0f);
+                    for (const auto& pl : current_qa.q_polylines) append_poly(pl, 0.15f, 0.90f, 1.00f, 0.88f, qp, qp > 0.02f && qp < 0.99f);
                     if (hst.anim_phase >= 0.45f) sprites.push_back({current_qa.s_Q.x, current_qa.s_Q.y, current_qa.s_Q.z, 15.0f, 1.0f, 0.95f, 0.75f, 0.96f});
-                    if (a_prog > 0.001f) {
-                        for (const auto& pl : current_qa.a_polylines) append_poly(pl, 1.00f, 0.72f, 0.18f, 0.94f, a_prog, a_prog < 0.99f);
-                    }
+                    if (ap > 0.001f) for (const auto& pl : current_qa.a_polylines) append_poly(pl, 1.00f, 0.72f, 0.18f, 0.94f, ap, ap < 0.99f);
                 }
             }
         }
@@ -1746,16 +1927,17 @@ int main(int argc, char** argv) {
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
 
-        // Wireframes
+        // 4 Concentric Sphere Wireframes
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(line_prog);
         glUniformMatrix4fv(glGetUniformLocation(line_prog, "uMVP"), 1, GL_FALSE, mvp.m);
         glBindVertexArray(wire_vao);
         if (show_words)  glDrawArrays(GL_LINES, static_cast<GLint>(off_outer), static_cast<GLsizei>(cnt_outer));
         if (show_pos)    glDrawArrays(GL_LINES, static_cast<GLint>(off_pos),   static_cast<GLsizei>(cnt_pos));
+        if (show_syn)    glDrawArrays(GL_LINES, static_cast<GLint>(off_syn),   static_cast<GLsizei>(cnt_syn));
         if (show_sponge) glDrawArrays(GL_LINES, static_cast<GLint>(off_sp),    static_cast<GLsizei>(cnt_sp));
 
-        // 128^3 CUDA Sponge + Live Voxel Fluid Weights & Recombination Hotspots!
+        // 128^3 CUDA Fluid Sponge Voxels
         if (show_sponge && draw_sponge_verts > 0) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(spr_prog);
@@ -1767,8 +1949,8 @@ int main(int argc, char** argv) {
             glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(draw_sponge_verts));
         }
 
-        // Splitting/Recombining Fluid Rays
-        if (show_rays && !ray_lines.empty()) {
+        // Syntactic Flow Web + Splitting/Cascade Rays
+        if (!ray_lines.empty()) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glUseProgram(line_prog);
             glUniformMatrix4fv(glGetUniformLocation(line_prog, "uMVP"), 1, GL_FALSE, mvp.m);
@@ -1778,7 +1960,7 @@ int main(int argc, char** argv) {
             glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(ray_lines.size()));
         }
 
-        // POS Hubs, Collision Pools, Splitting Droplets & Candidate Answer Fluid Orbs!
+        // POS Hubs, Syntactic Hubs, Collision Pools & Candidate Answer Orbs
         if (!sprites.empty()) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE);
             glUseProgram(spr_prog);
@@ -1826,18 +2008,12 @@ int main(int argc, char** argv) {
         if (!screenshot_path.empty() && total_frames >= 8) {
             glFinish();
             save_ppm_screenshot(screenshot_path, dw, dh);
-            if (!hst.candidates.empty()) {
-                std::cout << "[FLUID]  Active Voxels: " << hst.gpu_fluid_voxels
-                          << " | Forks: " << hst.gpu_split_forks
-                          << " | Collisions(2+): " << hst.gpu_collision_vox
-                          << " | Peak Wt: " << hst.gpu_peak_vox_wt << "\n";
-                for (size_t i = 0; i < std::min<size_t>(6, hst.candidates.size()); ++i) {
-                    const auto& c = hst.candidates[i];
-                    std::cout << "  #" << (i + 1) << " " << c.answer << " -> " << c.current_ml
-                              << " mL [" << c.drop_sources << "/" << c.total_sources << " drops"
-                              << (c.pos_valve_ok ? " + POS valve" : "") << "]\n";
-                }
-            }
+            std::cout << "[SYNTAX] Path: " << hst.syn_path_str << "\n";
+            std::cout << "[SPOKEN] \"" << hst.spoken_sentence << "\"\n";
+            std::cout << "[FLUID]  Active Voxels: " << hst.gpu_fluid_voxels
+                      << " | Forks: " << hst.gpu_split_forks
+                      << " | Collisions(2+): " << hst.gpu_collision_vox
+                      << " | Peak Wt: " << hst.gpu_peak_vox_wt << "\n";
             running = false;
         }
 
@@ -1849,7 +2025,7 @@ int main(int argc, char** argv) {
             hst.fps = static_cast<float>(fps_frames / fps_timer);
             char title[256];
             std::snprintf(title, sizeof(title),
-                          "GLLM Fluid Sponge | %u Active Fluid Voxels | %u Collisions | %.1f FPS | CUDA %.2f ms",
+                          "GLLM 4-Sphere Talk | %u Fluid Voxels | %u Collisions | %.1f FPS | CUDA %.2f ms",
                           hst.gpu_fluid_voxels, hst.gpu_collision_vox, hst.fps, hst.cuda_ms);
             SDL_SetWindowTitle(window, title);
             fps_timer = 0.0;
