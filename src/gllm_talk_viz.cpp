@@ -464,16 +464,6 @@ static std::vector<QAPair> load_qa_tsv(const std::string& path) {
     return out;
 }
 
-static std::vector<std::string> load_sentences_tsv(const std::string& path) {
-    std::vector<std::string> out;
-    std::ifstream ifs(path);
-    std::string line;
-    while (std::getline(ifs, line)) {
-        if (!line.empty()) out.push_back(std::move(line));
-    }
-    return out;
-}
-
 // -----------------------------------------------------------------------------
 // Sphere 3: Learned Emergent Syntactic Sphere (R = 0.64)
 //   Learns POS -> Syntax Hub mapping AND Syntax -> Syntax transition porosity
@@ -495,31 +485,10 @@ struct SyntacticCascade {
 
 class SyntacticSphere {
 public:
-    static constexpr uint32_t kBOSWord = 0xFFFFFFFEu;
-    static constexpr uint32_t kEOSWord = 0xFFFFFFFFu;
-    static constexpr uint8_t  kPOSBos  = 12u;
-    static constexpr uint8_t  kPOSEos  = 13u;
-
     uint64_t pos_to_syn[gllm::kNumPosClusters][gllm::kNumSynNodes] = {};
     uint64_t syn_flow[gllm::kNumSynNodes][gllm::kNumSynNodes] = {};
-    uint64_t pos_bi[14][14] = {};
-    uint64_t pos_bi_tot[14] = {};
-    uint64_t pos_tri[14][14][14] = {};
-    uint64_t pos_tri_tot[14][14] = {};
-
-    // Pure learned carved word-to-word & bigram fluid channels from real English sentences!
-    std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> uni_next;
-    std::unordered_map<uint32_t, uint64_t> uni_tot;
-    std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint32_t>> bi_next;
-    std::unordered_map<uint64_t, uint64_t> bi_tot;
-    std::vector<uint32_t> top_glue_wids; // Top highest-outflow learned bridge words (computed purely from corpus frequency!)
-
     uint64_t total_transitions = 0;
-    uint32_t sentences_trained = 0;
-
-    static inline uint64_t bi_key(uint32_t a, uint32_t b) {
-        return (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
-    }
+    uint32_t qa_trained = 0;
 
     // Pure POS + position-driven syntactic hub mapping (ZERO hardcoded English word lists!)
     std::vector<uint8_t> tag_syntax_sequence(const std::vector<Lexicon::Tok>& toks) const {
@@ -553,273 +522,39 @@ public:
         return seq;
     }
 
-    void learn_sentence(const Lexicon& lex, const std::string& sent) {
-        auto toks = lex.tokenize(sent);
-        if (toks.size() < 4) return;
+    void learn_utterance(const Lexicon& lex, const std::string& text) {
+        auto toks = lex.tokenize(text);
+        if (toks.empty()) return;
         auto seq = tag_syntax_sequence(toks);
-
         uint8_t prev_s = 255u;
-        uint32_t pw = kBOSWord, p2w = kBOSWord;
-        uint8_t  pp = kPOSBos,  p2p = kPOSBos;
-
         for (size_t i = 0; i < toks.size(); ++i) {
-            uint32_t w = toks[i].word_id;
-            uint8_t  p = toks[i].pos < 12u ? toks[i].pos : 11u;
-            uint8_t  s = seq[i];
-
+            uint8_t p = toks[i].pos < 12u ? toks[i].pos : 11u;
+            uint8_t s = seq[i];
             pos_to_syn[p][s]++;
             if (prev_s < gllm::kNumSynNodes && prev_s != s) {
                 syn_flow[prev_s][s]++;
                 total_transitions++;
             }
             prev_s = s;
-
-            uni_next[pw][w]++; uni_tot[pw]++;
-            pos_bi[pp][p]++;   pos_bi_tot[pp]++;
-            if (i >= 1) {
-                uint64_t bk = bi_key(p2w, pw);
-                bi_next[bk][w]++; bi_tot[bk]++;
-                pos_tri[p2p][pp][p]++; pos_tri_tot[p2p][pp]++;
-            }
-            p2w = pw; pw = w;
-            p2p = pp; pp = p;
-        }
-        // Sentence-end pore <EOS>
-        uni_next[pw][kEOSWord]++; uni_tot[pw]++;
-        pos_bi[pp][kPOSEos]++;    pos_bi_tot[pp]++;
-        if (toks.size() >= 2) {
-            pos_tri[p2p][pp][kPOSEos]++; pos_tri_tot[p2p][pp]++;
         }
         if (prev_s < gllm::kNumSynNodes) {
             syn_flow[prev_s][gllm::kSynClauseDecl]++;
             total_transitions++;
         }
-        sentences_trained++;
-    }
-
-    // Identify highest-outflow learned bridge words purely from sentence corpus frequency
-    void finalize_glue_bridges() {
-        std::vector<std::pair<uint64_t, uint32_t>> freqs;
-        freqs.reserve(uni_tot.size());
-        for (const auto& kv : uni_tot) {
-            if (kv.first != kBOSWord && kv.first != kEOSWord) freqs.push_back({kv.second, kv.first});
-        }
-        size_t k = std::min<size_t>(18, freqs.size());
-        std::partial_sort(freqs.begin(), freqs.begin() + k, freqs.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-        top_glue_wids.clear();
-        for (size_t i = 0; i < k; ++i) top_glue_wids.push_back(freqs[i].second);
-    }
-
-    static std::string capitalize_first(std::string s) {
-        if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
-        return s;
     }
 
     // =========================================================================
-    // 100% ZERO-RULE LEARNED 4-SPHERE FLUID SENTENCE WALK!
-    //   Walks purely through carved word channels (bi_next + uni_next) and
-    //   learned Syntactic Sphere POS-trigram channels (pos_tri + pos_bi),
-    //   draining active question & winning-answer fluid basins until <EOS>!
+    // 100% RAW, ZERO-LEVER, ZERO-PENALTY SPONGE OUTPUT CASCADE!
+    //   Emits the exact winning answer basin carved in the sponge directly
+    //   through Sphere 3's syntactic hubs -> Sphere 2 POS -> Sphere 1 words.
+    //   NO penalties, NO rewriting, NO beam bandages, NO interference!
     // =========================================================================
-    SyntacticCascade synthesize_natural_response(const Lexicon& lex,
-                                                 const std::string& q_text,
-                                                 const std::string& win_answer,
-                                                 const std::unordered_map<uint32_t, float>& word_conc) const {
+    SyntacticCascade emit_raw_sponge_answer(const Lexicon& lex, const std::string& raw_answer) const {
         SyntacticCascade cas;
-        auto q_toks = lex.tokenize(q_text);
-        auto a_toks = lex.tokenize(win_answer);
-        if (q_toks.empty() || a_toks.empty()) return cas;
-
-        // Display casing map (preserves original capitalization from Q & A)
-        std::unordered_map<uint32_t, std::string> display_word;
-        std::unordered_map<uint32_t, uint8_t>     w_pos;
-        std::unordered_set<uint32_t> q_set, topic_set, ans_set;
-        std::unordered_set<uint64_t> q_bigrams;
-
-        for (size_t i = 0; i < q_toks.size(); ++i) {
-            uint32_t wid = q_toks[i].word_id;
-            display_word[wid] = q_toks[i].raw;
-            w_pos[wid] = q_toks[i].pos;
-            q_set.insert(wid);
-            auto itc = word_conc.find(wid);
-            if (itc != word_conc.end() && itc->second >= 0.12f) topic_set.insert(wid);
-            if (i > 0) q_bigrams.insert(bi_key(q_toks[i - 1].word_id, wid));
-        }
-        bool q_has_verb = false;
-        for (const auto& t : q_toks) if (t.pos == 1u) q_has_verb = true;
-
-        for (size_t i = 0; i < a_toks.size(); ++i) {
-            uint32_t wid = a_toks[i].word_id;
-            display_word[wid] = a_toks[i].raw;
-            w_pos[wid] = a_toks[i].pos;
-            ans_set.insert(wid);
-            if (i > 0) q_bigrams.insert(bi_key(a_toks[i - 1].word_id, wid));
-        }
-
-        // Active candidate word pool = Question words + Winning Answer words + top learned corpus bridges
-        std::vector<uint32_t> pool;
-        std::unordered_set<uint32_t> in_pool;
-        auto add_pool = [&](uint32_t wid, uint8_t pid, const std::string& disp) {
-            if (in_pool.insert(wid).second) {
-                pool.push_back(wid);
-                if (!w_pos.count(wid)) w_pos[wid] = pid;
-                if (!display_word.count(wid)) display_word[wid] = disp;
-            }
-        };
-        for (const auto& t : q_toks) add_pool(t.word_id, t.pos, t.raw);
-        for (const auto& t : a_toks) add_pool(t.word_id, t.pos, t.raw);
-        for (uint32_t gw : top_glue_wids) {
-            uint8_t gp = gw < lex.num_words ? lex.primary_pos[gw] : 11u;
-            // Don't flood with extra verbs if the question already carries its own verb
-            if (q_has_verb && gp == 1u && !q_set.count(gw)) continue;
-            add_pool(gw, gp, gw < lex.num_words ? lex.id_to_word[gw] : "");
-        }
-
-        struct Beam {
-            float score = 0.0f;
-            std::vector<uint32_t> ws;
-            std::vector<uint8_t>  ps;
-            std::unordered_set<uint32_t> used;
-            bool seen_verb = false;
-            uint32_t hit_ans    = 0;
-            uint32_t hit_topics = 0;
-        };
-
-        std::vector<Beam> beams;
-        beams.push_back({0.0f, {kBOSWord}, {kPOSBos}, {}, false, 0u, 0u});
-        bool has_done = false;
-        float best_done_sc = -1e9f;
-        std::vector<uint32_t> best_ws;
-        std::vector<uint8_t>  best_ps;
-
-        uint32_t opener_wid = q_toks[0].word_id;
-        size_t max_len = std::min<size_t>(14, q_toks.size() + a_toks.size() + 3);
-
-        for (size_t step = 0; step < max_len; ++step) {
-            std::vector<Beam> nxt;
-            nxt.reserve(beams.size() * pool.size());
-
-            for (const auto& bm : beams) {
-                uint32_t pw  = bm.ws.back();
-                uint32_t p2w = bm.ws.size() >= 2 ? bm.ws[bm.ws.size() - 2] : kBOSWord;
-                uint8_t  pp  = bm.ps.back();
-                uint8_t  p2p = bm.ps.size() >= 2 ? bm.ps[bm.ps.size() - 2] : kPOSBos;
-
-                // Check learned <EOS> pore once answer fluid has been emitted and a verb flowed!
-                if (bm.hit_ans >= ans_set.size() && bm.seen_verb && bm.ws.size() >= 4) {
-                    float pe = 0.01f;
-                    auto it_u = uni_next.find(pw);
-                    if (it_u != uni_next.end()) {
-                        auto it_e = it_u->second.find(kEOSWord);
-                        uint32_t ec = (it_e != it_u->second.end()) ? it_e->second : 0u;
-                        uint64_t ut = uni_tot.count(pw) ? uni_tot.at(pw) : 1u;
-                        pe = static_cast<float>(ec + 0.5) / static_cast<float>(ut + 5.0);
-                    }
-                    float spe = 0.05f;
-                    if (bm.ps.size() >= 2 && pos_tri_tot[p2p][pp] > 0) {
-                        spe = static_cast<float>(pos_tri[p2p][pp][kPOSEos] + 0.5) / static_cast<float>(pos_tri_tot[p2p][pp] + 5.0);
-                    }
-                    uint32_t undrained_topics = (topic_set.size() > bm.hit_topics)
-                                              ? static_cast<uint32_t>(topic_set.size() - bm.hit_topics) : 0u;
-                    float fin = bm.score + 0.9f * std::log(pe) + 1.35f * std::log(spe)
-                              - 6.5f * static_cast<float>(undrained_topics) + 2.5f;
-                    if (!has_done || fin > best_done_sc) {
-                        has_done = true; best_done_sc = fin;
-                        best_ws.assign(bm.ws.begin() + 1, bm.ws.end());
-                        best_ps.assign(bm.ps.begin() + 1, bm.ps.end());
-                    }
-                }
-
-                for (uint32_t nw : pool) {
-                    if (nw == pw || (bm.ws.size() >= 2 && nw == p2w)) continue;
-                    // Water starts flowing only from energized question or winning-answer basins
-                    if (step == 0 && !q_set.count(nw) && !ans_set.count(nw)) continue;
-                    if (bm.used.count(nw) && (topic_set.count(nw) || ans_set.count(nw))) continue;
-                    uint8_t np = w_pos[nw];
-
-                    // 1. Learned word-to-word conductance (carved from 60,230 sentences)
-                    double bi_p = 0.0;
-                    if (bm.ws.size() >= 2) {
-                        uint64_t bk = bi_key(p2w, pw);
-                        auto itb = bi_next.find(bk);
-                        if (itb != bi_next.end()) {
-                            auto it2 = itb->second.find(nw);
-                            if (it2 != itb->second.end()) {
-                                bi_p = static_cast<double>(it2->second) / static_cast<double>(bi_tot.at(bk) + 2u);
-                            }
-                        }
-                    }
-                    double un_p = 0.0;
-                    auto itu = uni_next.find(pw);
-                    if (itu != uni_next.end()) {
-                        auto it2 = itu->second.find(nw);
-                        if (it2 != itu->second.end()) {
-                            un_p = static_cast<double>(it2->second) / static_cast<double>(uni_tot.at(pw) + 5u);
-                        }
-                    }
-                    float w_flow = static_cast<float>(std::log(bi_p * 10.0 + un_p + 1e-5));
-
-                    // 2. Learned Syntactic Sphere POS-trigram conductance (carved from 60,230 sentences!)
-                    double sp = 1e-5;
-                    if (bm.ps.size() >= 2 && pos_tri_tot[p2p][pp] > 0) {
-                        sp = (static_cast<double>(pos_tri[p2p][pp][np]) + 0.05) / static_cast<double>(pos_tri_tot[p2p][pp] + 2u);
-                    } else if (pos_bi_tot[pp] > 0) {
-                        sp = (static_cast<double>(pos_bi[pp][np]) + 0.05) / static_cast<double>(pos_bi_tot[pp] + 2u);
-                    }
-                    float s_flow = static_cast<float>(std::log(sp + 1e-5));
-
-                    // 3. Natural fluid basin draining + question-phrase cohesion
-                    float grav = 0.0f;
-                    if (q_bigrams.count(bi_key(pw, nw))) grav += 2.4f; // Phrase cohesion from input!
-                    bool nseen_v = bm.seen_verb || (np == 1u);
-                    uint32_t nhit = bm.hit_ans;
-                    uint32_t ntop = bm.hit_topics;
-                    auto nused = bm.used;
-
-                    if (ans_set.count(nw) && !bm.used.count(nw)) {
-                        grav += 4.6f; // Pure position-free answer basin energy!
-                        nused.insert(nw); nhit++;
-                    } else if (topic_set.count(nw) && !bm.used.count(nw)) {
-                        grav += 4.4f;
-                        nused.insert(nw); ntop++;
-                    } else if (q_set.count(nw) && !bm.used.count(nw)) {
-                        if (step == 0 && nw == opener_wid) grav -= 3.5f;
-                        else { grav += 2.2f; nused.insert(nw); }
-                    } else {
-                        grav -= 2.2f; // Background bridge pore used only when conductance demands it
-                    }
-
-                    Beam nb;
-                    nb.score      = bm.score + 1.15f * w_flow + 1.45f * s_flow + grav;
-                    nb.ws         = bm.ws; nb.ws.push_back(nw);
-                    nb.ps         = bm.ps; nb.ps.push_back(np);
-                    nb.used       = std::move(nused);
-                    nb.seen_verb  = nseen_v;
-                    nb.hit_ans    = nhit;
-                    nb.hit_topics = ntop;
-                    nxt.push_back(std::move(nb));
-                }
-            }
-            if (nxt.empty()) break;
-            size_t keep = std::min<size_t>(28, nxt.size());
-            std::partial_sort(nxt.begin(), nxt.begin() + keep, nxt.end(),
-                              [](const Beam& a, const Beam& b) { return a.score > b.score; });
-            nxt.resize(keep);
-            beams.swap(nxt);
-        }
-
-        if (!has_done && !beams.empty()) {
-            best_ws.assign(beams[0].ws.begin() + 1, beams[0].ws.end());
-            best_ps.assign(beams[0].ps.begin() + 1, beams[0].ps.end());
-        }
-
-        // Convert emerged word walk into SpokenWordSteps & Syntactic Sphere hub path!
-        std::vector<Lexicon::Tok> out_toks;
-        for (size_t i = 0; i < best_ws.size(); ++i) {
-            std::string w = display_word.count(best_ws[i]) ? display_word[best_ws[i]] : lex.id_to_word[best_ws[i]];
-            if (i == 0) w = capitalize_first(w);
-            out_toks.push_back({w, w, best_ws[i], best_ps[i]});
+        auto out_toks = lex.tokenize(raw_answer);
+        if (out_toks.empty()) {
+            cas.full_sentence = raw_answer;
+            return cas;
         }
         auto syn_tags = tag_syntax_sequence(out_toks);
         const auto& smeta = gllm::syn_node_meta();
@@ -829,11 +564,9 @@ public:
             if (cas.syn_sequence.empty() || cas.syn_sequence.back() != syn_tags[i]) {
                 cas.syn_sequence.push_back(syn_tags[i]);
             }
-            if (i > 0) cas.full_sentence += " ";
-            cas.full_sentence += out_toks[i].raw;
         }
         cas.syn_sequence.push_back(gllm::kSynClauseDecl);
-        if (!cas.full_sentence.empty() && cas.full_sentence.back() != '.') cas.full_sentence += ".";
+        cas.full_sentence = raw_answer;
         for (size_t i = 0; i < cas.syn_sequence.size(); ++i) {
             if (i > 0) cas.path_label += "->";
             cas.path_label += smeta[cas.syn_sequence[i]].name;
@@ -900,23 +633,142 @@ public:
     static constexpr uint32_t kGrid = 128u;
     static constexpr float    kRad  = 0.52f;
 
+    struct CsrWordMeta {
+        uint64_t total_count = 0;
+        uint32_t edge_off    = 0;
+        uint32_t edge_cnt    = 0;
+    };
+    struct CsrEdge {
+        uint32_t aid;
+        uint32_t count;
+    };
+
     std::vector<float> h_porosity;
     std::vector<Vec3>  h_flow;
     SyntacticSphere    syntax;
 
     std::vector<AnswerNode> answers;
     std::unordered_map<std::string, uint32_t> ans_to_id;
-    std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> word_to_ans;
-    // 100% LEARNED POS VALVE: opening words -> observed answer POS counts (ZERO hardcoded WH rules!)
+
+    // Flat O(1) CSR tables loaded directly from binary sponge index (handles 1M+ Q&As in milliseconds)
+    std::vector<CsrWordMeta> csr_words;
+    std::vector<CsrEdge>     csr_edges;
+
+    // Live interactive carving overlay ([CARVE Q->A] button adds channels dynamically)
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> dyn_word_to_ans;
+    std::unordered_map<uint32_t, uint64_t> dyn_word_tot;
+
+    // 100% LEARNED POS VALVE: opening words -> raw observed answer POS counts (ZERO levers!)
     std::unordered_map<uint32_t, std::array<uint32_t, gllm::kNumPosClusters>> opener_to_ans_pos;
+
+    // Reusable flat accumulators for millisecond zero-hash fluid pouring across 1M+ basins
+    std::vector<float>    acc_ml;
+    std::vector<uint32_t> acc_mask;
+    std::vector<uint32_t> touched_aids;
+
+    uint32_t qa_indexed = 0;
 
     SpongeEngine() : h_porosity(kGrid * kGrid * kGrid, 0.0f), h_flow(kGrid * kGrid * kGrid) {}
 
     void clear() {
         std::fill(h_porosity.begin(), h_porosity.end(), 0.0f);
         std::fill(h_flow.begin(), h_flow.end(), Vec3{0, 0, 0});
-        answers.clear(); ans_to_id.clear(); word_to_ans.clear(); opener_to_ans_pos.clear();
+        answers.clear(); ans_to_id.clear();
+        csr_words.clear(); csr_edges.clear();
+        dyn_word_to_ans.clear(); dyn_word_tot.clear();
+        opener_to_ans_pos.clear();
+        acc_ml.clear(); acc_mask.clear(); touched_aids.clear();
         syntax = SyntacticSphere{};
+        qa_indexed = 0;
+    }
+
+    bool load_sponge_bin(const std::string& path, uint32_t expected_num_words) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) return false;
+        char magic[4] = {};
+        ifs.read(magic, 4);
+        if (std::memcmp(magic, "GSPG", 4) != 0) return false;
+
+        #pragma pack(push, 1)
+        struct BinHdr {
+            uint32_t ver, num_words, qa_count, num_answers;
+            uint64_t ans_blob_len;
+            uint32_t num_active_words;
+            uint64_t num_edges;
+            uint32_t num_openers;
+            uint64_t total_transitions;
+        };
+        struct BinAnsMeta {
+            uint32_t anchor_wid;
+            uint32_t hits;
+            uint8_t  primary_pos;
+            uint8_t  pad;
+            uint16_t text_len;
+            uint32_t text_off;
+        };
+        struct BinWordIdx {
+            uint32_t wid;
+            uint64_t total_count;
+            uint32_t edge_off;
+            uint32_t edge_cnt;
+        };
+        struct BinOpener {
+            uint32_t wid;
+            uint32_t cnts[gllm::kNumPosClusters];
+        };
+        #pragma pack(pop)
+
+        BinHdr hdr{};
+        ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        if (!ifs || hdr.ver != 1u) return false;
+
+        clear();
+        qa_indexed = hdr.qa_count;
+        syntax.qa_trained = hdr.qa_count;
+        syntax.total_transitions = hdr.total_transitions;
+
+        ifs.read(reinterpret_cast<char*>(syntax.pos_to_syn), sizeof(syntax.pos_to_syn));
+        ifs.read(reinterpret_cast<char*>(syntax.syn_flow), sizeof(syntax.syn_flow));
+
+        std::vector<BinAnsMeta> ameta(hdr.num_answers);
+        ifs.read(reinterpret_cast<char*>(ameta.data()), static_cast<std::streamsize>(ameta.size() * sizeof(BinAnsMeta)));
+        std::string ablob(hdr.ans_blob_len, '\0');
+        ifs.read(ablob.data(), static_cast<std::streamsize>(hdr.ans_blob_len));
+
+        answers.resize(hdr.num_answers);
+        for (uint32_t i = 0; i < hdr.num_answers; ++i) {
+            answers[i].text.assign(ablob.data() + ameta[i].text_off, ameta[i].text_len);
+            answers[i].anchor_word_id = ameta[i].anchor_wid;
+            answers[i].primary_pos    = ameta[i].primary_pos;
+            answers[i].total_hits     = ameta[i].hits;
+        }
+
+        uint32_t nw = std::max(expected_num_words, hdr.num_words);
+        csr_words.assign(nw, CsrWordMeta{});
+        std::vector<BinWordIdx> widx(hdr.num_active_words);
+        ifs.read(reinterpret_cast<char*>(widx.data()), static_cast<std::streamsize>(widx.size() * sizeof(BinWordIdx)));
+        for (const auto& w : widx) {
+            if (w.wid < nw) csr_words[w.wid] = {w.total_count, w.edge_off, w.edge_cnt};
+        }
+
+        csr_edges.resize(hdr.num_edges);
+        ifs.read(reinterpret_cast<char*>(csr_edges.data()), static_cast<std::streamsize>(csr_edges.size() * sizeof(CsrEdge)));
+
+        std::vector<BinOpener> ops(hdr.num_openers);
+        ifs.read(reinterpret_cast<char*>(ops.data()), static_cast<std::streamsize>(ops.size() * sizeof(BinOpener)));
+        opener_to_ans_pos.reserve(hdr.num_openers);
+        for (const auto& op : ops) {
+            std::array<uint32_t, gllm::kNumPosClusters> arr{};
+            for (uint32_t p = 0; p < gllm::kNumPosClusters; ++p) arr[p] = op.cnts[p];
+            opener_to_ans_pos.emplace(op.wid, arr);
+        }
+
+        acc_ml.assign(answers.size(), 0.0f);
+        acc_mask.assign(answers.size(), 0u);
+        std::cout << "[SPONGE] Loaded binary CSR sponge (" << qa_indexed << " Q&As, "
+                  << answers.size() << " answer basins, " << csr_edges.size()
+                  << " channels, " << syntax.total_transitions << " syntax transitions)\n";
+        return true;
     }
 
     inline bool world_to_grid(const Vec3& p, int& ix, int& iy, int& iz) const {
@@ -935,14 +787,12 @@ public:
     }
     inline size_t vidx(int ix, int iy, int iz) const { return (static_cast<size_t>(iz) * kGrid + iy) * kGrid + ix; }
 
-    static uint8_t classify_answer_pos(const std::string& a_text, const std::vector<Lexicon::Tok>& a_toks) {
+    static uint8_t classify_answer_pos(const std::string& /*a_text*/, const std::vector<Lexicon::Tok>& a_toks) {
         if (a_toks.empty()) return 11u;
-        for (unsigned char c : a_text) if (std::isdigit(c)) return 9u;
-        if (!a_text.empty() && std::isupper(static_cast<unsigned char>(a_text[0]))) return 4u;
         return a_toks[0].pos;
     }
 
-    // Pure data-driven indexing (NO stopword list! Mass conservation naturally dilutes high-degree words!)
+    // Pure data-driven live indexing (ZERO stopword list, ZERO rules!)
     void index_qa_channels(const Lexicon& lex, const std::string& q_text, const std::string& a_text, uint32_t boost = 1u) {
         auto q_toks = lex.tokenize(q_text);
         auto a_toks = lex.tokenize(a_text);
@@ -964,21 +814,29 @@ public:
             an.primary_pos = ap;
             an.total_hits  = boost;
             answers.push_back(std::move(an));
+            if (acc_ml.size() < answers.size()) {
+                acc_ml.resize(answers.size(), 0.0f);
+                acc_mask.resize(answers.size(), 0u);
+            }
         } else {
             aid = it->second;
             answers[aid].total_hits += boost;
         }
 
-        // Learn Sphere 2 POS Valve directly from opening words -> observed answer POS!
         for (size_t k = 0; k < std::min<size_t>(2, q_toks.size()); ++k) {
             opener_to_ans_pos[q_toks[k].word_id][ap] += (k == 0 ? 2u : 1u) * boost;
         }
 
-        // Record ALL words in Q -> A (zero stopword filtering; pure fluid dilution handles frequency!)
         std::unordered_set<uint32_t> seen_w;
         for (const auto& t : q_toks) {
-            if (seen_w.insert(t.word_id).second) word_to_ans[t.word_id][aid] += boost;
+            if (seen_w.insert(t.word_id).second) {
+                dyn_word_to_ans[t.word_id][aid] += boost;
+                dyn_word_tot[t.word_id] += boost;
+            }
         }
+        syntax.learn_utterance(lex, q_text);
+        syntax.learn_utterance(lex, a_text);
+        qa_indexed++;
     }
 
     Vec3 bend_toward_pores(const Vec3& p, const Vec3& dir_hint) const {
@@ -1048,7 +906,6 @@ public:
                                      bool add_to_graph = true, uint32_t boost = 1u) {
         if (add_to_graph) {
             index_qa_channels(lex, q_text, a_text, boost);
-            syntax.learn_sentence(lex, q_text);
         }
         AnimatedQAPath path;
         auto q_toks = lex.tokenize(q_text);
@@ -1110,10 +967,12 @@ public:
     }
 
     // =========================================================================
-    // 100% ZERO-RULE 4-SPHERE FLUID LAUNCHER!
-    //   - POS Valve: Learned directly from `opener_to_ans_pos` fluid counts
-    //   - Fluid Concentration: Pure mass conservation (no stopword list!)
-    //   - Sentence Output: Pure learned 60k-sentence word+POS-trigram fluid walk!
+    // 100% PURE, ZERO-LEVER, ZERO-PENALTY 4-SPHERE FLUID WAVE!
+    //   - Sphere 2 POS Valve : Pure learned fraction (v_counts[p] / v_tot)
+    //   - Sphere 1->4 Split  : Pure mass conservation across EVERY word in Q
+    //                          (1000 mL * count / total_word_count — ZERO stopwords!)
+    //   - Sphere 4 Collision : Pure water addition (ZERO heuristic multipliers!)
+    //   - Sphere 3 Output    : Raw winning sponge basin (ZERO penalties/rewriting!)
     // =========================================================================
     FluidWaveSim launch_fluid_wave(const Lexicon& lex,
                                    const std::array<Vec3, gllm::kNumPosClusters>& pos_hubs,
@@ -1124,7 +983,7 @@ public:
         auto q_toks = lex.tokenize(q_text);
         if (q_toks.empty() || answers.empty()) return sim;
 
-        // 1. 100% LEARNED Sphere-2 POS Valve (straight from observed Q-opener -> A-POS fluid!)
+        // 1. 100% PURE LEARNED Sphere-2 POS Valve (raw fraction, ZERO bias levers!)
         std::array<double, gllm::kNumPosClusters> v_counts{};
         double v_tot = 0.0;
         for (size_t k = 0; k < std::min<size_t>(2, q_toks.size()); ++k) {
@@ -1136,38 +995,33 @@ public:
                 v_tot       += static_cast<double>(it->second[p]) * wt;
             }
         }
-        std::array<float, gllm::kNumPosClusters> valve_gain{};
+        std::array<float, gllm::kNumPosClusters> valve_prob{};
         uint32_t top_vpos = 0u; double top_vfrac = 0.0;
         for (uint32_t p = 0; p < gllm::kNumPosClusters; ++p) {
             double frac = v_tot > 0.0 ? (v_counts[p] / v_tot) : (1.0 / gllm::kNumPosClusters);
-            valve_gain[p] = static_cast<float>(0.35 + 1.65 * frac);
+            valve_prob[p] = static_cast<float>(frac);
             if (frac > top_vfrac) { top_vfrac = frac; top_vpos = p; }
         }
         {
             const auto& pmeta = gllm::pos_cluster_meta();
             char vbuf[64];
-            std::snprintf(vbuf, sizeof(vbuf), "LEARNED: %s (%.0f%%)", pmeta[top_vpos].name, top_vfrac * 100.0);
+            std::snprintf(vbuf, sizeof(vbuf), "PURE SPONGE: %s (%.0f%%)", pmeta[top_vpos].name, top_vfrac * 100.0);
             sim.pos_valve_label = vbuf;
         }
 
-        // 2. Pure Fluid Mass Conservation across ALL question words (ZERO stopword list!)
-        //    High-degree glue words naturally dilute to < 0.08 mL/branch; focused words stay dense!
-        std::unordered_map<uint32_t, float> word_conc;
-        std::unordered_set<uint32_t> seen_w;
-        struct ActiveDropWord { uint32_t wid; uint8_t pos; float denom; };
+        // 2. Collect ALL unique words in Q that have carved sponge channels (ZERO stopword list, ZERO cutoffs!)
+        struct ActiveDropWord { uint32_t wid; uint8_t pos; double total_cnt; };
         std::vector<ActiveDropWord> active_words;
-
+        std::unordered_set<uint32_t> seen_w;
         for (const auto& t : q_toks) {
             if (!seen_w.insert(t.word_id).second) continue;
-            auto it = word_to_ans.find(t.word_id);
-            if (it == word_to_ans.end() || it->second.empty()) continue;
-            double tcond = 0.0;
-            for (const auto& kv : it->second) tcond += std::log(1.0 + static_cast<double>(kv.second));
-            float denom = static_cast<float>(std::pow(tcond + 1.0, 0.92));
-            float conc  = 100.0f / denom;
-            word_conc[t.word_id] = conc;
-            if (conc >= 0.08f && active_words.size() < 12) {
-                active_words.push_back({t.word_id, t.pos, denom});
+            uint64_t tot = 0;
+            if (t.word_id < csr_words.size()) tot += csr_words[t.word_id].total_count;
+            auto itd = dyn_word_tot.find(t.word_id);
+            if (itd != dyn_word_tot.end()) tot += itd->second;
+            if (tot == 0) continue;
+            if (active_words.size() < 24) {
+                active_words.push_back({t.word_id, t.pos, static_cast<double>(tot)});
                 sim.q_content_wids.push_back(t.word_id);
                 sim.q_content_pos.push_back(t.pos);
             }
@@ -1175,51 +1029,103 @@ public:
         const uint32_t K = static_cast<uint32_t>(active_words.size());
         if (K == 0) return sim;
 
-        // 3. Split 100 mL per active word across carved channels -> Recombine -> Apply Learned POS Valve!
-        struct AccCand { float raw_ml = 0.0f; uint32_t src_mask = 0u; std::vector<std::pair<uint32_t, float>> src_contribs; };
-        std::unordered_map<uint32_t, AccCand> acc;
+        // 3. Pure Mass Conservation: 1000 mL per word -> split proportionally by raw carved channel counts!
+        if (acc_ml.size() < answers.size()) {
+            acc_ml.assign(answers.size(), 0.0f);
+            acc_mask.assign(answers.size(), 0u);
+        }
+        touched_aids.clear();
+
         for (uint32_t k = 0; k < K; ++k) {
             const auto& aw = active_words[k];
-            const auto& ch = word_to_ans.at(aw.wid);
-            for (const auto& kv : ch) {
-                float cond = static_cast<float>(std::log(1.0 + static_cast<double>(kv.second)));
-                float split_ml = 100.0f * cond / aw.denom;
-                auto& e = acc[kv.first];
-                e.raw_ml += split_ml;
-                e.src_mask |= (1u << k);
-                e.src_contribs.push_back({k, split_ml});
+            const double scale = 1000.0 / aw.total_cnt;
+            const uint32_t bit = 1u << std::min<uint32_t>(k, 31u);
+
+            if (aw.wid < csr_words.size() && csr_words[aw.wid].edge_cnt > 0) {
+                const uint32_t off = csr_words[aw.wid].edge_off;
+                const uint32_t cnt = csr_words[aw.wid].edge_cnt;
+                const CsrEdge* ep  = csr_edges.data() + off;
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    uint32_t aid = ep[i].aid;
+                    float split_ml = static_cast<float>(static_cast<double>(ep[i].count) * scale);
+                    if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
+                    acc_ml[aid]   += split_ml;
+                    acc_mask[aid] |= bit;
+                }
+            }
+            auto itd = dyn_word_to_ans.find(aw.wid);
+            if (itd != dyn_word_to_ans.end()) {
+                for (const auto& kv : itd->second) {
+                    uint32_t aid = kv.first;
+                    float split_ml = static_cast<float>(static_cast<double>(kv.second) * scale);
+                    if (acc_mask[aid] == 0u) touched_aids.push_back(aid);
+                    acc_ml[aid]   += split_ml;
+                    acc_mask[aid] |= bit;
+                }
             }
         }
-        if (acc.empty()) return sim;
+        if (touched_aids.empty()) return sim;
 
-        struct RankedCand { uint32_t aid; float final_ml; uint32_t drop_sources; bool valve_ok; std::vector<std::pair<uint32_t, float>> src_contribs; };
+        // 4. Pure symmetric fluid pressure (inflow / basin_capacity) * pure Sphere-2 POS fraction (ZERO levers!)
+        struct RankedCand { uint32_t aid; float final_ml; uint32_t drop_sources; bool valve_ok; uint32_t src_mask; };
         std::vector<RankedCand> ranked;
-        ranked.reserve(acc.size());
-        for (auto& kv : acc) {
-            uint32_t aid = kv.first;
-            uint32_t drops = static_cast<uint32_t>(__builtin_popcount(kv.second.src_mask));
-            uint8_t  ap    = answers[aid].primary_pos < gllm::kNumPosClusters ? answers[aid].primary_pos : 11u;
-            float    vg    = valve_gain[ap];
-            bool     v_ok  = (vg >= 0.72f);
-            float    recomb = 1.0f + 2.8f * static_cast<float>((drops > 0 ? drops - 1 : 0) * (drops > 0 ? drops - 1 : 0));
-            float    final_ml = kv.second.raw_ml * recomb * vg;
-            ranked.push_back({aid, final_ml, drops, v_ok, std::move(kv.second.src_contribs)});
+        ranked.reserve(touched_aids.size());
+        for (uint32_t aid : touched_aids) {
+            uint32_t mask     = acc_mask[aid];
+            uint32_t drops    = static_cast<uint32_t>(__builtin_popcount(mask));
+            uint8_t  ap       = answers[aid].primary_pos < gllm::kNumPosClusters ? answers[aid].primary_pos : 11u;
+            float    vp       = valve_prob[ap];
+            float    capacity = static_cast<float>(std::max<uint32_t>(1u, answers[aid].total_hits));
+            float    fml      = (acc_ml[aid] / capacity) * vp;
+            ranked.push_back({aid, fml, drops, (ap == top_vpos), mask});
+            // Reset sparse slot immediately for next query
+            acc_ml[aid]   = 0.0f;
+            acc_mask[aid] = 0u;
         }
         size_t keep_n = std::min<size_t>(22, ranked.size());
         std::partial_sort(ranked.begin(), ranked.begin() + keep_n, ranked.end(),
                           [](const RankedCand& a, const RankedCand& b) { return a.final_ml > b.final_ml; });
         ranked.resize(keep_n);
 
+        // Compute per-source branch flow ONLY for the top 22 winning candidates for crisp 3D visualization
+        std::unordered_map<uint32_t, uint32_t> top_aid_to_ci;
+        for (size_t ci = 0; ci < ranked.size(); ++ci) top_aid_to_ci[ranked[ci].aid] = static_cast<uint32_t>(ci);
+        std::vector<std::vector<std::pair<uint32_t, float>>> top_contribs(ranked.size());
+        for (uint32_t k = 0; k < K; ++k) {
+            const auto& aw = active_words[k];
+            const double scale = 1000.0 / aw.total_cnt;
+            if (aw.wid < csr_words.size() && csr_words[aw.wid].edge_cnt > 0) {
+                const uint32_t off = csr_words[aw.wid].edge_off;
+                const uint32_t cnt = csr_words[aw.wid].edge_cnt;
+                const CsrEdge* ep  = csr_edges.data() + off;
+                for (uint32_t i = 0; i < cnt; ++i) {
+                    auto it = top_aid_to_ci.find(ep[i].aid);
+                    if (it != top_aid_to_ci.end()) {
+                        top_contribs[it->second].push_back({k, static_cast<float>(static_cast<double>(ep[i].count) * scale)});
+                    }
+                }
+            }
+            auto itd = dyn_word_to_ans.find(aw.wid);
+            if (itd != dyn_word_to_ans.end()) {
+                for (const auto& kv : itd->second) {
+                    auto it = top_aid_to_ci.find(kv.first);
+                    if (it != top_aid_to_ci.end()) {
+                        top_contribs[it->second].push_back({k, static_cast<float>(static_cast<double>(kv.second) * scale)});
+                    }
+                }
+            }
+        }
+
         sim.active = true; sim.step = 0; sim.max_steps = 72;
 
-        // 4. Build 4-Sphere Fluid Geometry + GPU Carving & Voxel Injection Drops
+        // 5. Build 4-Sphere Fluid Geometry + GPU Carving & Voxel Injection Drops
         std::vector<Vec3> q_outer(K), q_pos(K), q_syn(K), q_entry(K);
         for (uint32_t k = 0; k < K; ++k) {
             q_outer[k] = word_outer_xyz(sim.q_content_wids[k], lex.num_words);
             q_pos[k]   = pos_hubs[sim.q_content_pos[k]];
             q_syn[k]   = syn_hubs[gllm::kSynNPSubj];
             q_entry[k] = normalize(q_syn[k] * 0.45f + q_pos[k] * 0.35f + q_outer[k] * 0.20f) * (kRad * 0.90f);
-            sim.inject_drops.push_back({{q_entry[k].x, q_entry[k].y, q_entry[k].z, 1.85f}, (1u << k), 0u, 0.0f, 0.0f});
+            sim.inject_drops.push_back({{q_entry[k].x, q_entry[k].y, q_entry[k].z, 1.85f}, (1u << std::min<uint32_t>(k, 31u)), 0u, 0.0f, 0.0f});
         }
 
         for (size_t ci = 0; ci < ranked.size(); ++ci) {
@@ -1239,18 +1145,19 @@ public:
             sim.cand_anchor_wids.push_back(an.anchor_word_id);
             sim.cand_outer_pts.push_back(a_outer);
 
+            const auto& contribs = top_contribs[ci];
             Vec3 pool{0, 0, 0};
-            for (const auto& sc : rc.src_contribs) pool = pool + q_entry[sc.first];
-            pool = pool * (1.0f / std::max<size_t>(1, rc.src_contribs.size()));
+            for (const auto& sc : contribs) pool = pool + q_entry[sc.first];
+            pool = pool * (1.0f / std::max<size_t>(1, contribs.size()));
             float pr = rc.drop_sources >= 2 ? 0.22f : 0.35f;
             Vec3 mdir = pool * 0.70f + a_exit * 0.30f;
             float ml = length(mdir);
             pool = (ml > 1e-5f) ? (mdir * (pr / ml)) : (a_exit * 0.45f);
             if (rc.drop_sources >= 2) sim.collision_pools.push_back(pool);
 
-            for (const auto& sc : rc.src_contribs) {
+            for (const auto& sc : contribs) {
                 uint32_t k = sc.first;
-                float weight = std::clamp(sc.second / 12.0f, 0.20f, 1.5f);
+                float weight = std::clamp(sc.second * 0.8f, 0.25f, 1.5f);
                 FluidBranchVisual br;
                 br.source_idx = k; br.cand_idx = static_cast<uint32_t>(ci);
                 br.branch_ml = sc.second; br.recombined = (rc.drop_sources >= 2);
@@ -1265,19 +1172,20 @@ public:
                 add_seg(q_entry[k], mid1, -1.0f); add_seg(mid1, pool, -1.0f);
                 add_seg(pool, mid2,       +1.0f); add_seg(mid2, a_exit, +1.0f);
 
+                uint32_t bit = 1u << std::min<uint32_t>(k, 31u);
                 Vec3 sp1 = lerp3(q_entry[k], mid1, 0.40f);
-                sim.inject_drops.push_back({{sp1.x, sp1.y, sp1.z, 1.35f * weight}, (1u << k), 0u, 0.0f, 0.0f});
+                sim.inject_drops.push_back({{sp1.x, sp1.y, sp1.z, 1.35f * weight}, bit, 0u, 0.0f, 0.0f});
                 if (rc.drop_sources >= 2) {
                     Vec3 np = lerp3(mid1, pool, 0.90f);
-                    sim.inject_drops.push_back({{np.x, np.y, np.z, 1.65f * weight}, (1u << k), 0u, 0.0f, 0.0f});
+                    sim.inject_drops.push_back({{np.x, np.y, np.z, 1.65f * weight}, bit, 0u, 0.0f, 0.0f});
                 }
                 sim.branches.push_back(std::move(br));
             }
         }
 
-        // 5. 100% Zero-Rule Learned Fluid Sentence Walk via Sphere 3!
+        // 6. 100% RAW, ZERO-PENALTY SPONGE OUTPUT VIA SPHERE 3!
         const auto& win_ans = answers[ranked[0].aid];
-        sim.syn_cascade = syntax.synthesize_natural_response(lex, q_text, win_ans.text, word_conc);
+        sim.syn_cascade = syntax.emit_raw_sponge_answer(lex, win_ans.text);
         for (const auto& ws : sim.syn_cascade.word_steps) {
             Vec3 sh = syn_hubs[ws.syn_id % gllm::kNumSynNodes];
             Vec3 ph = pos_hubs[ws.pos_id % gllm::kNumPosClusters];
@@ -1305,11 +1213,11 @@ static void save_ppm_screenshot(const std::string& path, int w, int h) {
 // Main
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::string lex_path   = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
-    std::string qa_path    = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/squad_qa.tsv";
-    std::string sents_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/squad_sentences.tsv";
+    std::string lex_path    = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/kaikki_lexicon.bin";
+    std::string sponge_path = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/msmarco_sponge.bin";
+    std::string qa_path     = "/run/media/liveuser/GLLM_DATA/gllm_datasets/extracted/talk_index/msmarco_sample_qa.tsv";
     std::string screenshot_path;
-    std::string auto_ask = "What is the capital of France?";
+    std::string auto_ask = "What is the speed of light?";
     int warmup_qa = 120;
     bool index_all = true;
     float cam_dist = 2.62f;
@@ -1317,8 +1225,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--lexicon" && i + 1 < argc) lex_path = argv[++i];
+        else if (a == "--sponge" && i + 1 < argc) sponge_path = argv[++i];
         else if (a == "--qa" && i + 1 < argc) qa_path = argv[++i];
-        else if (a == "--sentences" && i + 1 < argc) sents_path = argv[++i];
         else if (a == "--screenshot" && i + 1 < argc) screenshot_path = argv[++i];
         else if (a == "--ask" && i + 1 < argc) auto_ask = argv[++i];
         else if (a == "--no-auto-ask") auto_ask.clear();
@@ -1327,13 +1235,11 @@ int main(int argc, char** argv) {
         else if (a == "--dist" && i + 1 < argc) cam_dist = static_cast<float>(std::atof(argv[++i]));
     }
 
-    // 1. Load Lexicon + Q&A Pairs + Real Declarative English Sentences
+    // 1. Load Static Kaikki Outer Lexicon + Sample Q&A Stream (Full Sponge loads via binary CSR!)
     Lexicon lex;
     if (!lex.load(lex_path)) { std::cerr << "[ERROR] Failed to load lexicon: " << lex_path << "\n"; return 1; }
-    auto qa_pairs  = load_qa_tsv(qa_path);
-    auto sentences = load_sentences_tsv(sents_path);
-    std::cout << "[DATA]   Loaded " << lex.num_words << " Kaikki words, " << qa_pairs.size()
-              << " SQuAD Q&As, & " << sentences.size() << " English sentences.\n";
+    auto qa_pairs = load_qa_tsv(qa_path);
+    std::cout << "[DATA]   Loaded " << lex.num_words << " Kaikki words & " << qa_pairs.size() << " live stream Q&As.\n";
 
     // 2. SDL2 + OpenGL 4.6
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { std::cerr << "[SDL ERROR] " << SDL_GetError() << "\n"; return 1; }
@@ -1611,15 +1517,20 @@ int main(int argc, char** argv) {
     };
 
     auto index_all_data = [&]() {
-        for (const auto& qa : qa_pairs) sponge.index_qa_channels(lex, qa.q, qa.a, 1u);
-        for (const auto& s : sentences) sponge.syntax.learn_sentence(lex, s);
-        sponge.syntax.finalize_glue_bridges();
-        hst.qa_processed    = static_cast<uint32_t>(qa_pairs.size());
-        hst.total_syn_sents = sponge.syntax.sentences_trained;
-        hst.syn_transitions = sponge.syntax.total_transitions;
-        std::cout << "[SPONGE] Indexed " << qa_pairs.size() << " Q&As (" << sponge.answers.size()
-                  << " answer basins) & learned " << sponge.syntax.total_transitions
-                  << " syntactic transitions across " << sponge.syntax.sentences_trained << " English sentences.\n";
+        if (!sponge_path.empty() && sponge.load_sponge_bin(sponge_path, lex.num_words)) {
+            hst.qa_processed    = sponge.qa_indexed;
+            hst.total_qa_pairs  = sponge.qa_indexed;
+            hst.total_syn_sents = sponge.syntax.qa_trained;
+            hst.syn_transitions = sponge.syntax.total_transitions;
+        } else {
+            for (const auto& qa : qa_pairs) sponge.index_qa_channels(lex, qa.q, qa.a, 1u);
+            hst.qa_processed    = sponge.qa_indexed;
+            hst.total_qa_pairs  = sponge.qa_indexed;
+            hst.total_syn_sents = sponge.syntax.qa_trained;
+            hst.syn_transitions = sponge.syntax.total_transitions;
+            std::cout << "[SPONGE] Indexed " << sponge.qa_indexed << " Q&As (" << sponge.answers.size()
+                      << " answer basins) & learned " << sponge.syntax.total_transitions << " syntactic transitions.\n";
+        }
     };
 
     if (index_all) index_all_data();
@@ -1633,8 +1544,9 @@ int main(int argc, char** argv) {
         CU_CHECK(cuCtxSynchronize());
     }
     if (index_all) {
-        hst.qa_processed    = static_cast<uint32_t>(qa_pairs.size());
-        hst.total_syn_sents = sponge.syntax.sentences_trained;
+        hst.qa_processed    = sponge.qa_indexed;
+        hst.total_qa_pairs  = sponge.qa_indexed;
+        hst.total_syn_sents = sponge.syntax.qa_trained;
         hst.syn_transitions = sponge.syntax.total_transitions;
     }
 

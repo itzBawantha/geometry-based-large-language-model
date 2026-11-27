@@ -7,11 +7,11 @@ Normal AI models learn by tweaking billions of hidden numbers with math (backpro
 **GLLM** tries something completely different, inspired by **nature**: **four spheres nested inside each other**, with a **3D sponge** in the center that gets carved out by real English text—running live on an NVIDIA GPU (CUDA + OpenGL, no `nvcc` needed).
 
 <p align="center">
-  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Asking What is the capital of France in GLLM 4-Sphere Fluid Sponge and getting Paris is the capital of France" width="49%" />
+  <img src="docs/images/gllm_fluid_sponge_qa.png" alt="Asking What is the speed of light in GLLM 4-Sphere Fluid Sponge trained on 559,659 MS MARCO Q&As with zero rules or levers" width="49%" />
   <img src="docs/images/gllm_sponge_carving.png" alt="Live English Q&A pairs carving tunnels through the 3D sponge" width="49%" />
 </p>
 <p align="center">
-  <em><strong>Left (Asking a Question — Zero Hardcoded Rules):</strong> Asking <code>"What is the capital of France?"</code> (even though that exact question is not in the dataset). Water drops from <code>capital</code> and <code>France</code> split across <strong>6,388</strong> voxels inside the sponge and collide at <strong>2,986</strong> pink/gold overlap spots. Every possible answer fills up on the left—<strong>Paris</strong> collects the most water (<strong>5.7 mL</strong>) and flows out through the learned sentence layer as <strong>"Paris is the capital of France."</strong><br/>
+  <em><strong>Left (Asking a Question — Zero Rules, Zero Penalties, Zero Levers):</strong> Asking <code>"What is the speed of light?"</code> across <strong>559,659</strong> real human Microsoft MS MARCO v2.1 Q&As (<strong>3.14M</strong> carved channels). Water drops from every word split across <strong>23,755</strong> GPU voxels and collide at <strong>18,307</strong> pink/gold overlap spots—filling the winning basin with the highest fluid pressure and emerging untouched through the Syntactic Sphere as <strong>"The speed of light in MPH is 670 616 629 mph."</strong><br/>
   <strong>Right (Carving the Sponge):</strong> Watching real English questions and answers poke tunnels through the 3D sponge in real time, merging shared paths together and splitting apart at the answers.</em>
 </p>
 
@@ -55,9 +55,9 @@ flowchart LR
 1. **Sphere 1 — Outer Word Sphere (`R = 1.00`):**  
    Holds **`1,360,919` real English words** from the Wiktionary dictionary (Kaikki). Every word sits at its own fixed spot on the outside of the sphere.
 2. **Sphere 2 — Part-of-Speech Sphere (`R = 0.80`):**  
-   Has **12 buckets** (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every word on the outside connects inward to its bucket. This layer also learns its own **valve openings** straight from the 89,003 Q&A pairs—without a single hardcoded rule, it discovers on its own that *"When…?"* flows **75%** toward numbers/years while *"What…?"* flows **38%** toward names.
+   Has **12 buckets** (`noun`, `verb`, `adj`, `adv`, `name`, `pron`, `prep`, `det`, `conj`, `num`, `intj`, `other`). Every word on the outside connects inward to its bucket. This layer learns its own **valve openings** purely from the `559,659` MS MARCO Q&As—with zero rules or tuning knobs, it discovers on its own that *"Who…?"* opens **31%** toward names while *"What is…?"* opens **30%** toward determiners (`"The ..."` full sentences).
 3. **Sphere 3 — Sentence / Syntax Sphere (`R = 0.64`, glowing green ring):**  
-   Has **8 sentence-shape hubs** (question starter, subject, linking verb, action verb, object, time/place phrase, statement finish, connector). Running **60,230 real English sentences** through it carves **590,074** real grammar and word-to-word channels so the winning answer can flow back out on its own as a natural English sentence (`"Paris is the capital of France."`) with zero hardcoded sentence templates.
+   Has **8 sentence-shape hubs** (question starter, subject, linking verb, action verb, object, time/place phrase, statement finish, connector). All **7,688,886** syntactic transitions are carved directly from the MS MARCO questions and answers themselves—and the winning sponge basin flows straight out raw and untouched, with zero rewriting, zero penalties, and zero bandages.
 4. **Sphere 4 — The 3D Sponge (`R < 0.52`):**  
    A `128 × 128 × 128` grid of **2,097,152 voxels** running in parallel on your GPU. Every frame you can literally see:
    - **Blue/Cyan cubes:** Water from one word splitting through tunnels (brighter = more water in that cube).
@@ -65,19 +65,18 @@ flowchart LR
 
 ---
 
-## Being Honest: Zero Hardcoded Rules & What's Next
+## Being Honest: 100% Pure Unfiltered Sponge Physics
 
-We want this project to be 100% transparent—no smoke and mirrors:
+We want this project to be 100% transparent—no smoke and mirrors, no hidden levers:
 
-- **100% Learned From Data (Zero Hardcoded Rules, Word Lists, or Templates):**
-  - All `1,360,919` outer words and their parts of speech come straight from Wiktionary (Kaikki).
-  - **No stopword lists:** Common words like `"the"` and `"of"` connect to tens of thousands of tunnels, so a single drop of water splits so thinly that it barely registers—while specific words like `"capital"` and `"France"` stay concentrated naturally by fluid conservation.
-  - **Learned POS valve (Sphere 2):** Zero `if ("when")` rules. Opening words learn which answer buckets they drain into directly from the `89,003` Q&A pairs (`when -> 75% num`, `who -> 83% name`, `what -> 38% name`).
-  - **Learned 3D sponge fluid collision (Sphere 4):** All `63,384` answer basins, sponge tunnel carving, parallel GPU voxel splitting, multi-word collisions, and the **`#1 Paris (5.7 mL)`** fluid winner emerge purely from the carved data.
-  - **Learned sentence flow (Sphere 3):** Zero sentence templates or irregular-verb tables. The spoken response (`"Paris is the capital of France."`, `"Boston is the capital of Massachusetts."`) walks purely along word-to-word and part-of-speech channels carved from `60,230` real English sentences until it hits a learned end-of-sentence pore.
-- **What's Next (Scaling Up the Data):**
-  - Because there are zero grammar patches left in the code and Sphere 3 has only seen `60,230` Wikipedia sentences so far, trickier or multi-clause questions can still produce awkward word order (or flip two equally common names).
-  - **Next goal:** Carve millions of real sentences and multi-turn conversations through the sponge so even complex, multi-sentence answers flow smoothly on their own.
+- **Zero Rules, Zero Penalties, Zero Bandages:**
+  - **Outer Sphere (Sphere 1):** Static `1,360,919`-word English dictionary from Wiktionary (Kaikki).
+  - **Single Q&A Dataset (MS MARCO v2.1):** All `559,659` labeled human Q&A pairs (`521,576` unique answer basins, `3,144,991` carved sponge channels, `7,688,886` syntactic transitions) train Spheres 2, 3, and 4 together—no separate sentence corpus.
+  - **Pure Symmetric Fluid Physics:** Every question word pours an equal `1000 mL` droplet divided proportionally across all carved channels (`count / word_total_count` — **no stopword lists, no exponents, no cutoffs**). Colliding droplets simply add together and divide by each answer basin's own capacity (`inflow / basin_hits` — pure fluid pressure, **no heuristic collision multipliers**), then pass through Sphere 2's raw learned POS fraction (`v_counts[pos] / v_tot`).
+  - **Raw Untouched Output:** Zero beam-search penalties, zero templates, zero post-processing—whatever basin wins in the sponge is emitted completely raw through Sphere 3, even when a missing fact or rare word produces a raw/imperfect answer!
+- **What's Next (Scaling Past 1M → 15M+ Q&As):**
+  - MS MARCO v2.1 has `559,659` answered human Q&As (out of `909,824` train+dev queries), so facts absent from MS MARCO (like *"What is the capital of France?"*) still fall back to nearby carved shape neighbors (*"The capital of Holland is Amsterdam."*).
+  - **Next goal:** Combine MS MARCO with multi-million Q&A archives like **PAQ-L1 (14.1M)** and **TQA+NQ+PAQ (65M)** into the exact same binary CSR sponge format so every sphere gets deeper, richer geometry purely from data.
 
 ---
 
@@ -100,17 +99,17 @@ sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev curl python3
 # 1. Build the visualizer (and all GLLM tools)
 ./scripts/build.sh
 
-# 2. Prepare the dictionary + Q&A + sentence index (from Kaikki + SQuAD)
-python3 scripts/prepare_talk_data.py
+# 2. Pack the Kaikki lexicon + Microsoft MS MARCO v2.1 CSR binary sponge
+python3 scripts/prepare_msmarco_data.py
 
 # 3. Launch the live 4-Sphere Fluid Sponge!
-./scripts/run_talk_viz.sh --ask "What is the capital of France?"
+./scripts/run_talk_viz.sh --ask "What is the speed of light?"
 ```
 
 ### Controls Inside the Window
 - **Ask your own question:** Click the **`Q:`** box, type any question, and hit **`Enter`** (or click **`[ASK (4-SPHERE)]`**).
 - **Teach a new fact live:** Type a question in **`Q:`** and an answer in **`A:`**, then click **`[CARVE Q->A]`** to watch it poke a new tunnel through the sponge.
-- **Watch it again:** Click **`[REPLAY FLUID + SYNTAX]`** to replay the water splitting and sentence flow in slow motion.
+- **Watch it again:** Click **`[REPLAY FLUID WAVE]`** to replay the water splitting and syntactic flow in slow motion.
 - **Stream Q&As live:** **`Space`** play/pause • **`T`** fast burst carving • **`S`** one step at a time • **`X`** wipe sponge clean.
 - **Move around in 3D:** Drag with mouse to spin • Scroll to zoom • **`1`–`5`** toggle each sphere & rays • **`Up`/`Down`** fade the outer word shell • **`R`** reset camera.
 
@@ -124,9 +123,10 @@ Before teaching the sphere to talk, GLLM started with **zero-weight vision** ins
 
 ## Files in This Repo
 
-- [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app
+- [`src/gllm_talk_viz.cpp`](src/gllm_talk_viz.cpp) — The live 4-Sphere CUDA + OpenGL Fluid Sponge app (zero rules, zero penalties, binary CSR loader)
 - [`kernels/gllm_talk_kernels.ptx`](kernels/gllm_talk_kernels.ptx) — GPU kernels for the 1.36M word shell, sponge carving, and parallel `128³` voxel fluid splitting & collisions
-- [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, spoken sentence output, and competing answer water meters
-- [`scripts/prepare_talk_data.py`](scripts/prepare_talk_data.py) — Packs the Kaikki English dictionary + SQuAD Q&A pairs + real sentences for fast GPU loading
+- [`include/talk_hud.hpp`](include/talk_hud.hpp) — Left sidebar showing live voxel counts, raw sponge syntactic output, and competing answer fluid meters
+- [`scripts/prepare_msmarco_data.py`](scripts/prepare_msmarco_data.py) — Packs Microsoft MS MARCO v2.1 into a fast-loading binary CSR sponge index (`msmarco_sponge.bin`)
+- [`scripts/prepare_talk_data.py`](scripts/prepare_talk_data.py) — Packs the Kaikki English dictionary lexicon (`kaikki_lexicon.bin`)
 - [`scripts/run_talk_viz.sh`](scripts/run_talk_viz.sh) — Launches `gllm_talk_viz` on your NVIDIA GPU
 - [`src/gllm_*.cpp`](src/) & [`kernels/gllm_kernels.ptx`](kernels/gllm_kernels.ptx) — The earlier visual 1B-sphere CLI suite

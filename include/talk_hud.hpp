@@ -216,9 +216,8 @@ public:
         std::snprintf(buf, sizeof(buf), "4.SPONGE: 128^3 | %u carved | CUDA %.2fms | %.0fFPS",
                       st.carved_voxels, st.cuda_ms, st.fps);
         draw_text(22, 71, buf, 255, 204, 115);
-        std::snprintf(buf, sizeof(buf), "LEARNED: %u QAs | %u Sents | %llu Syntax Flows",
-                      st.qa_processed, st.total_syn_sents,
-                      static_cast<unsigned long long>(st.syn_transitions));
+        std::snprintf(buf, sizeof(buf), "LEARNED: %u QAs | %llu Syntax Flows (ZERO RULES)",
+                      st.qa_processed, static_cast<unsigned long long>(st.syn_transitions));
         draw_text(22, 85, buf, 120, 242, 188);
         std::snprintf(buf, sizeof(buf), "VALVE  : %s",
                       st.pos_valve_label.empty() ? "ALL POS OPEN" : st.pos_valve_label.c_str());
@@ -288,23 +287,27 @@ public:
         };
         draw_btn(btn_ask,    "ASK (4-SPHERE)", hover_btn == 1, 215, 80, 255);
         draw_btn(btn_carve,  "CARVE Q->A",     hover_btn == 2, 240, 165, 45);
-        draw_btn(btn_load89, "INDEX ALL 89K",  hover_btn == 3, 45, 205, 145);
+        draw_btn(btn_load89, "RELOAD SPONGE",  hover_btn == 3, 45, 205, 145);
         draw_btn(btn_stream, st.streaming ? "PAUSE STREAM" : "RESUME STREAM", hover_btn == 4, 55, 185, 245);
-        draw_btn(btn_replay, "REPLAY FLUID + SYNTAX", hover_btn == 5, 85, 220, 175);
+        draw_btn(btn_replay, "REPLAY FLUID WAVE", hover_btn == 5, 85, 220, 175);
 
         // =====================================================================
-        // SYNTACTIC SPHERE NATURAL SPOKEN SENTENCE OUTPUT!
+        // SYNTACTIC SPHERE RAW SPONGE OUTPUT (ZERO BANDAGES / ZERO PENALTIES!)
         // =====================================================================
         fill_rect(14, 414, 380, 102, 12, 28, 34, 255);
         stroke_rect(14, 414, 380, 102, 70, 235, 185);
-        draw_text(22, 422, "SYNTACTIC SPHERE RESPONSE (EMERGENT SENTENCE):", 95, 248, 195);
+        draw_text(22, 422, "RAW SPONGE -> SYNTACTIC SPHERE OUTPUT:", 95, 248, 195);
         if (!st.syn_path_str.empty()) {
             draw_text(22, 436, st.syn_path_str.substr(0, 60), 150, 215, 235);
         }
         if (!st.spoken_sentence.empty()) {
-            draw_wrapped(22, 454, 30, 3, st.spoken_sentence, 255, 248, 205, 18, 2);
+            int scale = st.spoken_sentence.size() > 70 ? 1 : 2;
+            int max_ch = scale == 2 ? 30 : 60;
+            int max_ln = scale == 2 ? 3 : 5;
+            int lh     = scale == 2 ? 18 : 11;
+            draw_wrapped(22, 454, max_ch, max_ln, st.spoken_sentence, 255, 248, 205, lh, scale);
         } else {
-            draw_wrapped(22, 456, 58, 2, "Ask any question to watch fluid split in the sponge and flow through the Syntactic Sphere into a natural sentence!", 145, 195, 205, 11);
+            draw_wrapped(22, 456, 58, 2, "Ask any question to watch water split in the sponge and emerge raw through the Syntactic Sphere!", 145, 195, 205, 11);
         }
 
         // =====================================================================
@@ -331,14 +334,14 @@ public:
             draw_text(22, 589, st.fluid_summary.substr(0, 60), 205, 225, 245);
         }
 
-        float max_ml = 1.0f;
+        float max_ml = 1e-4f;
         for (const auto& c : st.candidates) max_ml = std::max(max_ml, c.target_ml);
 
         int ry = 606;
         size_t shown = std::min<size_t>(8, st.candidates.size());
         for (size_t i = 0; i < shown; ++i) {
             const auto& c = st.candidates[i];
-            bool winner = (i == 0 && c.current_ml > 0.5f);
+            bool winner = (i == 0 && c.current_ml > 0.0f);
             fill_rect(20, ry, 368, 23, winner ? 38 : 16, winner ? 32 : 23, winner ? 18 : 40);
             stroke_rect(20, ry, 368, 23,
                         winner ? 255 : (c.drop_sources >= 2 ? 195 : 42),
@@ -359,9 +362,15 @@ public:
             draw_text(26, ry + 7, buf,
                       winner ? 255 : 230, winner ? 245 : 240, winner ? 185 : 255);
 
-            std::snprintf(buf, sizeof(buf), "%5.1fmL [%u/%u%s]",
-                          c.current_ml, c.drop_sources, c.total_sources,
-                          c.pos_valve_ok ? "V" : "");
+            if (c.current_ml < 10.0f) {
+                std::snprintf(buf, sizeof(buf), "%5.2fmL [%u/%u%s]",
+                              c.current_ml, c.drop_sources, c.total_sources,
+                              c.pos_valve_ok ? "V" : "");
+            } else {
+                std::snprintf(buf, sizeof(buf), "%5.1fmL [%u/%u%s]",
+                              c.current_ml, c.drop_sources, c.total_sources,
+                              c.pos_valve_ok ? "V" : "");
+            }
             int rw = static_cast<int>(std::strlen(buf)) * 6;
             draw_text(384 - rw, ry + 7, buf,
                       winner ? 255 : (c.drop_sources >= 2 ? 255 : 170),
