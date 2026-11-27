@@ -245,9 +245,16 @@ static std::string resolve_data_file(const std::string& filename) {
     return cands[0];
 }
 
+static std::string resolve_default_sponge() {
+    std::string best = resolve_data_file("msmarco_openhermes_clean_sponge.bin");
+    std::ifstream f(best, std::ios::binary);
+    if (f.good()) return best;
+    return resolve_data_file("msmarco_sponge.bin");
+}
+
 int main(int argc, char** argv) {
     std::string lex_path    = resolve_data_file("kaikki_lexicon.bin");
-    std::string sponge_path = resolve_data_file("msmarco_sponge.bin");
+    std::string sponge_path = resolve_default_sponge();
     std::string ptx_path    = "kernels/gllm_talk_kernels.ptx";
     std::string queries_tsv = "/home/liveuser/.gemini/antigravity-cli/brain/a8eaa546-9a14-44da-badc-ed3f36787d7c/scratch/bench_100_qa.tsv";
     std::string out_tsv     = "/home/liveuser/.gemini/antigravity-cli/brain/a8eaa546-9a14-44da-badc-ed3f36787d7c/scratch/bench_100_results.tsv";

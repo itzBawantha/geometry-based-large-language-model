@@ -118,42 +118,43 @@ Measured directly with [`src/gllm_talk_bench.cpp`](src/gllm_talk_bench.cpp) on a
 
 ---
 
-## Try It Yourself (Ready Out of the Box — Model Included!)
+## Try It Yourself (Ready Out of the Box — Both Models Included!)
 
-The full **100.7 MB** pre-carved 4-Sphere Fluid Sponge (`data/kaikki_lexicon.bin` + `data/msmarco_sponge.bin` + `data/msmarco_sample_qa.tsv`) is **already committed inside `data/`**—no dataset downloads or Python setup required!
+- **Latest 816k Sponge (`87% Top-1 / 99% Top-5`, 336.7 MB):** Published on [**GitHub Releases (`v2.0-816k-sponge`)**](https://github.com/itzBawantha/geometry-based-large-language-model/releases/tag/v2.0-816k-sponge) and **auto-downloaded on first run** by `./scripts/run_talk_viz.sh` (compressed ~140 MB, unpacks straight into `data/msmarco_openhermes_clean_sponge.bin`).
+- **Compact 559k MS MARCO Sponge (`78% Top-1 / 95% Top-5`, 100.7 MB):** Committed directly inside `data/` (`data/kaikki_lexicon.bin` + `data/msmarco_sponge.bin`) for immediate offline use.
 
 ### 1. Prerequisites
 - Linux + an NVIDIA GPU (uses standard `libcuda.so` — **no CUDA Toolkit / `nvcc` needed**)
-- `g++`, `SDL2`, `OpenGL`, `zlib`
+- `g++`, `SDL2`, `OpenGL`, `zlib`, `curl`, `gzip`
 
 ```bash
 # Arch / CachyOS
-sudo pacman -S base-devel sdl2 mesa zlib
+sudo pacman -S base-devel sdl2 mesa zlib curl gzip
 
 # Ubuntu / Debian
-sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev
+sudo apt install build-essential libsdl2-dev libgl-dev zlib1g-dev curl gzip
 ```
 
 ### 2. Clone, Build & Launch (3 Commands)
 ```bash
-# 1. Clone the repo (includes the bundled 100.7 MB model in data/)
+# 1. Clone the repo
 git clone https://github.com/itzBawantha/geometry-based-large-language-model.git
 cd geometry-based-large-language-model
 
 # 2. Build the live 4-Sphere visualizer and benchmark tools
 ./scripts/build.sh
 
-# 3. Launch the live 4-Sphere Fluid Sponge (auto-loads ./data/msmarco_sponge.bin!)
+# 3. Launch (auto-fetches the 816k MS MARCO + OpenHermes-2.5 sponge on first run!)
 ./scripts/run_talk_viz.sh
 ```
 
-Want to ask a specific question immediately on launch, or load a custom sponge you packed yourself?
+Want to ask a specific question immediately on launch, or pick a specific sponge file?
 ```bash
-# Launch with a custom question
-./scripts/run_talk_viz.sh --ask "Who invented the telephone?"
+# Ask any question on launch (try scrolling the green output box or clicking #1-#8!)
+./scripts/run_talk_viz.sh --ask "How to make a paper airplane?"
 
-# Optional: load a larger custom sponge you packed with bin/gllm_pack_sponge
-./scripts/run_talk_viz.sh --sponge /path/to/custom_sponge.bin
+# Or run the compact 100.7 MB MS MARCO-only sponge bundled in data/
+./scripts/run_talk_viz.sh --sponge data/msmarco_sponge.bin
 ```
 
 ### Controls Inside the Window

@@ -1254,9 +1254,16 @@ static std::string resolve_data_file(const std::string& filename) {
     return cands[0];
 }
 
+static std::string resolve_default_sponge() {
+    std::string best = resolve_data_file("msmarco_openhermes_clean_sponge.bin");
+    std::ifstream f(best, std::ios::binary);
+    if (f.good()) return best;
+    return resolve_data_file("msmarco_sponge.bin");
+}
+
 int main(int argc, char** argv) {
     std::string lex_path    = resolve_data_file("kaikki_lexicon.bin");
-    std::string sponge_path = resolve_data_file("msmarco_sponge.bin");
+    std::string sponge_path = resolve_default_sponge();
     std::string qa_path     = resolve_data_file("msmarco_sample_qa.tsv");
     std::string screenshot_path;
     std::string auto_ask = "What is the speed of light?";
